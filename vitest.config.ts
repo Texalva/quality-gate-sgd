@@ -3,7 +3,15 @@ import { defineConfig } from 'vitest/config'
 export default defineConfig({
   test: {
     globals: true,
-    exclude: ['**/node_modules/**', '**/dist/**', '**/tests/fixtures/**'],
+    exclude: [
+      '**/node_modules/**',
+      '**/dist/**',
+      '**/tests/fixtures/**',
+      // The synthetic subject is something the tool MEASURES, not part of the
+      // tool's own suite. Left in, its tests inflate our counts, and any
+      // deliberately-failing test added to it later would fail our build.
+      'tools/refactor-harness/synthetic-subject/**',
+    ],
     // v8 instrumentation costs ~3.8x wall-clock on this suite (40s -> 152s).
     // The tests/symbols/* files drive the TypeScript compiler API and average
     // ~4.1s each under coverage, which sits right on vitest's 5s default --

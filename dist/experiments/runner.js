@@ -18,11 +18,10 @@ export async function executeRun(task, condition, agent, options = {}) {
     // Initialize agent
     await agent.initialize(task, config);
     // Start logging
-    const actualRunId = startExperimentRun(task.id, condition, { logDir, runId });
+    startExperimentRun(task.id, condition, { logDir, runId });
     try {
         // Initial evaluation
         let evaluation = await agent.evaluate(config);
-        let previousScore = evaluation.qualityScore;
         // Log initial state as iteration 0
         const initialRecord = logIteration(evaluation.metrics, evaluation.qualityScore, evaluation.passed, { durationMs: 0 });
         onIteration?.(initialRecord);
@@ -61,7 +60,6 @@ export async function executeRun(task, condition, agent, options = {}) {
             });
             onIteration?.(record);
             onProgress?.(i, config.maxIterations, evaluation.metrics);
-            previousScore = evaluation.qualityScore;
             // Check for early termination
             if (evaluation.passed) {
                 return endExperimentRun('passed');
@@ -72,7 +70,7 @@ export async function executeRun(task, condition, agent, options = {}) {
     }
     catch (error) {
         // End run with error
-        const run = endExperimentRun('error');
+        endExperimentRun('error');
         throw error;
     }
     finally {

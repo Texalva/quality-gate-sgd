@@ -262,7 +262,7 @@ export function stratifiedSample(tasks, tasksPerRepo, seed) {
     }
     // Sample from each repo
     const sampled = [];
-    for (const [repo, repoTasks] of byRepo) {
+    for (const [, repoTasks] of byRepo) {
         const shuffled = shuffleArray(repoTasks, seed);
         sampled.push(...shuffled.slice(0, tasksPerRepo));
     }

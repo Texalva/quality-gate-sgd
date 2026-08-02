@@ -101,7 +101,7 @@ function evaluateHypothesisCoherence(hypothesis) {
 /**
  * Evaluate evidence alignment.
  */
-function evaluateEvidenceAlignment(evidence, hypothesis) {
+function evaluateEvidenceAlignment(evidence, _hypothesis) {
     let score = 0;
     // Has code references
     if (evidence.codeReferences && evidence.codeReferences.length > 0) {

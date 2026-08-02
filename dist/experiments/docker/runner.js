@@ -82,7 +82,7 @@ async function dockerComposeDown(runDirs) {
  * Get container status.
  */
 async function getContainerStatus(runDirs) {
-    return new Promise((resolve, reject) => {
+    return new Promise((resolve, _reject) => {
         const proc = spawn('docker-compose', ['-f', runDirs.compose, 'ps', '--format', 'json'], {
             cwd: runDirs.root,
         });
@@ -377,7 +377,6 @@ export async function executeBatchRuns(runs, options = {}) {
         const processNext = async () => {
             while (queue.length > 0 && executing.length < parallelism) {
                 const run = queue.shift();
-                const index = runs.indexOf(run);
                 const promise = (async () => {
                     try {
                         const result = await executeDockerRun(run.experimentId, run.runId, runOptions);

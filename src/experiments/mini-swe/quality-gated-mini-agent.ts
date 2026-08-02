@@ -11,8 +11,6 @@
  * This allows direct comparison to published mini-swe-agent results (74% on SWE-bench Verified).
  */
 
-import { spawn } from 'child_process';
-import * as path from 'path';
 import * as fs from 'fs';
 import type { SWEBenchTask } from '../swebench/types.js';
 import type { PatchProposalReasoning, PatchQualityMetrics } from '../swebench/quality-gate.js';
@@ -84,10 +82,6 @@ export async function runQualityGatedMiniAgent(
 ): Promise<AgentResult> {
   const {
     model,
-    apiKey,
-    qualityGate = DEFAULT_QUALITY_GATE,
-    maxReasoningIterations = 3,
-    enableQualityGate = true,
     miniSweAgentPath = '/tmp/mini-swe-agent',
     configFile = 'mini.yaml',
     costLimit = 3.0,
@@ -103,14 +97,6 @@ export async function runQualityGatedMiniAgent(
   if (!fs.existsSync(miniSweAgentPath)) {
     throw new Error(`Mini-SWE-agent not found at ${miniSweAgentPath}. Clone from https://github.com/SWE-agent/mini-swe-agent`);
   }
-
-  // Prepare environment
-  const env = {
-    ...process.env,
-    ...(apiKey && { OPENAI_API_KEY: apiKey }),
-    ANTHROPIC_API_KEY: apiKey, // In case using Claude
-    PYTHONUNBUFFERED: '1',
-  };
 
   const trajectory: AgentMessage[] = [];
   const qualityScores: PatchQualityMetrics[] = [];

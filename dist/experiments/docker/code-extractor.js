@@ -96,7 +96,7 @@ export async function extractCodeFromDocker(task, config = {}) {
                 extractedPaths.push(targetPath);
                 log(`    ✓ Extracted ${targetPath}`);
             }
-            catch (error) {
+            catch {
                 // File not found or other error - skip
                 log(`    ✗ Failed to extract ${targetPath}`);
             }

@@ -23,7 +23,6 @@ export function createAgentHarness(options) {
     const { metricsProvider, executor, targetScore = 90, topTargets = 10, } = options;
     // State
     let currentTask = null;
-    let currentConfig = null;
     let currentMetrics = null;
     let currentScore = 0;
     let previousScore = 0;
@@ -56,7 +55,7 @@ export function createAgentHarness(options) {
         // Dimension-level suggestions (fastest)
         if (config.granularity === 'dimension') {
             const gradient = computeGradient(currentMetrics);
-            return gradient.slice(0, topTargets).map((g, i) => ({
+            return gradient.slice(0, topTargets).map((g, _i) => ({
                 type: 'dimension',
                 id: g.dimension,
                 expectedDeltaQ: g.estimatedImprovement,
@@ -142,7 +141,6 @@ export function createAgentHarness(options) {
     return {
         async initialize(task, config) {
             currentTask = task;
-            currentConfig = config;
             currentMetrics = await metricsProvider.extractMetrics();
             currentScore = computeFitness(currentMetrics);
             previousScore = currentScore;
@@ -216,7 +214,7 @@ export function createAgentHarness(options) {
                 targetMatched: suggestion !== null,
             };
         },
-        async evaluate(config) {
+        async evaluate(_config) {
             if (!currentMetrics) {
                 return {
                     metrics: {},
@@ -234,7 +232,6 @@ export function createAgentHarness(options) {
         },
         async cleanup() {
             currentTask = null;
-            currentConfig = null;
             currentMetrics = null;
             currentScore = 0;
             previousScore = 0;
@@ -305,7 +302,7 @@ export function createMockExecutor(options = {}) {
     const { improvementProbability = 0.6, seed } = options;
     let rng = seed !== undefined ? seededRandom(seed) : Math.random;
     return {
-        async attemptFix(task, suggestion, context) {
+        async attemptFix(_task, _suggestion, _context) {
             // Simulate fix attempt
             const succeeded = rng() < improvementProbability;
             return {

@@ -13,6 +13,7 @@
  *   npx quality-gate-sgd [command] [options]
  */
 
+import { writeFileSync } from 'fs';
 import {
   extractAllMetrics,
   isSonarqubeAvailable,
@@ -81,7 +82,6 @@ import {
   executeDockerRun,
   listExperiments,
   listRuns as listDockerRuns,
-  loadRun as loadDockerRun,
   type ScaffoldOptions,
 } from './experiments/docker/index.js';
 import {
@@ -90,7 +90,6 @@ import {
   loadBatch,
   visualizeBatch,
   visualizeResults,
-  type ExperimentBatch,
   downloadSWEBenchSplit,
   checkSWEBenchLocalSplits,
   getSWEBenchDatasetInfo,
@@ -1119,7 +1118,7 @@ async function runExperimentRun(args: string[]): Promise<void> {
   const result = await executeDockerRun(experimentId, runId, {
     timeout: timeoutMs,
     followLogs,
-    onStateChange: (state, run) => {
+    onStateChange: (state, _run) => {
       log(`State: ${state}`);
     },
     onLog: (service, message) => {
@@ -1281,8 +1280,7 @@ function runExperimentReport(args: string[]): void {
 
   if (outputArg) {
     const outputPath = outputArg.split('=')[1];
-    const fs = require('fs');
-    fs.writeFileSync(outputPath, report);
+    writeFileSync(outputPath, report);
     log(`Report written to: ${outputPath}`);
   } else {
     console.log(report);
@@ -1340,7 +1338,7 @@ async function runExperimentDownload(args: string[]): Promise<void> {
     log('Quality Gate SGD - SWE-bench Dataset Status');
     log('==========================================\n');
 
-    const localSplits = checkSWEBenchLocalSplits(dataDir);
+    checkSWEBenchLocalSplits(dataDir);
     const splits: DatasetSplit[] = ['dev', 'test', 'lite', 'verified'];
 
     for (const split of splits) {

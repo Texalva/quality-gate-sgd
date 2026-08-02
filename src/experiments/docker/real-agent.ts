@@ -55,7 +55,6 @@ export function createRealLLMAgent(
   let currentScore = 0;
   let lastEvaluation: EvaluationResult | null = null;
   let iterationCount = 0;
-  let cumulativePatch = '';
 
   // Log helper
   const log = (msg: string) => {
@@ -65,18 +64,17 @@ export function createRealLLMAgent(
   };
 
   return {
-    async initialize(experimentTask: ExperimentTask, experimentConfig: ExperimentConfig) {
+    async initialize(experimentTask: ExperimentTask, _experimentConfig: ExperimentConfig) {
       currentScore = 0;
       lastEvaluation = null;
       iterationCount = 0;
-      cumulativePatch = '';
 
       log(`Initialized for task ${experimentTask.id}`);
       log(`  Gate enabled: ${gateEnabled}`);
       log(`  Target score: ${targetScore}`);
     },
 
-    async getSuggestion(experimentConfig: ExperimentConfig): Promise<TargetSuggestion | null> {
+    async getSuggestion(_experimentConfig: ExperimentConfig): Promise<TargetSuggestion | null> {
       if (!gateEnabled) {
         return null;
       }
@@ -191,7 +189,7 @@ export function createRealLLMAgent(
       };
     },
 
-    async evaluate(experimentConfig: ExperimentConfig): Promise<IterationEvaluationResult> {
+    async evaluate(_experimentConfig: ExperimentConfig): Promise<IterationEvaluationResult> {
       return {
         metrics: {
           quality: currentScore,

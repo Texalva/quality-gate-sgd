@@ -26,7 +26,6 @@ export function createRealLLMAgent(task, gateEnabled, config) {
     let currentScore = 0;
     let lastEvaluation = null;
     let iterationCount = 0;
-    let cumulativePatch = '';
     // Log helper
     const log = (msg) => {
         if (verbose) {
@@ -34,16 +33,15 @@ export function createRealLLMAgent(task, gateEnabled, config) {
         }
     };
     return {
-        async initialize(experimentTask, experimentConfig) {
+        async initialize(experimentTask, _experimentConfig) {
             currentScore = 0;
             lastEvaluation = null;
             iterationCount = 0;
-            cumulativePatch = '';
             log(`Initialized for task ${experimentTask.id}`);
             log(`  Gate enabled: ${gateEnabled}`);
             log(`  Target score: ${targetScore}`);
         },
-        async getSuggestion(experimentConfig) {
+        async getSuggestion(_experimentConfig) {
             if (!gateEnabled) {
                 return null;
             }
@@ -139,7 +137,7 @@ export function createRealLLMAgent(task, gateEnabled, config) {
                 targetMatched: suggestion !== null,
             };
         },
-        async evaluate(experimentConfig) {
+        async evaluate(_experimentConfig) {
             return {
                 metrics: {
                     quality: currentScore,

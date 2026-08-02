@@ -532,7 +532,7 @@ export async function extractReasoning(task, config) {
         }
         return { reasoning };
     }
-    catch (parseError) {
+    catch {
         return {
             reasoning: null,
             error: `Failed to parse reasoning: ${responseText.slice(0, 200)}`,
@@ -607,7 +607,7 @@ export async function reasoningToPatch(task, reasoning, config) {
         const patch = convertToUnifiedDiff(changes, config.projectRoot);
         return { patch, changes };
     }
-    catch (parseError) {
+    catch {
         return {
             patch: null,
             changes: null,

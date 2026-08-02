@@ -15,7 +15,7 @@ import {
   type ExperimentAgent,
 } from '../../src/experiments/runner.js'
 import { createConditions } from '../../src/experiments/conditions.js'
-import type { ExperimentConfig, IterationOutcome } from '../../src/experiments/types.js'
+import type { ExperimentConfig } from '../../src/experiments/types.js'
 
 const TEST_LOG_DIR = '.test-runner'
 
@@ -216,7 +216,7 @@ describe('experiment runner', () => {
 
       const completedRuns: string[] = []
 
-      const batch = await executeBatch('A', tasks, agent, {
+      await executeBatch('A', tasks, agent, {
         logDir: TEST_LOG_DIR,
         onRunComplete: (run) => completedRuns.push(run.runId),
       })

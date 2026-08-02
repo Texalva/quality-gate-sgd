@@ -12,7 +12,6 @@
  */
 
 import * as fs from 'node:fs';
-import * as path from 'node:path';
 import { spawn, type ChildProcess } from 'node:child_process';
 import type {
   DockerExperimentRun,
@@ -134,7 +133,7 @@ async function dockerComposeDown(runDirs: RunDirectoryStructure): Promise<void> 
 async function getContainerStatus(
   runDirs: RunDirectoryStructure
 ): Promise<{ agent: string; gate: string }> {
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve, _reject) => {
     const proc = spawn('docker-compose', ['-f', runDirs.compose, 'ps', '--format', 'json'], {
       cwd: runDirs.root,
     });
@@ -517,7 +516,6 @@ export async function executeBatchRuns(
     const processNext = async () => {
       while (queue.length > 0 && executing.length < parallelism) {
         const run = queue.shift()!;
-        const index = runs.indexOf(run);
 
         const promise = (async () => {
           try {

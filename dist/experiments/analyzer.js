@@ -263,8 +263,6 @@ function analyzeH5(runs) {
     const y = data.map(d => d.passed);
     // Use logistic regression for binary outcome
     const logistic = logisticRegression(x, y);
-    // Also compute Spearman for comparison
-    const spearman = spearmanCorrelation(x, y);
     // H5 is supported if positive slope (higher resolution = higher success probability)
     const supported = logistic.pValue < 0.05 && logistic.slope > 0;
     return {

@@ -14,7 +14,6 @@ import type {
   IterationRecord,
   TargetSuggestion,
   IterationOutcome,
-  RunOutcome,
 } from './types.js';
 import {
   startExperimentRun,
@@ -150,12 +149,11 @@ export async function executeRun(
   await agent.initialize(task, config);
 
   // Start logging
-  const actualRunId = startExperimentRun(task.id, condition, { logDir, runId });
+  startExperimentRun(task.id, condition, { logDir, runId });
 
   try {
     // Initial evaluation
     let evaluation = await agent.evaluate(config);
-    let previousScore = evaluation.qualityScore;
 
     // Log initial state as iteration 0
     const initialRecord = logIteration(
@@ -211,8 +209,6 @@ export async function executeRun(
       onIteration?.(record);
       onProgress?.(i, config.maxIterations, evaluation.metrics);
 
-      previousScore = evaluation.qualityScore;
-
       // Check for early termination
       if (evaluation.passed) {
         return endExperimentRun('passed');
@@ -223,7 +219,7 @@ export async function executeRun(
     return endExperimentRun('max_iterations');
   } catch (error) {
     // End run with error
-    const run = endExperimentRun('error');
+    endExperimentRun('error');
     throw error;
   } finally {
     // Cleanup

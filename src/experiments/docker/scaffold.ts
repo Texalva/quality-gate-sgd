@@ -19,9 +19,7 @@ import type {
 import {
   generateDockerCompose,
   generateGateConfig,
-  generateAgentConfig,
   generateExperimentDefinition,
-  generateConditionConfigs,
   generateExperimentReadme,
 } from './templates.js';
 import { createConditions } from '../conditions.js';

@@ -13,13 +13,13 @@
  * 4. Cleanup temp files after use
  */
 
-import { exec as execCallback, execSync } from 'child_process';
+import { exec as execCallback } from 'child_process';
 import { promisify } from 'util';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import type { SWEBenchTask } from '../swebench/types.js';
-import { getImageName, ensureImage } from './evaluator.js';
+import { ensureImage } from './evaluator.js';
 import { extractFilePaths } from '../swebench/code-retrieval.js';
 
 const exec = promisify(execCallback);
@@ -143,7 +143,7 @@ export async function extractCodeFromDocker(
 
         extractedPaths.push(targetPath);
         log(`    ✓ Extracted ${targetPath}`);
-      } catch (error) {
+      } catch {
         // File not found or other error - skip
         log(`    ✗ Failed to extract ${targetPath}`);
       }

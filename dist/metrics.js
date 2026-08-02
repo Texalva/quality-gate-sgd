@@ -8,6 +8,18 @@ import * as path from 'path';
 import { getConfig, getSonarCurlAuth } from './config.js';
 import { extractAllCustomMetrics, registerCustomDimensions, } from './dimensions/index.js';
 /**
+ * spawnSync defaults to a 1 MiB stdout buffer. Past that, Node truncates the
+ * output and kills the child, leaving status === null -- and every parse path
+ * below turns unparseable output into *zero findings* rather than an error.
+ * eslint's JSON crosses 1 MiB at roughly a thousand findings, so any real
+ * codebase with a lint backlog silently reports clean and passes an
+ * `eslint.errors: 0` ceiling. Observed directly: a 1038-finding subject
+ * returned exactly 1048576 bytes and 0 errors.
+ *
+ * 64 MiB is far beyond any plausible linter or compiler output.
+ */
+const SUBPROCESS_MAX_BUFFER = 64 * 1024 * 1024;
+/**
  * Merge two coverage reports by file.
  * For files appearing in both reports, take the max coverage per file.
  * Then recalculate totals from merged file data.
@@ -383,6 +395,7 @@ export function extractTypescriptMetrics() {
         encoding: 'utf-8',
         shell: true,
         timeout: 60000,
+        maxBuffer: SUBPROCESS_MAX_BUFFER,
     });
     const output = (result.stdout || '') + (result.stderr || '');
     // Parse structured errors
@@ -424,6 +437,7 @@ export function extractEslintMetrics() {
         encoding: 'utf-8',
         shell: true,
         timeout: 120000,
+        maxBuffer: SUBPROCESS_MAX_BUFFER,
     });
     try {
         const output = result.stdout || '[]';

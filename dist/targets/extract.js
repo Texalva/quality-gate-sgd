@@ -11,6 +11,12 @@ import { spawnSync } from 'child_process';
 import path from 'path';
 import { getConfig, getSonarAuthToken } from '../config.js';
 import { mapLocationToSymbol } from '../symbols/mapper.js';
+/**
+ * See the identical constant in ../metrics.ts. spawnSync's 1 MiB default
+ * truncates large linter output and kills the child; the catch blocks below
+ * then report zero issues instead of failing, so a noisy codebase looks clean.
+ */
+const SUBPROCESS_MAX_BUFFER = 64 * 1024 * 1024;
 function shouldSkipCoverageFile(filePath) {
     return (filePath.includes('node_modules') ||
         filePath.includes('.test.') ||
@@ -209,6 +215,7 @@ export function extractTypescriptIssues() {
         encoding: 'utf-8',
         shell: true,
         timeout: 60000,
+        maxBuffer: SUBPROCESS_MAX_BUFFER,
     });
     const output = (result.stdout || '') + (result.stderr || '');
     const errors = parseTypescriptOutput(output);
@@ -238,6 +245,7 @@ export function extractEslintIssues() {
         encoding: 'utf-8',
         shell: true,
         timeout: 120000,
+        maxBuffer: SUBPROCESS_MAX_BUFFER,
     });
     const issues = [];
     try {

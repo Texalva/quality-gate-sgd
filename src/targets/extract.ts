@@ -20,6 +20,13 @@ import type {
 import { mapLocationToSymbol } from '../symbols/mapper.js';
 import type { SymbolTable, CodeSymbol } from '../symbols/types.js';
 
+/**
+ * See the identical constant in ../metrics.ts. spawnSync's 1 MiB default
+ * truncates large linter output and kills the child; the catch blocks below
+ * then report zero issues instead of failing, so a noisy codebase looks clean.
+ */
+const SUBPROCESS_MAX_BUFFER = 64 * 1024 * 1024;
+
 // =============================================================================
 // Coverage Issue Extraction
 // =============================================================================
@@ -320,6 +327,7 @@ export function extractTypescriptIssues(): LocatedIssue[] {
     encoding: 'utf-8',
     shell: true,
     timeout: 60000,
+    maxBuffer: SUBPROCESS_MAX_BUFFER,
   });
 
   const output = (result.stdout || '') + (result.stderr || '');
@@ -373,6 +381,7 @@ export function extractEslintIssues(): LocatedIssue[] {
     encoding: 'utf-8',
     shell: true,
     timeout: 120000,
+    maxBuffer: SUBPROCESS_MAX_BUFFER,
   });
 
   const issues: LocatedIssue[] = [];

@@ -20,6 +20,8 @@ import {
   registerCustomDimensions,
   type CustomDimensionConfig,
 } from './dimensions/index.js';
+import { eslintLintProvider } from './providers/eslint.js';
+import { DEFAULT_MEASUREMENT_LIMITS } from './providers/result.js';
 
 /**
  * spawnSync defaults to a 1 MiB stdout buffer. Past that, Node truncates the
@@ -601,80 +603,35 @@ export function extractTypescriptMetrics(): TypescriptMetrics {
 // ESLint Metrics
 // =============================================================================
 
-interface EslintMessage {
-  ruleId: string | null;
-  severity: number; // 1 = warning, 2 = error
-  message: string;
-  line: number;
-  column: number;
-}
-
-interface EslintFileResult {
-  filePath: string;
-  errorCount: number;
-  warningCount: number;
-  messages: EslintMessage[];
-}
-
 /**
- * Count distinct root causes from ESLint results.
- * Root cause = unique (file, ruleId) combination.
- *
- * Rationale: The same rule violation in the same file often indicates
- * a systematic issue that should be fixed once. For example, multiple
- * "no-unused-vars" in the same file might all be resolved by one refactor.
+ * Delegates to the eslint provider. The parsing that used to live here now
+ * lives in src/providers/eslint.ts, unchanged.
  */
-function countEslintRootCauses(results: EslintFileResult[]): number {
-  const rootCauses = new Set<string>();
-
-  for (const fileResult of results) {
-    for (const msg of fileResult.messages) {
-      if (msg.severity === 2 && msg.ruleId) {
-        // Only count errors, not warnings
-        const key = `${fileResult.filePath}:${msg.ruleId}`;
-        rootCauses.add(key);
-      }
-    }
-  }
-
-  return rootCauses.size;
-}
-
 export function extractEslintMetrics(): EslintMetrics {
   const config = getConfig();
-  const result = spawnSync('npx', ['eslint', '--format', 'json', 'src/'], {
-    cwd: config.projectRoot,
-    encoding: 'utf-8',
-    shell: true,
-    timeout: 120000,
-    maxBuffer: SUBPROCESS_MAX_BUFFER,
+
+  const reading = eslintLintProvider.measure({
+    projectRoot: config.projectRoot,
+    timeoutMs: DEFAULT_MEASUREMENT_LIMITS.lintTimeoutMs,
+    maxBufferBytes: DEFAULT_MEASUREMENT_LIMITS.maxBufferBytes,
   });
 
-  try {
-    const output = result.stdout || '[]';
-    const results = JSON.parse(output) as EslintFileResult[];
-
-    let errors = 0;
-    let warnings = 0;
-
-    for (const r of results) {
-      errors += r.errorCount || 0;
-      warnings += r.warningCount || 0;
-    }
-
-    return {
-      errors,
-      warnings,
-      rootCauses: countEslintRootCauses(results),
-    };
-  } catch {
-    // If parsing fails, check exit code
-    return {
-      errors: result.status === 0 ? 0 : 1,
-      warnings: 0,
-      rootCauses: undefined, // Can't compute without parsed output
-    };
+  if (reading.ok) {
+    return reading.value.metrics;
   }
+
+  // Preserved verbatim from the pre-extraction implementation so this step
+  // changes structure only. It is wrong -- a linter that could not run is
+  // reported as one ordinary error, and a failure with exit code 0 as a clean
+  // project -- and the provider now returns a MeasurementFailure carrying the
+  // real reason. Consuming that properly is the next step; keeping the old
+  // shape here means the golden baseline can prove the extraction alone
+  // altered nothing.
+  return {
+    errors: reading.error.evidence.exitCode === 0 ? 0 : 1,
+    warnings: 0,
+    rootCauses: undefined,
+  };
 }
 
 // =============================================================================

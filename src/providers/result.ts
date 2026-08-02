@@ -67,6 +67,29 @@ export function measurementFailure(
 }
 
 /**
+ * What the process did, independent of whether it succeeded.
+ *
+ * Exported because a provider needs the same evidence when output arrives but
+ * does not parse -- a failure it can classify but `classifyProcessOutput`
+ * cannot, since only the caller knows the expected shape.
+ */
+export function buildEvidence(
+  spawn: SpawnSyncReturns<string>,
+  command: string,
+  elapsedMs: number
+): MeasurementEvidence {
+  const stderr = spawn.stderr ?? '';
+  return {
+    command,
+    exitCode: spawn.status,
+    signal: spawn.signal ?? null,
+    elapsedMs,
+    stdoutBytes: Buffer.byteLength(spawn.stdout ?? ''),
+    stderrExcerpt: stderr.slice(0, STDERR_EXCERPT_BYTES) || undefined,
+  };
+}
+
+/**
  * Turns a finished spawnSync into either its stdout or a classified failure.
  *
  * Deliberately does NOT treat a non-zero exit code as failure. eslint exits 1
@@ -87,16 +110,7 @@ export function classifyProcessOutput(
   }
 ): Result<string, MeasurementFailure> {
   const stdout = spawn.stdout ?? '';
-  const stderr = spawn.stderr ?? '';
-
-  const evidence: MeasurementEvidence = {
-    command: options.command,
-    exitCode: spawn.status,
-    signal: spawn.signal ?? null,
-    elapsedMs: options.elapsedMs,
-    stdoutBytes: Buffer.byteLength(stdout),
-    stderrExcerpt: stderr.slice(0, STDERR_EXCERPT_BYTES) || undefined,
-  };
+  const evidence = buildEvidence(spawn, options.command, options.elapsedMs);
 
   const fail = (kind: MeasurementFailureKind, message: string) =>
     err(measurementFailure(kind, options.dimension, message, evidence));

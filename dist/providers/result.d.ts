@@ -38,6 +38,14 @@ export declare const isErr: <T, E>(result: Result<T, E>) => result is {
 };
 export declare function measurementFailure(kind: MeasurementFailureKind, dimension: IssueSource, message: string, evidence: MeasurementEvidence): MeasurementFailure;
 /**
+ * What the process did, independent of whether it succeeded.
+ *
+ * Exported because a provider needs the same evidence when output arrives but
+ * does not parse -- a failure it can classify but `classifyProcessOutput`
+ * cannot, since only the caller knows the expected shape.
+ */
+export declare function buildEvidence(spawn: SpawnSyncReturns<string>, command: string, elapsedMs: number): MeasurementEvidence;
+/**
  * Turns a finished spawnSync into either its stdout or a classified failure.
  *
  * Deliberately does NOT treat a non-zero exit code as failure. eslint exits 1

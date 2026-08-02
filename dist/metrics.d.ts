@@ -30,6 +30,10 @@ export declare function runSonarqubeScan(): {
     error?: string;
 };
 export declare function extractTypescriptMetrics(): TypescriptMetrics;
+/**
+ * Delegates to the eslint provider. The parsing that used to live here now
+ * lives in src/providers/eslint.ts, unchanged.
+ */
 export declare function extractEslintMetrics(): EslintMetrics;
 export declare function runScript(script: string): 'pass' | 'fail';
 export declare function runScripts(scripts: string[]): Record<string, 'pass' | 'fail'>;

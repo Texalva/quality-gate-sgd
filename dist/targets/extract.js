@@ -11,6 +11,8 @@ import { spawnSync } from 'child_process';
 import path from 'path';
 import { getConfig, getSonarAuthToken } from '../config.js';
 import { mapLocationToSymbol } from '../symbols/mapper.js';
+import { eslintLintProvider } from '../providers/eslint.js';
+import { DEFAULT_MEASUREMENT_LIMITS } from '../providers/result.js';
 /**
  * See the identical constant in ../metrics.ts. spawnSync's 1 MiB default
  * truncates large linter output and kills the child; the catch blocks below
@@ -235,51 +237,27 @@ export function extractTypescriptIssues() {
         context: `${err.code}: ${err.message}`,
     }));
 }
+// =============================================================================
+// ESLint Issue Extraction
+// =============================================================================
 /**
  * Extract ESLint issues with location information.
+ *
+ * Delegates to the eslint provider; the parsing that used to live here now
+ * lives in src/providers/eslint.ts, unchanged.
  */
 export function extractEslintIssues() {
     const config = getConfig();
-    const result = spawnSync('npx', ['eslint', '--format', 'json', 'src/'], {
-        cwd: config.projectRoot,
-        encoding: 'utf-8',
-        shell: true,
-        timeout: 120000,
-        maxBuffer: SUBPROCESS_MAX_BUFFER,
+    const reading = eslintLintProvider.measure({
+        projectRoot: config.projectRoot,
+        timeoutMs: DEFAULT_MEASUREMENT_LIMITS.lintTimeoutMs,
+        maxBufferBytes: DEFAULT_MEASUREMENT_LIMITS.maxBufferBytes,
     });
-    const issues = [];
-    try {
-        const output = result.stdout || '[]';
-        const results = JSON.parse(output);
-        for (const fileResult of results) {
-            for (const msg of fileResult.messages) {
-                const isError = msg.severity === 2;
-                const dimension = isError ? 'eslint.errors' : 'eslint.warnings';
-                issues.push({
-                    file: fileResult.filePath,
-                    line: msg.line,
-                    column: msg.column,
-                    endLine: msg.endLine,
-                    endColumn: msg.endColumn,
-                    source: 'eslint',
-                    dimension,
-                    code: msg.ruleId || 'unknown',
-                    severity: isError ? 'major' : 'minor',
-                    impact: {
-                        dimension,
-                        delta: -1, // Fixing one issue reduces count by 1
-                        direction: 'lower-better',
-                    },
-                    message: msg.message,
-                    context: msg.ruleId ? `Rule: ${msg.ruleId}` : undefined,
-                });
-            }
-        }
-    }
-    catch {
-        // If parsing fails, return empty
-    }
-    return issues;
+    // Returning [] on failure is preserved verbatim, and is the same defect as
+    // in extractEslintMetrics: a linter that never ran is indistinguishable
+    // from a clean project. The provider now knows which one happened; step 6
+    // is where that reaches the caller.
+    return reading.ok ? [...reading.value.issues] : [];
 }
 function mapSonarSeverity(severity) {
     switch (severity.toUpperCase()) {

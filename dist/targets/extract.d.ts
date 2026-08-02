@@ -19,6 +19,9 @@ export declare function extractCoverageIssues(coverageDir?: string): LocatedIssu
 export declare function extractTypescriptIssues(): LocatedIssue[];
 /**
  * Extract ESLint issues with location information.
+ *
+ * Delegates to the eslint provider; the parsing that used to live here now
+ * lives in src/providers/eslint.ts, unchanged.
  */
 export declare function extractEslintIssues(): LocatedIssue[];
 /**

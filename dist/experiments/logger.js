@@ -4,7 +4,8 @@
  * Records experiment trajectories to disk for later analysis.
  * Supports streaming writes for crash-resilient logging.
  */
-import { writeFileSync, appendFileSync, mkdirSync, existsSync, readFileSync } from 'fs';
+import { writeFileSync, appendFileSync, mkdirSync, existsSync, readFileSync, readdirSync } from 'fs';
+import { execSync } from 'child_process';
 import { join, dirname } from 'path';
 import { randomUUID } from 'crypto';
 // =============================================================================
@@ -185,7 +186,6 @@ function computeOutcome(iterations, stopReason) {
 function getMetadata() {
     let experimentCommit = 'unknown';
     try {
-        const { execSync } = require('child_process');
         experimentCommit = execSync('git rev-parse HEAD', { encoding: 'utf-8' }).trim();
     }
     catch {
@@ -281,7 +281,6 @@ export function listRuns(options = {}) {
     if (!existsSync(fullDir)) {
         return [];
     }
-    const { readdirSync } = require('fs');
     const files = readdirSync(fullDir);
     return files
         .filter((f) => f.endsWith('.json') && !f.startsWith('batch-'))

@@ -131,7 +131,17 @@ function captureEslintLiveness(subjectDir, toolReportedCount) {
 
   const nonZeroOrNullExit = exitCode === null || exitCode !== 0;
   const emptyStdout = stdoutBytes === 0;
-  const nearTimeout = elapsedMs > ESLINT_BUDGET_MS * 0.5;
+  // Killed, rather than merely slow. A process that exits with its OWN status
+  // code ran to completion, so elapsed time says nothing about whether the
+  // measurement finished; a process that was killed may have been cut off
+  // mid-output no matter how quickly it happened.
+  //
+  // This replaces an `elapsedMs > budget * 0.5` rule that ignored exit status
+  // entirely. It was wrong in both directions: it flagged a clean 30.6s run
+  // against a 60s budget whose output was byte-identical to a 25.0s run that
+  // passed (a coin flip on machine load), and it cleared a killed process that
+  // happened to die early.
+  const killed = exitCode === null;
   // Evidence eslint actually enumerated real files, beyond a bare zero count.
   const workDoneEvidence = filesCount !== null && filesCount > 0;
   const zeroBoth = parsedOk && messageCount === 0 && toolReportedCount === 0;
@@ -139,7 +149,7 @@ function captureEslintLiveness(subjectDir, toolReportedCount) {
   let verdict;
   if (nonZeroOrNullExit && emptyStdout) verdict = "not-measured";
   else if (!parsedOk) verdict = "not-measured"; // stdout didn't parse -> the tool would have silently swallowed this too
-  else if (nearTimeout) verdict = "suspect";
+  else if (killed) verdict = "suspect";   // may have been cut off mid-output
   else if (zeroBoth && !workDoneEvidence) verdict = "suspect";
   else verdict = "measured";
 
@@ -152,7 +162,7 @@ function captureEslintLiveness(subjectDir, toolReportedCount) {
     messageCount,
     elapsedMs,
     budgetMs: ESLINT_BUDGET_MS,
-    nearTimeout,
+    killed,
     toolReportedCount,
     verdict,
   };
@@ -179,14 +189,30 @@ function captureTypescriptLiveness(subjectDir, toolReportedCount) {
 
   const nonZeroOrNullExit = exitCode === null || exitCode !== 0;
   const emptyOutput = combinedBytes === 0;
-  const nearTimeout = elapsedMs > TSC_BUDGET_MS * 0.5;
+  // See captureEslintLiveness: being killed implies possible truncation;
+  // being slow does not.
+  const killed = exitCode === null;
+
+  // ...but a numeric exit code is NOT proof of completion. A wrapper script or
+  // an outer timeout can abort mid-run and still exit numerically: a
+  // `type-check` that self-aborted with 124 after 1.8s of a 3s budget emitted
+  // only npm's banner, no diagnostics, and was accepted as `measured` when
+  // `killed` was the sole signal.
+  //
+  // tsc reports 0 for clean and 2 for diagnostics found; 1 shows up from some
+  // CLI-level failures. Anything else means the command did not finish as a
+  // type-check, whatever its exit status claims. Unlike eslint, tsc output is
+  // regex-scanned rather than parsed, so a truncated run still "reads" as zero
+  // errors -- there is no parse step to catch it.
+  const TSC_COMPLETION_EXITS = new Set([0, 1, 2]);
+  const unexpectedExit = !killed && !TSC_COMPLETION_EXITS.has(exitCode);
   const workDoneEvidence = elapsedMs >= TSC_MIN_REAL_RUN_MS;
   const zeroBoth = errorCount === 0 && toolReportedCount === 0;
 
   let verdict;
   if (!scriptExists) verdict = "not-measured"; // absent script is itself a measurement failure
   else if (nonZeroOrNullExit && emptyOutput) verdict = "not-measured";
-  else if (nearTimeout) verdict = "suspect";
+  else if (killed || unexpectedExit) verdict = "suspect"; // may have been cut off mid-output
   else if (zeroBoth && !workDoneEvidence) verdict = "suspect";
   else verdict = "measured";
 
@@ -198,7 +224,8 @@ function captureTypescriptLiveness(subjectDir, toolReportedCount) {
     errorCount,
     elapsedMs,
     budgetMs: TSC_BUDGET_MS,
-    nearTimeout,
+    killed,
+    unexpectedExit,
     toolReportedCount,
     verdict,
   };

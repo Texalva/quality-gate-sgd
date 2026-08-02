@@ -59,12 +59,19 @@ export function buildEvidence(spawn, command, elapsedMs) {
 /**
  * Turns a finished spawnSync into either its stdout or a classified failure.
  *
- * Deliberately does NOT treat a non-zero exit code as failure. eslint exits 1
- * when it finds problems and tsc exits 2 when it finds type errors — those are
- * successful measurements reporting bad news, and the original code's
- * `result.status === 0 ? 0 : 1` fallback had this exactly backwards. Only
- * process-level death, truncation, or a missing binary count here; malformed
- * output is the caller's to classify, since only it knows the expected shape.
+ * `successExitCodes` is required, and has no default, because exit codes are
+ * per-tool and getting them wrong is silent. eslint exits 0 clean, 1 when it
+ * finds problems, and **2 when it could not run at all** -- so a blanket
+ * "non-zero is still success" rule (needed for 1) hands back empty output for
+ * 2, which parses as zero findings and passes an `eslint.errors: 0` ceiling.
+ * That was a real defect in this file: a broken eslint config exits 2 with
+ * empty stdout, and the measurement was reported clean.
+ *
+ * Making the caller state the set forces the question to be answered per tool
+ * rather than inherited from whichever tool was considered first.
+ *
+ * Malformed output is NOT classified here -- only the caller knows the shape
+ * it expects.
  */
 export function classifyProcessOutput(spawn, options) {
     const stdout = spawn.stdout ?? '';
@@ -88,7 +95,18 @@ export function classifyProcessOutput(spawn, options) {
             : fail('crashed', `\`${options.command}\` was killed by ${spawn.signal} after ${options.elapsedMs}ms.`);
     }
     if (spawn.status === null) {
-        return fail('crashed', `\`${options.command}\` exited without a status code after ${options.elapsedMs}ms.`);
+        const detail = spawnError ? ` (${spawnError.code ?? spawnError.message})` : '';
+        return fail('crashed', `\`${options.command}\` exited without a status code after ${options.elapsedMs}ms${detail}.`);
+    }
+    // Any other spawn-level error -- EPERM, EACCES, EAGAIN. Previously only
+    // ENOENT and ENOBUFS were recognised and everything else fell through as a
+    // successful measurement.
+    if (spawnError) {
+        return fail('crashed', `\`${options.command}\` failed to run: ${spawnError.code ?? spawnError.message}.`);
+    }
+    if (!options.successExitCodes.includes(spawn.status)) {
+        return fail('crashed', `\`${options.command}\` exited ${spawn.status}, which this tool uses to report a failed run ` +
+            `rather than a findings report. Its output cannot be read as a measurement.`);
     }
     return ok(stdout);
 }

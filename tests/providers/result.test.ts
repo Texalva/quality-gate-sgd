@@ -26,13 +26,21 @@ function spawnResult(overrides: Partial<SpawnSyncReturns<string>> = {}): SpawnSy
   } as SpawnSyncReturns<string>;
 }
 
-const classify = (spawn: SpawnSyncReturns<string>, elapsedMs = 100) =>
+// eslint's codes: 0 clean, 1 findings, 2 could-not-run.
+const SUCCESS_CODES = [0, 1];
+
+const classify = (
+  spawn: SpawnSyncReturns<string>,
+  elapsedMs = 100,
+  successExitCodes: readonly number[] = SUCCESS_CODES
+) =>
   classifyProcessOutput(spawn, {
     command: 'npx eslint --format json src/',
     dimension: 'eslint',
     elapsedMs,
     timeoutMs: TIMEOUT_MS,
     maxBufferBytes: MAX_BUFFER,
+    successExitCodes,
   });
 
 describe('Result helpers', () => {
@@ -59,17 +67,31 @@ describe('classifyProcessOutput', () => {
       if (isOk(result)) expect(result.value).toBe('[]');
     });
 
-    // The single most important case here. eslint exits 1 whenever it finds
-    // anything at all, so treating non-zero as failure would classify every
-    // imperfect project as unmeasurable.
-    it('treats a non-zero exit as success, not failure', () => {
-      const eslintFoundProblems = classify(
-        spawnResult({ stdout: '[{"messages":[]}]', status: 1 })
-      );
-      expect(eslintFoundProblems.ok).toBe(true);
+    // eslint exits 1 whenever it finds anything, so a declared success code
+    // must stay success -- otherwise every imperfect project reads as
+    // unmeasurable.
+    it('treats a declared non-zero success code as success', () => {
+      const foundProblems = classify(spawnResult({ stdout: '[{"messages":[]}]', status: 1 }));
+      expect(foundProblems.ok).toBe(true);
+    });
 
+    // The mirror image, and the defect this parameter exists for: eslint's 2
+    // means "could not run", arrives with EMPTY stdout, and used to be waved
+    // through as a clean measurement.
+    it('treats an undeclared exit code as a failure, not an empty result', () => {
+      const couldNotRun = classify(spawnResult({ stdout: '', status: 2 }));
+
+      expect(isErr(couldNotRun)).toBe(true);
+      if (isErr(couldNotRun)) expect(couldNotRun.error.kind).toBe('crashed');
+    });
+
+    // The same code means different things to different tools, which is why
+    // the set is required rather than defaulted.
+    it('honours a different tool\'s exit-code contract', () => {
       const tscFoundErrors = classify(
-        spawnResult({ stdout: 'src/a.ts(1,1): error TS2322: nope', status: 2 })
+        spawnResult({ stdout: 'src/a.ts(1,1): error TS2322: nope', status: 2 }),
+        100,
+        [0, 1, 2] // tsc reports type errors with 2
       );
       expect(tscFoundErrors.ok).toBe(true);
     });
@@ -138,11 +160,71 @@ describe('classifyProcessOutput', () => {
       if (isErr(result)) expect(result.error.kind).toBe('crashed');
     });
 
+    // The two shapes a permission failure actually takes, measured rather than
+    // imagined: spawning the binary directly yields {error: EACCES, status:
+    // null}, while the production `shell: true` path yields {error: undefined,
+    // status: 126} because the shell reports it instead.
+    it('rejects a permission failure in both of its real forms', () => {
+      const eacces = Object.assign(new Error('spawnSync EACCES'), { code: 'EACCES' });
+      const direct = classify(spawnResult({ error: eacces, status: null, stdout: '', signal: null }));
+      expect(isErr(direct)).toBe(true);
+      if (isErr(direct)) expect(direct.error.kind).toBe('crashed');
+
+      // 126 is "found but not executable" -- not a declared success code.
+      const viaShell = classify(spawnResult({ status: 126, stdout: '' }));
+      expect(isErr(viaShell)).toBe(true);
+      if (isErr(viaShell)) expect(viaShell.error.kind).toBe('crashed');
+    });
+
+    // Defensive rather than observed: spawnSync has not been seen returning an
+    // error alongside a numeric status. The branch exists so a future/platform
+    // variant cannot fall through to success, which is what happened when only
+    // ENOENT and ENOBUFS were recognised.
+    it('rejects an error carried alongside a numeric status', () => {
+      for (const code of ['EPERM', 'EAGAIN']) {
+        const spawnErr = Object.assign(new Error(`spawnSync ${code}`), { code });
+        const result = classify(spawnResult({ error: spawnErr, status: 0, stdout: '' }));
+
+        expect(isErr(result), code).toBe(true);
+        if (isErr(result)) {
+          expect(result.error.kind).toBe('crashed');
+          expect(result.error.message).toContain(code);
+        }
+      }
+    });
+
     it('reports a null status with no signal as a crash', () => {
       const result = classify(spawnResult({ status: null, signal: null }));
 
       expect(isErr(result)).toBe(true);
       if (isErr(result)) expect(result.error.kind).toBe('crashed');
+    });
+
+    it('names the spawn error alongside a null status', () => {
+      const spawnErr = Object.assign(new Error('spawnSync EAGAIN'), { code: 'EAGAIN' });
+      const result = classify(spawnResult({ error: spawnErr, status: null, signal: null }));
+
+      expect(isErr(result)).toBe(true);
+      if (isErr(result)) expect(result.error.message).toContain('EAGAIN');
+    });
+
+    // Not every spawn error carries a `code`; falling back to the message keeps
+    // the failure diagnosable instead of reporting "undefined".
+    it('falls back to the error message when there is no error code', () => {
+      const codeless = new Error('resource temporarily unavailable');
+
+      const nullStatus = classify(spawnResult({ error: codeless, status: null, signal: null }));
+      expect(isErr(nullStatus)).toBe(true);
+      if (isErr(nullStatus)) {
+        expect(nullStatus.error.message).toContain('resource temporarily unavailable');
+      }
+
+      const withStatus = classify(spawnResult({ error: codeless, status: 0, stdout: '' }));
+      expect(isErr(withStatus)).toBe(true);
+      if (isErr(withStatus)) {
+        expect(withStatus.error.kind).toBe('crashed');
+        expect(withStatus.error.message).toContain('resource temporarily unavailable');
+      }
     });
 
     it('survives a child that produced no stdout or stderr at all', () => {

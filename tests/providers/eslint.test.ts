@@ -186,16 +186,65 @@ describe('eslintLintProvider', () => {
     });
 
     it('reports unparseable output with the evidence needed to diagnose it', async () => {
-      await mockEslint({ stdout: 'Error: cannot find config', stderr: 'boom', status: 2 });
+      // Exit 1 (a declared success code) so the classifier passes it through
+      // and the JSON parse is what actually fails.
+      await mockEslint({ stdout: 'Error: cannot find config', stderr: 'boom', status: 1 });
 
       const result = eslintLintProvider.measure(CONTEXT);
 
       expect(isErr(result)).toBe(true);
       if (!isErr(result)) return;
       expect(result.error.kind).toBe('unparseable-output');
-      expect(result.error.evidence.exitCode).toBe(2);
+      expect(result.error.evidence.exitCode).toBe(1);
       expect(result.error.evidence.stderrExcerpt).toBe('boom');
       expect(result.error.evidence.command).toContain('eslint');
+    });
+
+    // eslint exits 2 with EMPTY stdout when its config is broken -- verified by
+    // running it against a malformed config. Before this was fixed, exit 2 was
+    // treated as success, '' became '[]', and the provider reported a clean
+    // project that had never been linted.
+    it('reports eslint\'s fatal exit 2 as a failure, not a clean project', async () => {
+      await mockEslint({ stdout: '', stderr: 'Invalid config', status: 2 });
+
+      const result = eslintLintProvider.measure(CONTEXT);
+
+      expect(isErr(result)).toBe(true);
+      if (isErr(result)) expect(result.error.kind).toBe('crashed');
+    });
+
+    // Valid JSON of the wrong shape. The pre-extraction code caught this
+    // because parse AND iteration shared one try; the extraction guarded only
+    // the parse, so these threw an uncaught TypeError out of measure().
+    //
+    // The last three are the ones a shallower validator let through:
+    //   messages:[null]   passed the array check, then threw on msg.severity
+    //   absent counts     became 0 via `|| 0`, so malformed read as clean
+    //   "7" as a count    made `errors` the STRING "07" by concatenation, which
+    //                     rules.ts rejects as non-numeric and then SKIPS --
+    //                     and a skipped ceiling passes
+    it('reports well-formed JSON of the wrong shape as unparseable', async () => {
+      for (const stdout of [
+        '{}',
+        '"a string"',
+        '[{"filePath":"x.ts","errorCount":7,"warningCount":0}]',
+        '[{"filePath":"x.ts","errorCount":1,"warningCount":0,"messages":null}]',
+        '[null]',
+        '[{"filePath":"x.ts","errorCount":1,"warningCount":0,"messages":[null]}]',
+        '[{"filePath":"x.ts","messages":[]}]',
+        '[{"filePath":"x.ts","errorCount":"7","warningCount":0,"messages":[]}]',
+        '[{"filePath":"x.ts","errorCount":1,"warningCount":0,"messages":[{"ruleId":"r","message":"m"}]}]',
+      ]) {
+        await mockEslint({ stdout, status: 1 });
+
+        let result;
+        expect(() => {
+          result = eslintLintProvider.measure(CONTEXT);
+        }, `must not throw for ${stdout}`).not.toThrow();
+
+        expect(isErr(result!), stdout).toBe(true);
+        if (isErr(result!)) expect(result!.error.kind).toBe('unparseable-output');
+      }
     });
 
     it('reports a missing binary as tool-missing', async () => {
@@ -210,13 +259,29 @@ describe('eslintLintProvider', () => {
   });
 
   describe('preserved pre-extraction behaviour', () => {
-    // Retained deliberately: `stdout || '[]'`. It is half of the original
-    // silent-failure bug, kept so the extraction step alters nothing, and
-    // reachable now only when the process exited cleanly with no output --
-    // the dangerous cases are caught before parsing. Step 6 removes it, and
-    // this test is expected to change then.
-    it('treats clean-exit empty output as zero findings', async () => {
+    // This previously asserted the OPPOSITE -- that clean-exit empty output is
+    // zero findings -- which locked in the vacuous pass rather than testing
+    // anything. eslint's JSON formatter is `JSON.stringify(results)` and a
+    // wholly clean project still emits a full per-file report, so empty stdout
+    // cannot be a legitimate clean result. Verified against eslint 9.
+    it('treats clean-exit empty output as a failure, not zero findings', async () => {
       await mockEslint({ stdout: '', status: 0 });
+
+      const result = eslintLintProvider.measure(CONTEXT);
+
+      expect(isErr(result)).toBe(true);
+      if (isErr(result)) expect(result.error.kind).toBe('unparseable-output');
+    });
+
+    it('accepts a genuinely clean report', async () => {
+      // What eslint actually emits for a clean file -- the case the empty-stdout
+      // check must not break.
+      await mockEslint({
+        stdout: JSON.stringify([
+          { filePath: '/x/src/a.js', messages: [], errorCount: 0, warningCount: 0 },
+        ]),
+        status: 0,
+      });
 
       const result = eslintLintProvider.measure(CONTEXT);
 

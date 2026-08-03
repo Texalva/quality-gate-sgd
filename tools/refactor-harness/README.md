@@ -148,24 +148,34 @@ where that coverage actually lives.
 **Breakage.** Neither the golden nor the mocked unit tests break a real tool.
 `verify-vacuous-pass.mjs` does: it copies the synthetic subject, deletes the
 `type-check` script, points it at a missing binary, corrupts the eslint config,
-and asserts the gate FAILS each time with the right `MeasurementFailure` kind.
-Its unsabotaged control has to measure cleanly, or a chain that called every run
-broken would score a perfect result.
+breaks a custom extractor four ways, and asserts the gate FAILS each time with the
+right `MeasurementFailure` kind. Its unsabotaged control has to measure cleanly,
+or a chain that called every run broken would score a perfect result — and a
+working custom dimension rides along with each sabotage, so a chain that gave up
+at the first failure cannot pass either.
+
+**Whether the product does what the library does.** One case there runs the
+shipped `dist/cli.js` rather than calling into the library, and it earns its keep:
+`extractAllMetricsAsync` is the only extraction path that loads custom dimensions,
+and for the whole life of the tool nothing called it. The CLI used the synchronous
+variant, so every configured `custom.*` ceiling was skipped for want of a metric —
+not merely unmeasured, *never enforced*. Every library-level case in this file
+passed throughout, because each one handed the dimensions in itself. A check that
+only ever calls the function it is testing cannot notice that the product calls a
+different one.
 
 **What the environment does, as opposed to what we assume it does.** Mocked tests
 assert that a hand-written string parses the way its author expected, so they
-cannot catch a wrong belief about the thing being mocked — and three such beliefs
+cannot catch a wrong belief about the tool being mocked — and three such beliefs
 have been wrong in this refactor. `spawnSync`'s `maxBuffer` turned out to be a
 budget *shared* across stdout and stderr; output landing *exactly* on the limit
 turned out not to be truncation; and `git log --format=%P` turned out to honour a
 shallow graft where `git cat-file` does not. Each was stated confidently in a
 comment and falsified by measurement. `verify-baseline-resolution.mjs` is the
 answer for the git one: it builds real repositories, clones one at `--depth 1`,
-and refuses to run (exit 2) if that clone is not actually shallow, since a fixture
-that no longer reproduces the condition proves nothing while still reporting
-success. It also makes a real GPG-signed commit, because PGP armor contains a
-blank line and the header/message split depends on git folding it to a line
-holding a single space.
+and refuses to run (exit 2) if that clone is not actually shallow, since a
+fixture that no longer reproduces the condition proves nothing while still
+reporting success.
 
 `tool-lint-baseline.json` is a separate record of *this repo's own* lint state,
 used to check that refactor commits do not introduce new errors. It is not part

@@ -13,8 +13,7 @@
  * on its own that a dead process found nothing.
  */
 import type { SpawnSyncReturns } from 'child_process';
-import type { IssueSource } from '../targets/types.js';
-import type { MeasurementEvidence, MeasurementFailure, MeasurementFailureKind, Result } from './types.js';
+import type { MeasurementDimension, MeasurementEvidence, MeasurementFailure, MeasurementFailureKind, Result } from './types.js';
 /**
  * Matches the timeouts already in use so the extraction changes no behaviour.
  * The buffer does not match: spawnSync's 1 MiB default silently truncated a
@@ -36,7 +35,7 @@ export declare const isErr: <T, E>(result: Result<T, E>) => result is {
     readonly ok: false;
     readonly error: E;
 };
-export declare function measurementFailure(kind: MeasurementFailureKind, dimension: IssueSource, message: string, evidence: MeasurementEvidence): MeasurementFailure;
+export declare function measurementFailure(kind: MeasurementFailureKind, dimension: MeasurementDimension, message: string, evidence: MeasurementEvidence): MeasurementFailure;
 /**
  * What the process did, independent of whether it succeeded.
  *
@@ -64,7 +63,7 @@ export declare function buildEvidence(spawn: SpawnSyncReturns<string>, command: 
  */
 export declare function classifyProcessOutput(spawn: SpawnSyncReturns<string>, options: {
     readonly command: string;
-    readonly dimension: IssueSource;
+    readonly dimension: MeasurementDimension;
     readonly elapsedMs: number;
     readonly timeoutMs: number;
     readonly maxBufferBytes: number;

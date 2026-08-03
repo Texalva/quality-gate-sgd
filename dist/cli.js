@@ -13,7 +13,10 @@
  *   npx quality-gate-sgd [command] [options]
  */
 import { writeFileSync } from 'fs';
-import { extractAllMetrics, isSonarqubeAvailable, runSonarqubeScan, getTopSonarIssues, } from './metrics.js';
+import { 
+// Deliberately not importing `extractAllMetrics`: it cannot load custom
+// dimensions, so any surface in here that used it silently omitted them.
+extractAllMetricsAsync, describeUnmeasured, isSonarqubeAvailable, runSonarqubeScan, getTopSonarIssues, } from './metrics.js';
 import { loadRules, evaluateRules, isCacheValid } from './rules.js';
 import { loadCache, saveCache, getCurrentCommitHash, getCacheKey, getCacheEntry, setCacheEntry, createCacheEntry, findBaselineEntry, resolveBaselineCommit, pruneOldEntries, } from './cache.js';
 import { getConfig } from './config.js';
@@ -222,9 +225,13 @@ async function runQualityGate(options = { skipSonarQube: false }) {
         }
     }
     // Extract metrics
+    //
+    // The async variant, because it is the only one that loads custom dimensions.
+    // Using the sync one here meant every configured `custom.*` ceiling was
+    // skipped for want of a metric, so those rules were never enforced.
     log('\nExtracting metrics...');
     const requiredScripts = rules.rules.requiredScripts || ['quality'];
-    const metrics = extractAllMetrics({
+    const metrics = await extractAllMetricsAsync({
         scriptsToRun: requiredScripts,
         skipSonarQube: options.skipSonarQube,
     });
@@ -272,6 +279,9 @@ async function runQualityGate(options = { skipSonarQube: false }) {
     // no run ever fully earned, and `isCacheValid` returns true for any cached
     // pass without re-checking. Recording nothing means the next run, which may
     // well have a baseline by then, evaluates them for real.
+    //
+    // NOT the same as failing the gate on it, which is a live question -- see the
+    // note above `describeMissingBaseline` and the monotonic gap it links to.
     const monotonicSkipped = (rules.rules.monotonic?.length ?? 0) > 0 && baselineEntry === undefined;
     if (measurementFailures.length > 0 || monotonicSkipped) {
         const reasons = [
@@ -419,18 +429,32 @@ async function runScore(args) {
     // Extract metrics
     const rules = loadRules({ coverageOnly: skipSonarQube });
     const requiredScripts = rules.rules.requiredScripts || ['quality'];
-    const metrics = extractAllMetrics({
+    // Async: a fitness score computed over the configured dimensions minus the
+    // custom ones is a confident number about a smaller quality space than the
+    // user defined. See extractAllMetricsAsync.
+    const metrics = await extractAllMetricsAsync({
         scriptsToRun: requiredScripts,
         skipSonarQube,
     });
     // Compute fitness
     const score = computeFitness(metrics);
+    // Reported next to the score rather than in place of it: the score over the
+    // dimensions that could be read is still the most useful answer, but it is not
+    // the complete one it looks like.
+    const unmeasured = describeUnmeasured(metrics);
     if (jsonFlag) {
         console.log(JSON.stringify({
             score,
+            unmeasured,
             metrics,
         }, null, 2));
         return;
+    }
+    if (unmeasured) {
+        log(`\n${unmeasured.length} dimension(s) could NOT be measured, and are missing from this score:`);
+        for (const u of unmeasured)
+            log(`  ${u.dimension} (${u.kind})`);
+        log('');
     }
     log(`Fitness Score: ${formatFitnessScore(score)}`);
     log('');
@@ -498,7 +522,9 @@ async function runSuggest(args) {
     // Extract metrics for fitness score
     const rules = loadRules({ coverageOnly: skipSonarQube });
     const requiredScripts = rules.rules.requiredScripts || ['quality'];
-    const metrics = extractAllMetrics({
+    // Async, for the same reason as runScore: suggestions ranked over a partial
+    // dimension set quietly recommend against the wrong things.
+    const metrics = await extractAllMetricsAsync({
         scriptsToRun: requiredScripts,
         skipSonarQube,
     });

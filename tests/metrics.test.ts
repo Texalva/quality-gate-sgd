@@ -1511,23 +1511,19 @@ describe('extractAllMetrics', () => {
 
     // Mock file existence - return false for coverage files
     vi.mocked(fs.existsSync).mockReturnValue(false)
-    vi.mocked(spawnSync).mockReturnValue({
+    // Custom extractors go through spawnSync now, alongside eslint and tsc, so
+    // the stub has to answer per command rather than uniformly.
+    vi.mocked(spawnSync).mockImplementation((cmd) => ({
       status: 0,
-      stdout: '[]',
+      stdout: String(cmd).includes('custom-output.json')
+        ? JSON.stringify({ customValue: 42 })
+        : '[]',
       stderr: '',
       pid: 123,
       signal: null,
       output: [],
-    })
-    // Mock execSync to return JSON for the custom metric command
-    vi.mocked(execSync).mockImplementation((cmd) => {
-      const cmdStr = String(cmd)
-      if (cmdStr.includes('custom-output.json')) {
-        return JSON.stringify({ customValue: 42 })
-      }
-      // SonarQube response
-      return JSON.stringify({ component: { measures: [] } })
-    })
+    }) as ReturnType<typeof spawnSync>)
+    vi.mocked(execSync).mockReturnValue(JSON.stringify({ component: { measures: [] } }))
 
     const result = extractAllMetrics({
       customDimensions: [
@@ -1547,6 +1543,45 @@ describe('extractAllMetrics', () => {
 
     expect(result.custom).toBeDefined()
     expect(result.custom?.['test_dim']).toBe(42)
+    expect(result.measurementFailures).toBeUndefined()
+  })
+
+  it('reports a broken custom extractor as a measurement failure, not as zero', async () => {
+    // The dangerous case: `custom.*` is gated by ceilings alone and a
+    // lower-better dimension is best at zero, so a broken extractor used to
+    // report a perfect score for a dimension nobody measured.
+    const { spawnSync, execSync } = await import('child_process')
+
+    vi.mocked(fs.existsSync).mockReturnValue(false)
+    vi.mocked(spawnSync).mockImplementation((cmd) => ({
+      // Non-zero only for the custom extractor; eslint and tsc stay healthy so
+      // the failure below cannot be theirs.
+      status: String(cmd).includes('complexity-tool') ? 127 : 0,
+      stdout: '[]',
+      stderr: String(cmd).includes('complexity-tool') ? 'command not found\n' : '',
+      pid: 123,
+      signal: null,
+      output: [],
+    }) as ReturnType<typeof spawnSync>)
+    vi.mocked(execSync).mockReturnValue(JSON.stringify({ component: { measures: [] } }))
+
+    const result = extractAllMetrics({
+      customDimensions: [
+        {
+          path: 'custom.complexity',
+          displayName: 'Complexity',
+          direction: 'lower-better',
+          extractor: { type: 'script', command: 'complexity-tool --score' },
+        },
+      ],
+    })
+
+    expect(result.custom?.['complexity']).toBeUndefined()
+    expect(result.measurementFailures).toHaveLength(1)
+    expect(result.measurementFailures?.[0]).toMatchObject({
+      kind: 'crashed',
+      dimension: 'custom.complexity',
+    })
   })
 
   it('skips custom metrics when skipCustomDimensions is true', async () => {

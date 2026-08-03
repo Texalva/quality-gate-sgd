@@ -4,7 +4,10 @@
  * Implements the tool handlers for the MCP server.
  */
 
-import { extractAllMetrics } from '../metrics.js';
+// Not `extractAllMetrics`: it cannot load custom dimensions, so every handler
+// that used it reported a verdict or a score over a smaller quality space than
+// the project configured.
+import { extractAllMetricsAsync, describeUnmeasured } from '../metrics.js';
 import { loadRules, evaluateRules } from '../rules.js';
 import {
   loadCache,
@@ -135,7 +138,9 @@ export async function handleRun(args: RunArguments): Promise<{
     const rules = loadRules({ coverageOnly: skipSonarQube });
     const requiredScripts = rules.rules.requiredScripts || ['quality'];
 
-    const metrics = extractAllMetrics({
+    // Async variant: it is the only one that loads custom dimensions, and this
+    // handler produces a gate verdict. See extractAllMetricsAsync.
+    const metrics = await extractAllMetricsAsync({
       scriptsToRun: requiredScripts,
       skipSonarQube,
     });
@@ -176,7 +181,10 @@ export async function handleScore(args: ScoreArguments): Promise<{
     const rules = loadRules({ coverageOnly: skipSonarQube });
     const requiredScripts = rules.rules.requiredScripts || ['quality'];
 
-    const metrics = extractAllMetrics({
+    // Async: it is the only path that loads custom dimensions, and a score
+    // computed over fewer dimensions than the project configured is a confident
+    // number about a smaller quality space. See extractAllMetricsAsync.
+    const metrics = await extractAllMetricsAsync({
       scriptsToRun: requiredScripts,
       skipSonarQube,
     });
@@ -186,6 +194,10 @@ export async function handleScore(args: ScoreArguments): Promise<{
 
     const response = {
       score: Math.round(score * 10) / 10,
+      // Reported alongside the score, not instead of it: the score is still the
+      // best available reading, but a caller cannot judge it without knowing
+      // which dimensions are missing from it.
+      unmeasured: describeUnmeasured(metrics),
       breakdown: gradient.slice(0, 10).map(g => ({
         dimension: g.dimension,
         displayName: g.displayName,
@@ -216,12 +228,14 @@ export async function handleSuggest(args: SuggestArguments): Promise<{
     const rules = loadRules({ coverageOnly: skipSonarQube });
     const requiredScripts = rules.rules.requiredScripts || ['quality'];
 
-    const metrics = extractAllMetrics({
+    // Async, for the reason given in handleScore.
+    const metrics = await extractAllMetricsAsync({
       scriptsToRun: requiredScripts,
       skipSonarQube,
     });
 
     const currentScore = computeFitness(metrics);
+    const unmeasured = describeUnmeasured(metrics);
 
     // Dimension-level suggestions (original behavior)
     if (granularity === 'dimension') {
@@ -230,6 +244,7 @@ export async function handleSuggest(args: SuggestArguments): Promise<{
       const response = {
         mode: 'dimension',
         currentScore: Math.round(currentScore * 10) / 10,
+        unmeasured,
         suggestions: suggestions.map(s => ({
           dimension: s.dimension,
           displayName: s.displayName,
@@ -261,6 +276,7 @@ export async function handleSuggest(args: SuggestArguments): Promise<{
     const response = {
       mode: granularity,
       currentScore: Math.round(currentScore * 10) / 10,
+      unmeasured,
       issuesSummary: {
         total: extractedIssues.totalCount,
         coverage: extractedIssues.summary.coverage,

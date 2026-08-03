@@ -525,8 +525,11 @@ export function extractAllMetrics(scriptsToRunOrOptions = ['quality']) {
     const skipCustomDimensions = options.skipCustomDimensions ?? false;
     // Extract custom metrics if configs are provided and not skipped
     let custom;
+    const customFailures = [];
     if (!skipCustomDimensions && options.customDimensions && options.customDimensions.length > 0) {
-        custom = extractAllCustomMetrics(options.customDimensions);
+        const reading = extractAllCustomMetrics(options.customDimensions);
+        custom = reading.metrics;
+        customFailures.push(...reading.failures);
     }
     // Measured once each, and both halves of every reading kept together: the
     // metrics if it worked, the reason if it did not. Calling the public
@@ -534,9 +537,12 @@ export function extractAllMetrics(scriptsToRunOrOptions = ['quality']) {
     // the only thing that makes a missing ceiling metric fail rather than pass.
     const typescript = measureTypescript();
     const eslint = measureEslint();
-    const measurementFailures = [typescript, eslint]
-        .filter((reading) => !reading.ok)
-        .map((reading) => reading.error);
+    const measurementFailures = [
+        ...[typescript, eslint]
+            .filter((reading) => !reading.ok)
+            .map((reading) => reading.error),
+        ...customFailures,
+    ];
     return {
         coverage: extractAllCoverageMetrics(),
         typescript: typescript.ok ? typescript.value.metrics : undefined,
@@ -549,14 +555,49 @@ export function extractAllMetrics(scriptsToRunOrOptions = ['quality']) {
     };
 }
 /**
+ * The dimensions a reading is missing, for the surfaces that report a NUMBER
+ * rather than a verdict.
+ *
+ * `score` and `suggest` cannot reasonably refuse to answer the way the gate
+ * does -- a fitness score over the dimensions that could be read is still the
+ * most useful thing available. What they must not do is present it as complete.
+ * A score silently computed over a smaller quality space than the project
+ * configured reads as "you are at 82" when the honest statement is "you are at
+ * 82 across the dimensions I could measure, and one of them I could not".
+ *
+ * Returns `undefined` rather than an empty array so it disappears from JSON
+ * output entirely when everything was measured.
+ */
+export function describeUnmeasured(metrics) {
+    const failures = metrics.measurementFailures ?? [];
+    if (failures.length === 0)
+        return undefined;
+    return failures.map((failure) => ({
+        dimension: failure.dimension,
+        kind: failure.kind,
+        why: failure.message,
+    }));
+}
+/**
  * Async version of extractAllMetrics that loads custom dimensions from config.
- * Use this when you want automatic custom dimension discovery.
+ *
+ * Every path that produces a GATE VERDICT has to use this rather than
+ * `extractAllMetrics`, and until now none did. `extractAllMetricsAsync` was
+ * exported and never called: the CLI and the MCP server both went through the
+ * synchronous version with no `customDimensions`, so no custom extractor ever
+ * ran, `metrics.custom` was always absent, and `evaluateCeilings` skipped every
+ * configured `custom.*` ceiling in silence. The dimensions were not merely
+ * unmeasured -- the rules written against them were never enforced at all.
  */
 export async function extractAllMetricsAsync(options = {}) {
+    const config = getConfig();
     // Load and register custom dimensions if not already provided
     let customDimensions = options.customDimensions;
     if (!customDimensions && !options.skipCustomDimensions) {
-        customDimensions = await registerCustomDimensions();
+        // projectRoot, not the default of process.cwd(): the config belongs to the
+        // project being measured, and the CLI can be invoked from anywhere above or
+        // below it. Searching cwd finds a different project's config, or none.
+        customDimensions = await registerCustomDimensions(config.projectRoot);
     }
     return extractAllMetrics({
         ...options,

@@ -15,8 +15,8 @@
 
 import type { SpawnSyncReturns } from 'child_process';
 
-import type { IssueSource } from '../targets/types.js';
 import type {
+  MeasurementDimension,
   MeasurementEvidence,
   MeasurementFailure,
   MeasurementFailureKind,
@@ -59,7 +59,7 @@ export const isErr = <T, E>(
 
 export function measurementFailure(
   kind: MeasurementFailureKind,
-  dimension: IssueSource,
+  dimension: MeasurementDimension,
   message: string,
   evidence: MeasurementEvidence
 ): MeasurementFailure {
@@ -111,7 +111,7 @@ export function classifyProcessOutput(
   spawn: SpawnSyncReturns<string>,
   options: {
     readonly command: string;
-    readonly dimension: IssueSource;
+    readonly dimension: MeasurementDimension;
     readonly elapsedMs: number;
     readonly timeoutMs: number;
     readonly maxBufferBytes: number;

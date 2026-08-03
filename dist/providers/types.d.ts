@@ -57,6 +57,20 @@ export type Result<T, E> = {
  */
 export type MeasurementFailureKind = 'tool-missing' | 'crashed' | 'timed-out' | 'output-truncated' | 'unparseable-output' | 'report-missing';
 /**
+ * What a failed measurement was measuring.
+ *
+ * Wider than `IssueSource` because that type answers a different question --
+ * which tool located an issue -- and custom dimensions never locate one. They
+ * still need to be nameable here: a `custom.*` dimension is gated by a ceiling
+ * and by nothing else, so a broken extractor is precisely the case where saying
+ * WHICH dimension went unmeasured is the whole value of the report.
+ *
+ * The specific path (`custom.anyCount`) rather than a bare `custom` wherever it
+ * is known, since a project with a dozen custom dimensions gains nothing from
+ * being told that one of them failed.
+ */
+export type MeasurementDimension = IssueSource | 'custom' | `custom.${string}`;
+/**
  * What the process actually did, captured whether or not it succeeded.
  *
  * These are the fields that distinguished a real 0-finding run from a silent
@@ -87,7 +101,7 @@ export interface MeasurementEvidence {
 }
 export interface MeasurementFailure {
     readonly kind: MeasurementFailureKind;
-    readonly dimension: IssueSource;
+    readonly dimension: MeasurementDimension;
     /** Human-readable, safe to surface directly in gate output. */
     readonly message: string;
     readonly evidence: MeasurementEvidence;

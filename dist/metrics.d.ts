@@ -73,8 +73,34 @@ interface MetricsExtractionOptions {
 }
 export declare function extractAllMetrics(scriptsToRunOrOptions?: string[] | MetricsExtractionOptions): Metrics;
 /**
+ * The dimensions a reading is missing, for the surfaces that report a NUMBER
+ * rather than a verdict.
+ *
+ * `score` and `suggest` cannot reasonably refuse to answer the way the gate
+ * does -- a fitness score over the dimensions that could be read is still the
+ * most useful thing available. What they must not do is present it as complete.
+ * A score silently computed over a smaller quality space than the project
+ * configured reads as "you are at 82" when the honest statement is "you are at
+ * 82 across the dimensions I could measure, and one of them I could not".
+ *
+ * Returns `undefined` rather than an empty array so it disappears from JSON
+ * output entirely when everything was measured.
+ */
+export declare function describeUnmeasured(metrics: Metrics): readonly {
+    readonly dimension: string;
+    readonly kind: string;
+    readonly why: string;
+}[] | undefined;
+/**
  * Async version of extractAllMetrics that loads custom dimensions from config.
- * Use this when you want automatic custom dimension discovery.
+ *
+ * Every path that produces a GATE VERDICT has to use this rather than
+ * `extractAllMetrics`, and until now none did. `extractAllMetricsAsync` was
+ * exported and never called: the CLI and the MCP server both went through the
+ * synchronous version with no `customDimensions`, so no custom extractor ever
+ * ran, `metrics.custom` was always absent, and `evaluateCeilings` skipped every
+ * configured `custom.*` ceiling in silence. The dimensions were not merely
+ * unmeasured -- the rules written against them were never enforced at all.
  */
 export declare function extractAllMetricsAsync(options?: MetricsExtractionOptions): Promise<Metrics>;
 export {};

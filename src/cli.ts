@@ -367,15 +367,33 @@ async function runQualityGate(options: RunOptions = { skipSonarQube: false }): P
   log('\nEvaluating rules...');
   const result = evaluateRules(rules, metrics, baselineEntry);
 
-  // Create and save cache entry
-  const failedRuleNames = result.failedRules.map((f) => f.rule);
-  const entry = createCacheEntry(
-    metrics,
-    rules,
-    result.status,
-    failedRuleNames
-  );
-  setCacheEntry(cache, cacheKey, entry);
+  // Create and save cache entry -- unless a measurement failed.
+  //
+  // A run that could not measure something has nothing worth remembering: its
+  // numbers are incomplete by definition, and caching them would keep serving
+  // that incomplete reading for the same cache key long after the tool was
+  // fixed. Storing the FAILURE is no better, since the next run would report a
+  // stale breakage. Not writing means the next run re-measures, which is the
+  // only outcome that converges.
+  const measurementFailures = metrics.measurementFailures ?? [];
+
+  if (measurementFailures.length > 0) {
+    log(
+      `\n${measurementFailures.length} measurement(s) failed; not caching this run:`
+    );
+    for (const failure of measurementFailures) {
+      log(`  ${failure.dimension}: ${failure.kind}`);
+    }
+  } else {
+    const failedRuleNames = result.failedRules.map((f) => f.rule);
+    const entry = createCacheEntry(
+      metrics,
+      rules,
+      result.status,
+      failedRuleNames
+    );
+    setCacheEntry(cache, cacheKey, entry);
+  }
 
   // Prune old entries (keep last 90 days)
   const pruned = pruneOldEntries(cache, 90);

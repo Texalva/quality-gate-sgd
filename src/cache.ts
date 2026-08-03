@@ -16,7 +16,30 @@ import type {
 import { computeRulesHash } from './rules.js';
 import { getConfig } from './config.js';
 
-const CURRENT_SCHEMA_VERSION = 1;
+/**
+ * 2 since measurement failures started failing the gate. Every version-1 entry
+ * was scored under the old semantics, where a crashed tool became `{errors: 0}`,
+ * so a stored PASS from then may be a vacuous one. `loadCache` discards a
+ * mismatched schema, which is the point: the fix must not be undone by a cache
+ * written before it.
+ */
+const CURRENT_SCHEMA_VERSION = 2;
+
+/**
+ * Buffer ceiling for the git reads whose output scales with the repository.
+ *
+ * `execSync` THROWS on overflow rather than truncating -- verified: ENOBUFS,
+ * with a partial and unpredictable amount of output attached to the error -- and
+ * its default ceiling is 1 MiB.
+ * That matters here because the overflow is correlated with the very thing
+ * being measured: the more files a tree has modified or untracked, the longer
+ * `git status --porcelain` gets, so the dirtiest trees were the likeliest to
+ * throw. Combined with the catch that used to answer "clean", the failure mode
+ * got MORE likely exactly when being wrong cost the most.
+ *
+ * Not applied to `git rev-parse`, whose output is a single 41-byte hash.
+ */
+const GIT_MAX_BUFFER = 64 * 1024 * 1024;
 
 // =============================================================================
 // Git Utilities
@@ -52,7 +75,19 @@ export function getBaselineCommitHash(): string | undefined {
 // =============================================================================
 
 /**
- * Check if there are any uncommitted changes (staged or unstaged)
+ * Check if there are any uncommitted changes (staged or unstaged).
+ *
+ * Throws rather than guessing. This used to answer `false` on any git failure,
+ * annotated "safe default", and it was the opposite of safe: `false` sends
+ * getCacheKey() down the commit-hash branch, so uncommitted code inherits
+ * whatever verdict that commit last earned -- and cli.ts exits 0 on a cached
+ * pass without measuring anything at all. A quality gate that reports PASS for
+ * code it never looked at is the failure this tool exists to prevent.
+ *
+ * There is also nothing for the swallow to protect. When git is genuinely
+ * unavailable, the very next call (`getCurrentCommitHash`) throws anyway; the
+ * catch only changed which error surfaced, and only after silently committing
+ * to the dangerous branch.
  */
 function hasUncommittedChanges(): boolean {
   const config = getConfig();
@@ -60,11 +95,15 @@ function hasUncommittedChanges(): boolean {
     const output = execSync('git status --porcelain', {
       cwd: config.projectRoot,
       encoding: 'utf-8',
+      maxBuffer: GIT_MAX_BUFFER,
     });
     return output.trim().length > 0;
-  } catch {
-    // If git status fails, assume no changes (safe default)
-    return false;
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new Error(
+      `Failed to determine whether the working tree is clean: ${reason}. ` +
+        'Refusing to assume it is -- that would cache this run against the wrong commit.'
+    );
   }
 }
 
@@ -113,13 +152,14 @@ function computeContentHash(): string {
   const trackedDiff = execSync(`git diff HEAD ${codePathspec}`, {
     cwd: config.projectRoot,
     encoding: 'utf-8',
-    maxBuffer: 10 * 1024 * 1024, // 10MB buffer for large diffs
+    maxBuffer: GIT_MAX_BUFFER,
   });
 
   // Get list of untracked files (not in .gitignore)
   const untrackedList = execSync('git ls-files --others --exclude-standard', {
     cwd: config.projectRoot,
     encoding: 'utf-8',
+    maxBuffer: GIT_MAX_BUFFER,
   }).trim();
 
   // Build content for untracked CODE files only

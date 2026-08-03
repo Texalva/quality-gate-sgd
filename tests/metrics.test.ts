@@ -801,7 +801,12 @@ error TS1234: Another unparseable error.`,
     expect(result.errors).toBe(3)
   })
 
-  it('handles empty output', async () => {
+  // This previously asserted `errors === 0`. A non-zero exit with no output at
+  // all is a type-check that died -- a crash, a kill, a missing script -- and
+  // scoring it zero satisfied a `typescript.errors: 0` ceiling. Absence is now
+  // the answer, and extractAllMetrics records the reason beside it so the gate
+  // fails rather than skipping the rule.
+  it('reports no metrics at all when the type-check produced nothing', async () => {
     const { spawnSync } = await import('child_process')
     vi.mocked(spawnSync).mockReturnValue({
       status: 1,
@@ -812,13 +817,10 @@ error TS1234: Another unparseable error.`,
       output: [],
     })
 
-    const result = extractTypescriptMetrics()
-
-    expect(result.errors).toBe(0)
-    expect(result.rootCauses).toBe(0)
+    expect(extractTypescriptMetrics()).toBeUndefined()
   })
 
-  it('handles null stdout/stderr', async () => {
+  it('reports no metrics when the type-check produced no streams', async () => {
     const { spawnSync } = await import('child_process')
     vi.mocked(spawnSync).mockReturnValue({
       status: 1,
@@ -829,9 +831,7 @@ error TS1234: Another unparseable error.`,
       output: [],
     })
 
-    const result = extractTypescriptMetrics()
-
-    expect(result.errors).toBe(0)
+    expect(extractTypescriptMetrics()).toBeUndefined()
   })
 })
 
@@ -924,7 +924,11 @@ describe('ESLint Metrics', () => {
     expect(result.rootCauses).toBe(3)
   })
 
-  it('handles invalid JSON output', async () => {
+  // This previously asserted `errors === 1`, "falls back to exit code". It
+  // failed the ceiling, so it looked safe, but it reported a linter that could
+  // not run as one ordinary lint error -- sending whoever read it hunting for a
+  // code problem that does not exist.
+  it('reports no metrics when eslint emitted something other than a report', async () => {
     const { spawnSync } = await import('child_process')
     vi.mocked(spawnSync).mockReturnValue({
       status: 1,
@@ -935,13 +939,14 @@ describe('ESLint Metrics', () => {
       output: [],
     })
 
-    const result = extractEslintMetrics()
-
-    expect(result.errors).toBe(1) // Falls back to exit code
-    expect(result.warnings).toBe(0)
+    expect(extractEslintMetrics()).toBeUndefined()
   })
 
-  it('handles invalid JSON output with exit code 0', async () => {
+  // The dangerous half of the pair, and the one that used to pass the gate:
+  // this previously asserted `errors === 0` with the comment "Exit code 0 = no
+  // errors". Exit 0 says the PROCESS was fine, not that its output was a
+  // findings report -- and unparseable output means nothing was counted.
+  it('does not read a clean exit with garbage output as a clean project', async () => {
     const { spawnSync } = await import('child_process')
     vi.mocked(spawnSync).mockReturnValue({
       status: 0,
@@ -952,11 +957,7 @@ describe('ESLint Metrics', () => {
       output: [],
     })
 
-    const result = extractEslintMetrics()
-
-    expect(result.errors).toBe(0) // Exit code 0 = no errors
-    expect(result.warnings).toBe(0)
-    expect(result.rootCauses).toBeUndefined() // Can't compute without parsed output
+    expect(extractEslintMetrics()).toBeUndefined()
   })
 
   it('ignores warnings when counting root causes', async () => {

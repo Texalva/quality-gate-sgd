@@ -114,19 +114,49 @@ describe('cache module', () => {
       expect(result.key).toMatch(/^wip:/)
     })
 
-    it('returns commit hash when git status fails', () => {
+    // This previously asserted the OPPOSITE -- that a failed `git status`
+    // yields the commit hash with isWIP: false. That is not a lenient default,
+    // it is a cache poisoning: cli.ts looks the commit up, finds the verdict it
+    // earned when it was clean, and exits 0 announcing PASSED without running a
+    // single measurement over the uncommitted code.
+    it('refuses to guess the tree state when git status fails', () => {
       mockExecSync
         .mockImplementationOnce(() => {
           throw new Error('git status failed')
         }) // git status --porcelain fails
         .mockReturnValueOnce('abc123\n') // git rev-parse HEAD
 
-      const result = getCacheKey()
+      expect(() => getCacheKey()).toThrow(/whether the working tree is clean/)
+    })
 
-      expect(result).toEqual({
-        key: 'abc123',
-        isWIP: false,
-      })
+    // The realistic trigger, and the reason this is not a theoretical concern:
+    // execSync throws ENOBUFS past its 1 MiB default rather than truncating,
+    // and `git status --porcelain` grows with the number of changed files. The
+    // failure was therefore likeliest on the dirtiest trees -- the ones where
+    // reusing a clean commit's verdict does the most damage.
+    it('does not report a clean tree when git status output overflows the buffer', () => {
+      mockExecSync
+        .mockImplementationOnce(() => {
+          throw Object.assign(new Error('spawnSync /bin/sh ENOBUFS'), {
+            code: 'ENOBUFS',
+          })
+        })
+        .mockReturnValueOnce('abc123\n')
+
+      expect(() => getCacheKey()).toThrow(/ENOBUFS/)
+    })
+
+    it('reads git status with a buffer far above the default', () => {
+      mockExecSync
+        .mockReturnValueOnce('') // git status --porcelain
+        .mockReturnValueOnce('abc123\n') // git rev-parse HEAD
+
+      getCacheKey()
+
+      expect(mockExecSync).toHaveBeenCalledWith(
+        'git status --porcelain',
+        expect.objectContaining({ maxBuffer: 64 * 1024 * 1024 })
+      )
     })
 
     it('includes untracked code files in content hash', () => {
@@ -205,14 +235,14 @@ describe('cache module', () => {
       const result = loadCache()
 
       expect(result).toEqual({
-        schemaVersion: 1,
+        schemaVersion: 2,
         entries: {},
       })
     })
 
     it('returns parsed cache when file exists with valid schema', () => {
       const cacheData: QualityGateCache = {
-        schemaVersion: 1,
+        schemaVersion: 2,
         entries: {
           'abc123': {
             timestamp: 12345,
@@ -240,16 +270,20 @@ describe('cache module', () => {
       const result = loadCache()
 
       expect(result).toEqual({
-        schemaVersion: 1,
+        schemaVersion: 2,
         entries: {},
       })
       consoleSpy.mockRestore()
     })
 
+    // Version 1 specifically, because that is the schema whose entries were
+    // scored before a failed measurement could fail the gate. A stored PASS
+    // from then may be a vacuous one, so discarding it is the point of the
+    // bump rather than a side effect.
     it('returns empty cache on schema version mismatch', () => {
       const oldCache = {
-        schemaVersion: 0,
-        entries: {},
+        schemaVersion: 1,
+        entries: { abc123: { timestamp: 1, evaluation: { status: 'pass', failedRules: [] } } },
       }
 
       mockFs.existsSync.mockReturnValue(true)
@@ -259,7 +293,7 @@ describe('cache module', () => {
       const result = loadCache()
 
       expect(result).toEqual({
-        schemaVersion: 1,
+        schemaVersion: 2,
         entries: {},
       })
       consoleSpy.mockRestore()
@@ -267,7 +301,7 @@ describe('cache module', () => {
 
     it('returns empty cache when entries is not an object', () => {
       const invalidCache = {
-        schemaVersion: 1,
+        schemaVersion: 2,
         entries: 'not an object',
       }
 
@@ -278,7 +312,7 @@ describe('cache module', () => {
       const result = loadCache()
 
       expect(result).toEqual({
-        schemaVersion: 1,
+        schemaVersion: 2,
         entries: {},
       })
       consoleSpy.mockRestore()
@@ -292,7 +326,7 @@ describe('cache module', () => {
       const result = loadCache()
 
       expect(result).toEqual({
-        schemaVersion: 1,
+        schemaVersion: 2,
         entries: {},
       })
       consoleSpy.mockRestore()
@@ -300,7 +334,7 @@ describe('cache module', () => {
 
     it('returns empty cache when entries is null', () => {
       const invalidCache = {
-        schemaVersion: 1,
+        schemaVersion: 2,
         entries: null,
       }
 
@@ -311,7 +345,7 @@ describe('cache module', () => {
       const result = loadCache()
 
       expect(result).toEqual({
-        schemaVersion: 1,
+        schemaVersion: 2,
         entries: {},
       })
       consoleSpy.mockRestore()
@@ -321,7 +355,7 @@ describe('cache module', () => {
   describe('saveCache', () => {
     it('writes sorted cache to file', () => {
       const cache: QualityGateCache = {
-        schemaVersion: 1,
+        schemaVersion: 2,
         entries: {
           'zzz': { timestamp: 1, rulesVersion: '1.0.0', rulesHash: 'h', evaluation: { status: 'pass', failedRules: [] }, metrics: {} as Metrics },
           'aaa': { timestamp: 2, rulesVersion: '1.0.0', rulesHash: 'h', evaluation: { status: 'pass', failedRules: [] }, metrics: {} as Metrics },
@@ -353,7 +387,7 @@ describe('cache module', () => {
         metrics: {} as Metrics,
       }
       const cache: QualityGateCache = {
-        schemaVersion: 1,
+        schemaVersion: 2,
         entries: { 'abc123': entry },
       }
 
@@ -364,7 +398,7 @@ describe('cache module', () => {
 
     it('returns undefined for missing key', () => {
       const cache: QualityGateCache = {
-        schemaVersion: 1,
+        schemaVersion: 2,
         entries: {},
       }
 
@@ -377,7 +411,7 @@ describe('cache module', () => {
   describe('setCacheEntry', () => {
     it('sets entry in cache', () => {
       const cache: QualityGateCache = {
-        schemaVersion: 1,
+        schemaVersion: 2,
         entries: {},
       }
       const entry: CacheEntry = {
@@ -438,7 +472,7 @@ describe('cache module', () => {
       mockExecSync.mockReturnValue('headcommit\n')
 
       const cache: QualityGateCache = {
-        schemaVersion: 1,
+        schemaVersion: 2,
         entries: { 'headcommit': headEntry },
       }
       const rules: QualityRules = { version: '1.0.0', rules: {} }
@@ -460,7 +494,7 @@ describe('cache module', () => {
       mockExecSync.mockReturnValue('parentcommit\n')
 
       const cache: QualityGateCache = {
-        schemaVersion: 1,
+        schemaVersion: 2,
         entries: { 'parentcommit': parentEntry },
       }
       const rules: QualityRules = { version: '1.0.0', rules: {} }
@@ -476,7 +510,7 @@ describe('cache module', () => {
       })
 
       const cache: QualityGateCache = {
-        schemaVersion: 1,
+        schemaVersion: 2,
         entries: {},
       }
       const rules: QualityRules = { version: '1.0.0', rules: {} }
@@ -490,7 +524,7 @@ describe('cache module', () => {
       mockExecSync.mockReturnValue('parentcommit\n')
 
       const cache: QualityGateCache = {
-        schemaVersion: 1,
+        schemaVersion: 2,
         entries: {
           'othercommit': {
             timestamp: 12345,
@@ -516,7 +550,7 @@ describe('cache module', () => {
       const recentTimestamp = now - 10 * 24 * 60 * 60 * 1000 // 10 days ago
 
       const cache: QualityGateCache = {
-        schemaVersion: 1,
+        schemaVersion: 2,
         entries: {
           'old': { timestamp: oldTimestamp, rulesVersion: '1.0.0', rulesHash: 'h', evaluation: { status: 'pass', failedRules: [] }, metrics: {} as Metrics },
           'recent': { timestamp: recentTimestamp, rulesVersion: '1.0.0', rulesHash: 'h', evaluation: { status: 'pass', failedRules: [] }, metrics: {} as Metrics },
@@ -532,7 +566,7 @@ describe('cache module', () => {
 
     it('returns 0 when no entries to prune', () => {
       const cache: QualityGateCache = {
-        schemaVersion: 1,
+        schemaVersion: 2,
         entries: {},
       }
 

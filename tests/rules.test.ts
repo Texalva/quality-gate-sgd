@@ -9,6 +9,7 @@ import {
 import { resetConfig } from '../src/config.js'
 import { isEmbeddedDefaults } from '../src/defaults.js'
 import type { QualityRules, Metrics, CacheEntry } from '../src/types.js'
+import type { MeasurementFailure } from '../src/providers/types.js'
 
 describe('loadRules', () => {
   afterEach(() => {
@@ -281,7 +282,12 @@ describe('evaluateRules', () => {
       expect(result.failedRules[0].type).toBe('ceiling')
     })
 
-    it('ignores missing metrics for ceilings', () => {
+    // A ceiling whose metric was never ASKED for stays skipped. That is the
+    // legitimate half: nobody configured SonarQube, so there is nothing to
+    // check and nothing failed. The other half -- a metric that is absent
+    // because measuring it BROKE -- is the vacuous pass, and is covered by the
+    // measurement suite below. Only `measurementFailures` distinguishes them.
+    it('ignores a ceiling whose metric was never measured in the first place', () => {
       const rules: QualityRules = {
         version: '1.0.0',
         rules: {
@@ -298,6 +304,105 @@ describe('evaluateRules', () => {
       }
 
       const result = evaluateRules(rules, metrics)
+
+      expect(result.status).toBe('pass')
+      expect(metrics.measurementFailures).toBeUndefined()
+    })
+  })
+
+  // =========================================================================
+  // Measurement failures
+  // =========================================================================
+  //
+  // The counterweight to the ceiling asymmetry above. Ceilings guard
+  // typescript.errors, eslint.errors, sonarqube.* and every custom.* dimension
+  // -- none of which have floors -- so before this, a tool that crashed made
+  // its own ceiling disappear.
+  describe('measurement failures', () => {
+    const failure = (dimension: 'eslint' | 'typescript', kind: string) => ({
+      kind: kind as MeasurementFailure['kind'],
+      dimension,
+      message: `\`${dimension}\` did not run`,
+      evidence: {
+        command: dimension,
+        exitCode: null,
+        signal: 'SIGKILL',
+        elapsedMs: 1234,
+        stdoutBytes: 0,
+        stderrBytes: 0,
+      },
+    })
+
+    it('fails the gate when a measurement could not be taken', () => {
+      const rules: QualityRules = { version: '1.0.0', rules: {} }
+      const metrics: Metrics = {
+        scripts: {},
+        measurementFailures: [failure('eslint', 'crashed')],
+      }
+
+      const result = evaluateRules(rules, metrics)
+
+      expect(result.status).toBe('fail')
+      expect(result.failedRules[0].type).toBe('measurement')
+      expect(result.failedRules[0].rule).toBe('eslint.measurement')
+    })
+
+    // The whole point. The metric is absent, its ceiling is skipped exactly as
+    // before, and the run still fails -- on the failure rather than the rule.
+    it('fails even though the skipped ceiling would have passed on its own', () => {
+      const rules: QualityRules = {
+        version: '1.0.0',
+        rules: { ceilings: { 'eslint.errors': 0 } },
+      }
+      const metrics: Metrics = {
+        scripts: {},
+        measurementFailures: [failure('eslint', 'output-truncated')],
+      }
+
+      const result = evaluateRules(rules, metrics)
+
+      expect(result.status).toBe('fail')
+      expect(result.failedRules.some((f) => f.type === 'ceiling')).toBe(false)
+      expect(result.failedRules.some((f) => f.type === 'measurement')).toBe(true)
+    })
+
+    // Not conditional on a matching rule: a tool asked to run and unable to is
+    // a broken build whether or not anyone wrote a threshold for it. Making it
+    // conditional would leave the original hole open for everyone who had not.
+    it('fails with no rules configured at all', () => {
+      const result = evaluateRules({ version: '1.0.0', rules: {} }, {
+        scripts: {},
+        measurementFailures: [failure('typescript', 'timed-out')],
+      })
+
+      expect(result.status).toBe('fail')
+    })
+
+    it('reports every failure, not just the first', () => {
+      const result = evaluateRules({ version: '1.0.0', rules: {} }, {
+        scripts: {},
+        measurementFailures: [failure('eslint', 'crashed'), failure('typescript', 'tool-missing')],
+      })
+
+      expect(result.failedRules.filter((f) => f.type === 'measurement')).toHaveLength(2)
+    })
+
+    it('carries the evidence into the message so the cause is diagnosable', () => {
+      const result = evaluateRules({ version: '1.0.0', rules: {} }, {
+        scripts: {},
+        measurementFailures: [failure('typescript', 'timed-out')],
+      })
+
+      expect(result.failedRules[0].message).toContain('timed-out')
+      expect(result.failedRules[0].message).toContain('SIGKILL')
+      expect(result.failedRules[0].message).toContain('1234ms')
+    })
+
+    it('passes when the list is present but empty', () => {
+      const result = evaluateRules({ version: '1.0.0', rules: {} }, {
+        scripts: {},
+        measurementFailures: [],
+      })
 
       expect(result.status).toBe('pass')
     })

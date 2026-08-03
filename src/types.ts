@@ -1,14 +1,24 @@
 /**
  * Type definitions for the Quality Gate system
- * Schema Version: 1
+ * Schema Version: 2
  */
+
+import type { MeasurementFailure } from './providers/types.js';
 
 // =============================================================================
 // Cache Schema
 // =============================================================================
 
+/**
+ * Bumped to 2 when measurement failures started failing the gate.
+ *
+ * Version 1 entries were computed under the old semantics, where a crashed
+ * linter or type-checker became `{errors: 0}` -- so a stored PASS from then may
+ * be a vacuous one, and reusing it would carry the defect forward past its fix.
+ * `loadCache` discards a mismatched schema, which is exactly the wanted effect.
+ */
 export interface QualityGateCache {
-  schemaVersion: 1;
+  schemaVersion: 2;
   entries: Record<string, CacheEntry>;
 }
 
@@ -35,6 +45,23 @@ export interface Metrics {
   sloc?: number; // Source lines of code for normalization
   /** Custom user-defined metrics (path without "custom." prefix → value) */
   custom?: Record<string, number>;
+
+  /**
+   * Measurements that could not be taken, and why.
+   *
+   * Carried inside Metrics rather than passed beside it deliberately. Every
+   * dimension above is optional, so "absent" already means two different
+   * things -- nobody asked for it, or asking failed -- and only this list tells
+   * them apart. A ceiling on an absent metric is silently skipped by
+   * `evaluateRules`, which is how a dead linter used to pass; the failures
+   * recorded here are what make that same absence loud.
+   *
+   * It travels with the data so that no call site can forget to forward it. A
+   * fourth parameter to `evaluateRules` would have to be threaded through six
+   * call sites, and the one that got missed would be a silent hole of exactly
+   * the kind this field exists to close.
+   */
+  measurementFailures?: readonly MeasurementFailure[];
 }
 
 // =============================================================================
@@ -195,7 +222,7 @@ export interface EvaluationResult {
 }
 
 export interface FailedRule {
-  type: 'floor' | 'ceiling' | 'monotonic' | 'script';
+  type: 'floor' | 'ceiling' | 'monotonic' | 'script' | 'measurement';
   rule: string;
   message: string;
   baseline?: number;

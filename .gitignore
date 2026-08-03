@@ -34,3 +34,6 @@ npm-debug.log*
 
 # Test output
 .scannerwork/
+
+# Per-file scratch dirs for the experiment suites (see scaffold.test.ts)
+.test-experiments*/

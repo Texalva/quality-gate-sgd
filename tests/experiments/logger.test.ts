@@ -16,7 +16,8 @@ import {
 } from '../../src/experiments/logger.js'
 import type { ExperimentCondition } from '../../src/experiments/types.js'
 
-const TEST_LOG_DIR = '.test-experiments'
+// Per-file; see the note in tests/experiments/docker/scaffold.test.ts.
+const TEST_LOG_DIR = '.test-experiments-logger'
 
 describe('experiment logger', () => {
   beforeEach(() => {

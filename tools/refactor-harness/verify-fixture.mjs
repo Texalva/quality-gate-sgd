@@ -11,17 +11,39 @@
  *
  *   node verify-fixture.mjs           # check, exit 1 on drift
  *   node verify-fixture.mjs --write   # (re)generate the manifest
+ *
+ * The subject is 793 MB with node_modules and lives outside the repo, so its
+ * location comes from the manifest that pins it rather than from a path next to
+ * this script. It used to be assumed to be a sibling directory, which meant the
+ * committed copy of this file could not run at all -- only the copy that
+ * happened to sit beside the fixture worked, from identical bytes.
  */
 
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { readFileSync, writeFileSync, existsSync, statSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const FIXTURE = join(HERE, "apollo-client");
 const MANIFEST = join(HERE, "fixture-manifest.json");
+
+const manifestOnDisk = existsSync(MANIFEST)
+  ? JSON.parse(readFileSync(MANIFEST, "utf-8"))
+  : null;
+
+const [FIXTURE, FIXTURE_SOURCE] = process.env.QG_FIXTURE_DIR
+  ? [resolve(process.env.QG_FIXTURE_DIR), "$QG_FIXTURE_DIR"]
+  : manifestOnDisk?.fixture
+    ? [manifestOnDisk.fixture, "fixture-manifest.json"]
+    : [join(HERE, "apollo-client"), "default sibling directory"];
+
+if (!existsSync(FIXTURE) || !statSync(FIXTURE).isDirectory()) {
+  console.error(`FIXTURE MISSING: ${FIXTURE}`);
+  console.error(`  (path came from ${FIXTURE_SOURCE})`);
+  console.error("\nSet QG_FIXTURE_DIR to the subject checkout, or re-clone it there.");
+  process.exit(1);
+}
 
 /**
  * Files that are load-bearing but invisible to `git status` because they are
@@ -73,12 +95,12 @@ if (process.argv.includes("--write")) {
   process.exit(0);
 }
 
-if (!existsSync(MANIFEST)) {
+if (manifestOnDisk === null) {
   console.error("FIXTURE UNVERIFIED: no manifest. Run with --write first.");
   process.exit(1);
 }
 
-const expected = JSON.parse(readFileSync(MANIFEST, "utf-8"));
+const expected = manifestOnDisk;
 const drift = [];
 
 const compare = (label, exp, got) => {
@@ -87,6 +109,9 @@ const compare = (label, exp, got) => {
   }
 };
 
+// A manifest pinning one checkout cannot vouch for a different one, so an
+// override that silently points elsewhere is drift like any other.
+compare("fixture", expected.fixture, FIXTURE);
 compare("head", expected.head, actual.head);
 compare("trackedDiffSha", expected.trackedDiffSha, actual.trackedDiffSha);
 compare("modifiedPaths", expected.modifiedPaths, actual.modifiedPaths);

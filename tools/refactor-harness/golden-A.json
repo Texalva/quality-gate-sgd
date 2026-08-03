@@ -22387,9 +22387,9 @@
       "parsedOk": true,
       "filesCount": 524,
       "messageCount": 1038,
-      "elapsedMs": 35287,
+      "elapsedMs": 38978,
       "budgetMs": 120000,
-      "nearTimeout": false,
+      "killed": false,
       "toolReportedCount": 1038,
       "verdict": "measured"
     },
@@ -22399,9 +22399,10 @@
       "exitCode": 0,
       "combinedBytes": 92,
       "errorCount": 0,
-      "elapsedMs": 25013,
+      "elapsedMs": 29183,
       "budgetMs": 60000,
-      "nearTimeout": false,
+      "killed": false,
+      "unexpectedExit": false,
       "toolReportedCount": 0,
       "verdict": "measured"
     },
@@ -22414,5 +22415,10 @@
       "toolReportedCount": 279,
       "verdict": "measured"
     }
+  },
+  "captureSha": "0d8168419510d42ad33aa80383617e181fb6435dace9019a1fdafc0a13ebcef9",
+  "subject": {
+    "head": "359f3e6357534d7933906d3c4bcb2a3bf5735b4f",
+    "trackedDiffSha": "8ee552bc1ab8625276d83702bf66aee897597171ab01019551afcadf0a454cdd"
   }
 }

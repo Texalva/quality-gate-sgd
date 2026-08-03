@@ -7,9 +7,29 @@
  *   node capture.mjs <tool-dir> <subject-dir> <out.json>
  */
 
-import { writeFileSync, existsSync, readFileSync, statSync } from "node:fs";
+import { writeFileSync, existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { fileURLToPath } from "node:url";
+
+/**
+ * Hash of this script's own bytes, stamped into every capture.
+ *
+ * Two captures taken by different versions of this file differ for reasons that
+ * belong to the instrument, not the tool under test -- so the acceptance gate
+ * refuses to compare them at all rather than reporting the drift as a pass or a
+ * regression. The golden baseline predating this field was captured with an
+ * older liveness heuristic (`nearTimeout`) that has since been shown to
+ * false-positive, which is precisely the confusion this prevents.
+ *
+ * Comment-only edits invalidate a golden too. That is deliberate: re-capturing
+ * to prove nothing changed is cheap, and the alternative is deciding by eye
+ * which edits to this file could have altered a reading.
+ */
+const CAPTURE_SHA = createHash("sha256")
+  .update(readFileSync(fileURLToPath(import.meta.url)))
+  .digest("hex");
 
 const [toolDir, subjectDir, outPath] = process.argv.slice(2);
 if (!toolDir || !subjectDir || !outPath) {
@@ -20,10 +40,84 @@ if (!toolDir || !subjectDir || !outPath) {
 const TOOL = resolve(toolDir);
 const SUBJECT = resolve(subjectDir);
 
+/**
+ * Which state of the subject this reading was taken against.
+ *
+ * `verify-fixture.mjs` checks the same two values, but as a separate step
+ * somebody has to remember to run. Stamping them into the capture makes the
+ * acceptance gate able to refuse a cross-subject comparison on its own, which
+ * matters because a golden master compared against a silently-changed subject
+ * is worse than no golden master: it reports confidence it has not earned.
+ *
+ * The diff hash covers renames and content alike, so an edit anywhere in the
+ * tracked tree moves it.
+ */
+function probeSubjectState(subject) {
+  const git = (...args) =>
+    spawnSync("git", ["-C", subject, ...args], { encoding: "utf-8", maxBuffer: 64 * 1024 * 1024 });
+
+  const head = git("rev-parse", "HEAD");
+  const diff = git("diff", "HEAD");
+
+  if (head.status !== 0 || diff.status !== 0) {
+    // Recorded as unknown rather than omitted. Two captures that both failed to
+    // read the subject would otherwise compare equal on the strength of having
+    // failed alike, so the gate refuses this flag outright.
+    return { head: null, trackedDiffSha: null, unreadable: true };
+  }
+
+  return {
+    head: head.stdout.trim(),
+    trackedDiffSha: createHash("sha256").update(diff.stdout).digest("hex"),
+  };
+}
+
 // The tool reads all of its configuration from the environment at first use.
 process.env.QUALITY_PROJECT_ROOT = SUBJECT;
 process.env.QUALITY_PROJECT_NAME = "stability-subject";
 process.env.QUALITY_CACHE_FILE = resolve(SUBJECT, ".quality-gate-cache.json");
+
+/**
+ * Refuse to measure compiled output older than the source it came from.
+ *
+ * This script imports `dist/`, never `src/`. Nothing else in the workflow
+ * builds, so editing a provider and forgetting `npm run build` produced a
+ * candidate capture that ran the OLD implementation and duly reported
+ * ACCEPTED -- the harness certifying code that was never executed. Mutating
+ * JSON, which is all `verify-gate.mjs` does, cannot catch that.
+ */
+function assertBuildIsCurrent(toolDir) {
+  const newestMtime = (dir) => {
+    let newest = 0;
+    for (const entry of readdirSync(dir, { withFileTypes: true, recursive: true })) {
+      if (!entry.isFile()) continue;
+      if (!/\.(ts|mts|cts|js|mjs|cjs|json)$/.test(entry.name)) continue;
+      newest = Math.max(newest, statSync(resolve(entry.parentPath ?? dir, entry.name)).mtimeMs);
+    }
+    return newest;
+  };
+
+  const srcDir = resolve(toolDir, "src");
+  const distDir = resolve(toolDir, "dist");
+
+  if (!existsSync(distDir)) {
+    console.error(`NOT BUILT: ${distDir} does not exist. Run \`npm run build\` first.`);
+    process.exit(2);
+  }
+
+  const [srcNewest, distNewest] = [newestMtime(srcDir), newestMtime(distDir)];
+
+  if (srcNewest > distNewest) {
+    console.error(
+      `STALE BUILD: src/ is newer than dist/ by ${Math.round((srcNewest - distNewest) / 1000)}s.\n` +
+        `  This capture would measure the previous build, not the current source.\n` +
+        `  Run \`npm run build\` and capture again.`,
+    );
+    process.exit(2);
+  }
+}
+
+assertBuildIsCurrent(TOOL);
 
 const metricsMod = await import(`${TOOL}/dist/metrics.js`);
 const targetsMod = await import(`${TOOL}/dist/targets/index.js`);
@@ -299,6 +393,8 @@ writeFileSync(
       evaluation: stripAbs(evaluation),
       evaluationError: stripAbs(evaluationError),
       liveness: stripAbs(liveness),
+      captureSha: CAPTURE_SHA,
+      subject: probeSubjectState(SUBJECT),
     },
     null,
     2,

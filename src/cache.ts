@@ -57,17 +57,77 @@ export function getCurrentCommitHash(): string {
   }
 }
 
-export function getBaselineCommitHash(): string | undefined {
+/**
+ * Where the previous commit's reading should come from, or why it cannot be said.
+ *
+ * The three cases used to be one. `git rev-parse HEAD~1` failing was read as
+ * "first commit has no parent", which is only one of the reasons it fails.
+ */
+export type BaselineCommit =
+  /** HEAD has a parent, and this is it. */
+  | { readonly kind: 'parent'; readonly hash: string }
+  /** HEAD genuinely has no parent, so there is no baseline to compare against. */
+  | { readonly kind: 'root-commit' }
+  /** Git could not be asked. Distinct from "there is nothing to find". */
+  | { readonly kind: 'indeterminate'; readonly reason: string };
+
+/**
+ * The parent of HEAD, read out of the commit object itself.
+ *
+ * `git rev-parse HEAD~1` is the obvious way and it is wrong here, because it
+ * respects the shallow graft: in a `--depth 1` clone -- what
+ * `actions/checkout` produces by DEFAULT -- it exits 128 "unknown revision".
+ * The old catch turned that into "first commit", `findBaselineEntry` returned
+ * nothing, and `evaluateMonotonic` returns an empty list when it has no
+ * baseline. Every monotonic rule therefore evaporated in CI while passing
+ * locally, which is the exact inversion of where they matter.
+ *
+ * Measured on git 2.51 in a depth-1 clone, since the alternatives look
+ * equivalent and are not:
+ *
+ *   git rev-parse HEAD~1     -> exit 128, fatal: unknown revision
+ *   git rev-parse HEAD^@     -> EMPTY, exit 0   (indistinguishable from a root
+ *                                                commit -- the dangerous one)
+ *   git log -1 --format=%P   -> EMPTY, exit 0   (same trap)
+ *   git cat-file commit HEAD -> `parent <sha>` present and correct
+ *
+ * The commit object is the raw stored object; a shallow clone hides the parent
+ * from revision walks without rewriting it. So the hash is recoverable, and a
+ * cache entry keyed by it is still there to be found.
+ */
+export function resolveBaselineCommit(): BaselineCommit {
   const config = getConfig();
+  let commitObject: string;
+
   try {
-    // Get the parent commit (baseline)
-    return execSync('git rev-parse HEAD~1', {
+    commitObject = execSync('git cat-file commit HEAD', {
       cwd: config.projectRoot,
       encoding: 'utf-8',
-    }).trim();
-  } catch {
-    return undefined; // First commit has no parent
+      maxBuffer: GIT_MAX_BUFFER,
+    });
+  } catch (error) {
+    return {
+      kind: 'indeterminate',
+      reason: error instanceof Error ? error.message : String(error),
+    };
   }
+
+  // Header only. The message follows the first blank line and may itself contain
+  // a line beginning "parent " -- a revert or a cherry-pick note routinely
+  // does -- which a whole-output scan would read as a second parent.
+  const header = commitObject.split('\n\n', 1)[0];
+  const parents = header
+    .split('\n')
+    .filter((line) => line.startsWith('parent '))
+    .map((line) => line.slice('parent '.length).trim());
+
+  if (parents.length === 0) {
+    return { kind: 'root-commit' };
+  }
+
+  // First parent for a merge: the baseline is the branch being merged into,
+  // matching what HEAD~1 meant.
+  return { kind: 'parent', hash: parents[0] };
 }
 
 // =============================================================================
@@ -342,14 +402,27 @@ export function findBaselineEntry(
     return cache.entries[headCommit];
   }
 
-  // For committed code: baseline is HEAD~1
-  const baselineHash = getBaselineCommitHash();
+  // For committed code: baseline is the parent of HEAD
+  const baseline = resolveBaselineCommit();
 
-  if (!baselineHash) {
+  // Throws rather than returning undefined, because undefined here is
+  // indistinguishable from "no baseline exists" and that is precisely the
+  // conflation this function used to make. A missing baseline silently disables
+  // every monotonic rule, so guessing at one is not a safe default -- a gate
+  // that cannot tell whether it checked something must not report a pass.
+  if (baseline.kind === 'indeterminate') {
+    throw new Error(
+      `Failed to determine the commit to compare against: ${baseline.reason}. ` +
+        'Refusing to treat this as a first commit -- that would silently skip every monotonic ' +
+        'rule instead of enforcing it.'
+    );
+  }
+
+  if (baseline.kind === 'root-commit') {
     return undefined;
   }
 
-  const entry = cache.entries[baselineHash];
+  const entry = cache.entries[baseline.hash];
 
   if (!entry) {
     return undefined;

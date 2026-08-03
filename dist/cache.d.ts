@@ -4,7 +4,52 @@
  */
 import type { QualityGateCache, CacheEntry, Metrics, QualityRules } from './types.js';
 export declare function getCurrentCommitHash(): string;
-export declare function getBaselineCommitHash(): string | undefined;
+/**
+ * Where the previous commit's reading should come from, or why it cannot be said.
+ *
+ * The three cases used to be one. `git rev-parse HEAD~1` failing was read as
+ * "first commit has no parent", which is only one of the reasons it fails.
+ */
+export type BaselineCommit = 
+/** HEAD has a parent, and this is it. */
+{
+    readonly kind: 'parent';
+    readonly hash: string;
+}
+/** HEAD genuinely has no parent, so there is no baseline to compare against. */
+ | {
+    readonly kind: 'root-commit';
+}
+/** Git could not be asked. Distinct from "there is nothing to find". */
+ | {
+    readonly kind: 'indeterminate';
+    readonly reason: string;
+};
+/**
+ * The parent of HEAD, read out of the commit object itself.
+ *
+ * `git rev-parse HEAD~1` is the obvious way and it is wrong here, because it
+ * respects the shallow graft: in a `--depth 1` clone -- what
+ * `actions/checkout` produces by DEFAULT -- it exits 128 "unknown revision".
+ * The old catch turned that into "first commit", `findBaselineEntry` returned
+ * nothing, and `evaluateMonotonic` returns an empty list when it has no
+ * baseline. Every monotonic rule therefore evaporated in CI while passing
+ * locally, which is the exact inversion of where they matter.
+ *
+ * Measured on git 2.51 in a depth-1 clone, since the alternatives look
+ * equivalent and are not:
+ *
+ *   git rev-parse HEAD~1     -> exit 128, fatal: unknown revision
+ *   git rev-parse HEAD^@     -> EMPTY, exit 0   (indistinguishable from a root
+ *                                                commit -- the dangerous one)
+ *   git log -1 --format=%P   -> EMPTY, exit 0   (same trap)
+ *   git cat-file commit HEAD -> `parent <sha>` present and correct
+ *
+ * The commit object is the raw stored object; a shallow clone hides the parent
+ * from revision walks without rewriting it. So the hash is recoverable, and a
+ * cache entry keyed by it is still there to be found.
+ */
+export declare function resolveBaselineCommit(): BaselineCommit;
 /**
  * Get the cache key for the current state
  * Returns commit hash for clean working tree, or wip:contentHash for uncommitted changes

@@ -41,6 +41,7 @@ of work is `not-measured`, never `measured`.
 | `verify-gate.mjs [--verbose]` | Is `accept-refactor.mjs` still capable of rejecting? | 0 verified / 1 too weak |
 | `verify-ground-truth.mjs [tool-dir]` | Are the numbers *correct*, against hand-derived expectations? | 0 ok / 1 violated / 2 vacuous |
 | `verify-vacuous-pass.mjs [tool-dir]` | When a measurement genuinely breaks, does the gate say so? | 0 all caught / 1 a break passed |
+| `verify-baseline-resolution.mjs [tool-dir]` | Does baseline resolution survive a real shallow clone? | 0 correct / 1 wrong / 2 fixture inert |
 
 Captures are dumped **unsorted on purpose**. Sorting inside `capture.mjs` would
 hide emission-order nondeterminism, which is one of the things being checked.
@@ -150,6 +151,21 @@ where that coverage actually lives.
 and asserts the gate FAILS each time with the right `MeasurementFailure` kind.
 Its unsabotaged control has to measure cleanly, or a chain that called every run
 broken would score a perfect result.
+
+**What the environment does, as opposed to what we assume it does.** Mocked tests
+assert that a hand-written string parses the way its author expected, so they
+cannot catch a wrong belief about the thing being mocked — and three such beliefs
+have been wrong in this refactor. `spawnSync`'s `maxBuffer` turned out to be a
+budget *shared* across stdout and stderr; output landing *exactly* on the limit
+turned out not to be truncation; and `git log --format=%P` turned out to honour a
+shallow graft where `git cat-file` does not. Each was stated confidently in a
+comment and falsified by measurement. `verify-baseline-resolution.mjs` is the
+answer for the git one: it builds real repositories, clones one at `--depth 1`,
+and refuses to run (exit 2) if that clone is not actually shallow, since a fixture
+that no longer reproduces the condition proves nothing while still reporting
+success. It also makes a real GPG-signed commit, because PGP armor contains a
+blank line and the header/message split depends on git folding it to a line
+holding a single space.
 
 `tool-lint-baseline.json` is a separate record of *this repo's own* lint state,
 used to check that refactor commits do not introduce new errors. It is not part

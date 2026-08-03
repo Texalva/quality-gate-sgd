@@ -22,7 +22,7 @@ vi.mock('../src/rules.js', () => ({
 // Import after mocks
 import {
   getCurrentCommitHash,
-  getBaselineCommitHash,
+  resolveBaselineCommit,
   getCacheKey,
   isWIPKey,
   loadCache,
@@ -36,6 +36,24 @@ import {
 
 const mockFs = vi.mocked(fs)
 const mockExecSync = vi.mocked(execSync)
+
+/**
+ * The raw output of `git cat-file commit <ref>`: header lines, a blank line,
+ * then the message. Reproduced faithfully because the parse depends on that
+ * shape -- the blank line is what keeps a "parent" line in the MESSAGE from
+ * being read as a parent.
+ */
+function commitObject(parents: string[], message = 'subject line'): string {
+  return [
+    'tree 73f4a563c2329887a460e314b14bcde40af16e45',
+    ...parents.map((hash) => `parent ${hash}`),
+    'author Test <t@example.com> 1700000000 +0000',
+    'committer Test <t@example.com> 1700000000 +0000',
+    '',
+    message,
+    '',
+  ].join('\n')
+}
 
 describe('cache module', () => {
   beforeEach(() => {
@@ -64,27 +82,68 @@ describe('cache module', () => {
     })
   })
 
-  describe('getBaselineCommitHash', () => {
-    it('returns parent commit hash', () => {
-      mockExecSync.mockReturnValue('parent123\n')
+  describe('resolveBaselineCommit', () => {
+    it('returns the parent recorded in the commit object', () => {
+      mockExecSync.mockReturnValue(commitObject(['parent123']))
 
-      const result = getBaselineCommitHash()
+      const result = resolveBaselineCommit()
 
-      expect(result).toBe('parent123')
-      expect(mockExecSync).toHaveBeenCalledWith('git rev-parse HEAD~1', {
-        cwd: '/test/project',
-        encoding: 'utf-8',
-      })
+      expect(result).toEqual({ kind: 'parent', hash: 'parent123' })
     })
 
-    it('returns undefined for first commit', () => {
+    it('reads the commit object rather than walking revisions', () => {
+      // The whole fix. `git rev-parse HEAD~1` respects the shallow graft and
+      // fails in a depth-1 clone -- actions/checkout's default -- which the old
+      // code read as "first commit", silently disabling every monotonic rule.
+      // The stored commit object still carries the parent.
+      mockExecSync.mockReturnValue(commitObject(['parent123']))
+
+      resolveBaselineCommit()
+
+      expect(mockExecSync).toHaveBeenCalledWith(
+        'git cat-file commit HEAD',
+        expect.objectContaining({ cwd: '/test/project' })
+      )
+      expect(mockExecSync).not.toHaveBeenCalledWith(
+        expect.stringContaining('HEAD~1'),
+        expect.anything()
+      )
+    })
+
+    it('reports a genuine root commit as a root commit', () => {
+      mockExecSync.mockReturnValue(commitObject([]))
+
+      expect(resolveBaselineCommit()).toEqual({ kind: 'root-commit' })
+    })
+
+    it('reports a git failure as indeterminate, not as a root commit', () => {
+      // These were the same answer before, and they call for opposite responses:
+      // a root commit has no baseline, a broken git means we cannot tell.
       mockExecSync.mockImplementation(() => {
-        throw new Error('no parent')
+        throw new Error('fatal: not a git repository')
       })
 
-      const result = getBaselineCommitHash()
+      const result = resolveBaselineCommit()
 
-      expect(result).toBeUndefined()
+      expect(result.kind).toBe('indeterminate')
+      if (result.kind !== 'indeterminate') return
+      expect(result.reason).toContain('not a git repository')
+    })
+
+    it('takes the first parent of a merge commit', () => {
+      mockExecSync.mockReturnValue(commitObject(['mainline456', 'merged789']))
+
+      expect(resolveBaselineCommit()).toEqual({ kind: 'parent', hash: 'mainline456' })
+    })
+
+    it('ignores a "parent" line inside the commit message', () => {
+      // A revert or cherry-pick note routinely produces one, and a whole-output
+      // scan would read it as a second parent.
+      mockExecSync.mockReturnValue(
+        commitObject(['realparent'], 'Revert a change\n\nparent deadbeefdeadbeefdeadbeef')
+      )
+
+      expect(resolveBaselineCommit()).toEqual({ kind: 'parent', hash: 'realparent' })
     })
   })
 
@@ -491,7 +550,7 @@ describe('cache module', () => {
         metrics: {} as Metrics,
       }
 
-      mockExecSync.mockReturnValue('parentcommit\n')
+      mockExecSync.mockReturnValue(commitObject(['parentcommit']))
 
       const cache: QualityGateCache = {
         schemaVersion: 2,
@@ -504,9 +563,24 @@ describe('cache module', () => {
       expect(result).toBe(parentEntry)
     })
 
-    it('returns undefined when no baseline exists', () => {
+    it('returns undefined on a root commit, which genuinely has no baseline', () => {
+      mockExecSync.mockReturnValue(commitObject([]))
+
+      const cache: QualityGateCache = {
+        schemaVersion: 2,
+        entries: {},
+      }
+      const rules: QualityRules = { version: '1.0.0', rules: {} }
+
+      expect(findBaselineEntry(cache, rules, false)).toBeUndefined()
+    })
+
+    it('throws when the baseline cannot be determined', () => {
+      // Returning undefined here would be indistinguishable from a root commit,
+      // and `evaluateMonotonic` skips every rule when it has no baseline -- so
+      // the quiet answer disables the rules instead of enforcing them.
       mockExecSync.mockImplementation(() => {
-        throw new Error('no parent')
+        throw new Error('fatal: not a git repository')
       })
 
       const cache: QualityGateCache = {
@@ -515,13 +589,13 @@ describe('cache module', () => {
       }
       const rules: QualityRules = { version: '1.0.0', rules: {} }
 
-      const result = findBaselineEntry(cache, rules, false)
-
-      expect(result).toBeUndefined()
+      expect(() => findBaselineEntry(cache, rules, false)).toThrow(
+        /Refusing to treat this as a first commit/
+      )
     })
 
     it('returns undefined when parent commit exists but not in cache', () => {
-      mockExecSync.mockReturnValue('parentcommit\n')
+      mockExecSync.mockReturnValue(commitObject(['parentcommit']))
 
       const cache: QualityGateCache = {
         schemaVersion: 2,

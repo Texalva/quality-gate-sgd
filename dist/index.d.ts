@@ -16,7 +16,7 @@ export { type QualityGateConfig, getConfig, loadConfig, resetConfig, getSonarAut
 export { loadRules, computeRulesHash, evaluateRules, isCacheValid, isUsingEmbeddedDefaults, type LoadRulesOptions, } from './rules.js';
 export { getDefaultRules, isEmbeddedDefaults, COVERAGE_ONLY_DEFAULTS, FULL_DEFAULTS, } from './defaults.js';
 export { extractAllCoverageMetrics, extractCoverageMetrics, extractSonarqubeMetrics, isSonarqubeAvailable, runSonarqubeScan, getTopSonarIssues, type SonarIssue, extractTypescriptMetrics, extractEslintMetrics, runScript, runScripts, extractSloc, extractAllMetrics, extractAllMetricsAsync, } from './metrics.js';
-export { getCurrentCommitHash, getBaselineCommitHash, getCacheKey, isWIPKey, loadCache, saveCache, getCacheEntry, setCacheEntry, createCacheEntry, findBaselineEntry, pruneOldEntries, } from './cache.js';
+export { getCurrentCommitHash, resolveBaselineCommit, getCacheKey, isWIPKey, loadCache, saveCache, getCacheEntry, setCacheEntry, createCacheEntry, findBaselineEntry, pruneOldEntries, } from './cache.js';
 export { DEFAULT_SEVERITY_WEIGHTS, getSeverityWeight, sumSeverityWeights, } from './severity.js';
 export { buildDependencyGraph, buildDependentCounts, getAllTypeScriptFiles, extractLocalImports, calculateDegrees, attachCoverageData, } from './dependency-graph.js';
 export { computePriority, prioritizeFiles, DEFAULT_PRIORITY_WEIGHTS, } from './optimizer.js';

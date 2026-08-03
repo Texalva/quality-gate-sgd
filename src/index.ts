@@ -123,7 +123,7 @@ export {
 export {
   // Git utilities
   getCurrentCommitHash,
-  getBaselineCommitHash,
+  resolveBaselineCommit,
   getCacheKey,
   isWIPKey,
 

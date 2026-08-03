@@ -15,7 +15,7 @@
 import { writeFileSync } from 'fs';
 import { extractAllMetrics, isSonarqubeAvailable, runSonarqubeScan, getTopSonarIssues, } from './metrics.js';
 import { loadRules, evaluateRules, isCacheValid } from './rules.js';
-import { loadCache, saveCache, getCurrentCommitHash, getCacheKey, getCacheEntry, setCacheEntry, createCacheEntry, findBaselineEntry, pruneOldEntries, } from './cache.js';
+import { loadCache, saveCache, getCurrentCommitHash, getCacheKey, getCacheEntry, setCacheEntry, createCacheEntry, findBaselineEntry, resolveBaselineCommit, pruneOldEntries, } from './cache.js';
 import { getConfig } from './config.js';
 import { listIssues } from './list-issues.js';
 import { buildTrajectory, formatTrajectorySummary, trajectorySparkline, } from './trajectory.js';
@@ -100,6 +100,19 @@ function parseRunArgs(args) {
             args.includes('--no-sonar') ||
             args.includes('--coverage-only'),
     };
+}
+/**
+ * Why there is no baseline entry for a committed run.
+ *
+ * Only reached when `findBaselineEntry` returned nothing, and it throws rather
+ * than returning on an indeterminate baseline, so the two remaining cases are a
+ * genuine root commit and a parent that simply has no cached reading.
+ */
+function describeMissingBaseline() {
+    const baseline = resolveBaselineCommit();
+    return baseline.kind === 'root-commit'
+        ? 'this is the first commit, so there is no parent to compare against'
+        : `no cached reading for parent ${baseline.kind === 'parent' ? baseline.hash.slice(0, 7) : 'commit'} -- run the gate on that commit, or commit the cache file, to enable monotonic rules`;
 }
 async function runQualityGate(options = { skipSonarQube: false }) {
     log('Quality Gate SGD v0.1.0');
@@ -192,7 +205,21 @@ async function runQualityGate(options = { skipSonarQube: false }) {
         log(`\nBaseline: ${new Date(baselineEntry.timestamp).toISOString()}`);
     }
     else {
-        log(`\nNo baseline found (${isWIP ? 'no cached HEAD commit' : 'first run or no parent commit'})`);
+        // Says which of the two it is, and what follows from it. The old message
+        // guessed ("first run or no parent commit") and omitted the consequence:
+        // `evaluateMonotonic` returns nothing when it has no baseline, so every
+        // monotonic rule is unenforced for this run. That is not a failure -- a
+        // first run genuinely has nothing to compare against, and failing here
+        // would make the tool unusable on any fresh clone -- but it is a gap in
+        // what the verdict below covers, and it should not have to be inferred.
+        const monotonicCount = rules.rules.monotonic?.length ?? 0;
+        const why = isWIP
+            ? 'no cached reading for the HEAD commit'
+            : describeMissingBaseline();
+        log(`\nNo baseline found (${why})`);
+        if (monotonicCount > 0) {
+            log(`  ${monotonicCount} monotonic rule(s) not evaluated this run -- nothing to compare against.`);
+        }
     }
     // Extract metrics
     log('\nExtracting metrics...');
@@ -239,10 +266,21 @@ async function runQualityGate(options = { skipSonarQube: false }) {
     // stale breakage. Not writing means the next run re-measures, which is the
     // only outcome that converges.
     const measurementFailures = metrics.measurementFailures ?? [];
-    if (measurementFailures.length > 0) {
-        log(`\n${measurementFailures.length} measurement(s) failed; not caching this run:`);
-        for (const failure of measurementFailures) {
-            log(`  ${failure.dimension}: ${failure.kind}`);
+    // The same argument covers a pass whose monotonic rules never ran. It is a
+    // narrower reading than a complete one -- some configured rules were not
+    // applied -- so caching it would let a later run short-circuit to a PASS that
+    // no run ever fully earned, and `isCacheValid` returns true for any cached
+    // pass without re-checking. Recording nothing means the next run, which may
+    // well have a baseline by then, evaluates them for real.
+    const monotonicSkipped = (rules.rules.monotonic?.length ?? 0) > 0 && baselineEntry === undefined;
+    if (measurementFailures.length > 0 || monotonicSkipped) {
+        const reasons = [
+            ...measurementFailures.map((f) => `${f.dimension}: ${f.kind}`),
+            ...(monotonicSkipped ? ['monotonic rules were not evaluated (no baseline)'] : []),
+        ];
+        log(`\nNot caching this run -- it is not a complete reading:`);
+        for (const reason of reasons) {
+            log(`  ${reason}`);
         }
     }
     else {

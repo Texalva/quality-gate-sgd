@@ -41,7 +41,7 @@ extractAllMetrics, extractAllMetricsAsync, } from './metrics.js';
 // =============================================================================
 export { 
 // Git utilities
-getCurrentCommitHash, getBaselineCommitHash, getCacheKey, isWIPKey, 
+getCurrentCommitHash, resolveBaselineCommit, getCacheKey, isWIPKey, 
 // Cache I/O
 loadCache, saveCache, 
 // Cache entry operations

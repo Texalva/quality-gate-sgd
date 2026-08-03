@@ -15,6 +15,9 @@ import type { LocatedIssue, ExtractedIssues, ExtractLocatedIssuesOptions } from 
 export declare function extractCoverageIssues(coverageDir?: string): LocatedIssue[];
 /**
  * Extract TypeScript errors with location information.
+ *
+ * Delegates to the typecheck provider; the parsing that used to live here now
+ * lives in src/providers/typescript.ts, unchanged.
  */
 export declare function extractTypescriptIssues(): LocatedIssue[];
 /**

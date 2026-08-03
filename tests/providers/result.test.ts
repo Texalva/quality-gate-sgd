@@ -14,6 +14,9 @@ import {
 const MAX_BUFFER = 1024;
 const TIMEOUT_MS = 10_000;
 
+/** Each stream under the ceiling on its own; together over it. */
+const BOTH_STREAMS_HALF = Math.ceil(MAX_BUFFER * 0.6);
+
 function spawnResult(overrides: Partial<SpawnSyncReturns<string>> = {}): SpawnSyncReturns<string> {
   return {
     pid: 1234,
@@ -121,17 +124,68 @@ describe('classifyProcessOutput', () => {
       if (isErr(result)) expect(result.error.kind).toBe('output-truncated');
     });
 
+    // Observed, not hypothetical: 600 bytes on each stream against a 1000-byte
+    // limit returns ENOBUFS with a CLEAN exit status and neither stream
+    // individually over the limit. Both details are traps -- exit 0 is a
+    // declared success code, so checking status before the spawn error would
+    // hand back truncated output as a clean measurement, and a per-stream
+    // comparison would see nothing wrong.
+    it('reports ENOBUFS carried alongside a clean exit as output-truncated', () => {
+      const enobufs = Object.assign(new Error('spawnSync ENOBUFS'), { code: 'ENOBUFS' });
+      const result = classify(
+        spawnResult({
+          error: enobufs,
+          status: 0,
+          stdout: 'o'.repeat(BOTH_STREAMS_HALF),
+          stderr: 'e'.repeat(BOTH_STREAMS_HALF),
+        })
+      );
+
+      expect(isErr(result)).toBe(true);
+      if (isErr(result)) expect(result.error.kind).toBe('output-truncated');
+    });
+
+    // maxBuffer is a budget shared across both streams, so neither reaching it
+    // alone is not evidence that the output is complete.
+    it('reports the two streams TOGETHER crossing the ceiling as output-truncated', () => {
+      const result = classify(
+        spawnResult({
+          status: 0,
+          stdout: 'o'.repeat(BOTH_STREAMS_HALF),
+          stderr: 'e'.repeat(BOTH_STREAMS_HALF),
+        })
+      );
+
+      expect(isErr(result)).toBe(true);
+      if (!isErr(result)) return;
+      expect(result.error.kind).toBe('output-truncated');
+      expect(result.error.evidence.stdoutBytes).toBe(BOTH_STREAMS_HALF);
+      expect(result.error.evidence.stderrBytes).toBe(BOTH_STREAMS_HALF);
+    });
+
     // The regression test for the bug this whole module exists to prevent:
-    // 1038 real findings arrived as exactly 1048576 bytes and were reported
-    // as zero errors.
-    it('reports stdout sitting on the buffer ceiling as output-truncated', () => {
-      const result = classify(spawnResult({ stdout: 'x'.repeat(MAX_BUFFER), status: null }));
+    // 1038 real findings arrived as roughly 1 MiB and were reported as zero
+    // errors. Node hands back whatever it had buffered when it gave up, which
+    // is past the limit rather than clipped to it.
+    it('reports stdout past the buffer ceiling as output-truncated', () => {
+      const result = classify(spawnResult({ stdout: 'x'.repeat(MAX_BUFFER + 1), status: null }));
 
       expect(isErr(result)).toBe(true);
       if (isErr(result)) {
         expect(result.error.kind).toBe('output-truncated');
-        expect(result.error.evidence.stdoutBytes).toBe(MAX_BUFFER);
+        expect(result.error.evidence.stdoutBytes).toBe(MAX_BUFFER + 1);
       }
+    });
+
+    // The boundary is STRICTLY greater than, measured on Node: output of
+    // exactly maxBuffer bytes completes with status 0 and arrives whole.
+    // Rejecting it was a false truncation -- and a false failure here becomes a
+    // false PASS, because the caller reads a rejected measurement as zero.
+    it('accepts output landing exactly on the ceiling as complete', () => {
+      const result = classify(spawnResult({ stdout: 'x'.repeat(MAX_BUFFER), status: 0 }));
+
+      expect(isOk(result)).toBe(true);
+      if (isOk(result)) expect(result.value).toHaveLength(MAX_BUFFER);
     });
 
     it('prefers truncation over crash when the child was killed by the buffer', () => {
@@ -139,7 +193,7 @@ describe('classifyProcessOutput', () => {
       // present. Misreporting it as a crash would send someone hunting a
       // subject bug instead of raising a limit.
       const result = classify(
-        spawnResult({ stdout: 'x'.repeat(MAX_BUFFER), status: null, signal: 'SIGTERM' })
+        spawnResult({ stdout: 'x'.repeat(MAX_BUFFER + 1), status: null, signal: 'SIGTERM' })
       );
 
       expect(isErr(result)).toBe(true);
@@ -176,10 +230,12 @@ describe('classifyProcessOutput', () => {
       if (isErr(viaShell)) expect(viaShell.error.kind).toBe('crashed');
     });
 
-    // Defensive rather than observed: spawnSync has not been seen returning an
-    // error alongside a numeric status. The branch exists so a future/platform
-    // variant cannot fall through to success, which is what happened when only
-    // ENOENT and ENOBUFS were recognised.
+    // This was annotated "defensive rather than observed: spawnSync has not
+    // been seen returning an error alongside a numeric status". It has --
+    // ENOBUFS arrives with status 0, tested above. So the pairing is real and
+    // the branch is load-bearing rather than speculative, which is exactly why
+    // an unrecognised code must not fall through to success the way everything
+    // outside ENOENT and ENOBUFS once did.
     it('rejects an error carried alongside a numeric status', () => {
       for (const code of ['EPERM', 'EAGAIN']) {
         const spawnErr = Object.assign(new Error(`spawnSync ${code}`), { code });
@@ -281,13 +337,15 @@ describe('classifyProcessOutput', () => {
     // Whatever else is true of a run, output at or past the ceiling is never
     // trustworthy -- no combination of exit code or signal should let it
     // through as a successful measurement.
-    it('never returns ok for stdout at or beyond the buffer limit', () => {
+    // "Beyond", not "at": exactly maxBuffer bytes is a complete run on Node,
+    // and rejecting it costs a real measurement.
+    it('never returns ok for stdout beyond the buffer limit, whatever the exit', () => {
       const statuses: Array<number | null> = [0, 1, 2, null];
       const signals: Array<NodeJS.Signals | null> = [null, 'SIGTERM', 'SIGKILL'];
 
       for (const status of statuses) {
         for (const signal of signals) {
-          for (const size of [MAX_BUFFER, MAX_BUFFER + 1, MAX_BUFFER * 2]) {
+          for (const size of [MAX_BUFFER + 1, MAX_BUFFER * 2]) {
             const result = classify(spawnResult({ stdout: 'x'.repeat(size), status, signal }));
             expect(result.ok, `status=${status} signal=${signal} size=${size}`).toBe(false);
           }

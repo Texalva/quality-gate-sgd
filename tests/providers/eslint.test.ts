@@ -162,10 +162,10 @@ describe('eslintLintProvider', () => {
 
   describe('failures are failures, not empty results', () => {
     // The regression test for the defect this refactor exists to remove.
-    // 1038 real findings once arrived as exactly 1048576 bytes and were
-    // reported as zero errors, which passed an `eslint.errors: 0` ceiling.
+    // 1038 real findings once arrived as roughly 1 MiB of truncated JSON and
+    // were reported as zero errors, which passed an `eslint.errors: 0` ceiling.
     it('reports truncated output as a failure rather than zero findings', async () => {
-      await mockEslint({ stdout: 'x'.repeat(CONTEXT.maxBufferBytes), status: null });
+      await mockEslint({ stdout: 'x'.repeat(CONTEXT.maxBufferBytes + 1), status: null });
 
       const result = eslintLintProvider.measure(CONTEXT);
 
@@ -173,7 +173,7 @@ describe('eslintLintProvider', () => {
       if (!isErr(result)) return;
       expect(result.error.kind).toBe('output-truncated');
       expect(result.error.dimension).toBe('eslint');
-      expect(result.error.evidence.stdoutBytes).toBe(CONTEXT.maxBufferBytes);
+      expect(result.error.evidence.stdoutBytes).toBe(CONTEXT.maxBufferBytes + 1);
     });
 
     it('reports a killed process as a failure rather than zero findings', async () => {

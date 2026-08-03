@@ -29,12 +29,32 @@ export declare function runSonarqubeScan(): {
     success: boolean;
     error?: string;
 };
-export declare function extractTypescriptMetrics(): TypescriptMetrics;
 /**
- * Delegates to the eslint provider. The parsing that used to live here now
- * lives in src/providers/eslint.ts, unchanged.
+ * Type-check totals, or `undefined` when the type-check could not be run.
+ *
+ * `undefined` rather than `{errors: 0}`. Returning zero was the vacuous pass:
+ * the old inline implementation scanned whatever output arrived with no
+ * exit-code check at all, so a crashed, killed, or missing type-check produced
+ * an empty string, matched no diagnostics, and satisfied a
+ * `typescript.errors: 0` ceiling.
+ *
+ * Absence alone would not fix that -- `evaluateCeilings` skips a missing metric
+ * just as quietly. What makes it loud is `extractAllMetrics` recording the
+ * MeasurementFailure alongside, which `evaluateRules` fails on. Callers using
+ * this function directly get the honest `undefined` and no diagnosis; that is
+ * why the gate path does not use it.
  */
-export declare function extractEslintMetrics(): EslintMetrics;
+export declare function extractTypescriptMetrics(): TypescriptMetrics | undefined;
+/**
+ * Lint totals, or `undefined` when eslint could not be run.
+ *
+ * Replaces `errors: exitCode === 0 ? 0 : 1`, which was wrong twice over: a
+ * linter that could not run was reported as one ordinary lint error, and a
+ * failure that happened to exit 0 -- a broken config, an empty report -- as a
+ * clean project. See extractTypescriptMetrics for why absence is only half the
+ * fix.
+ */
+export declare function extractEslintMetrics(): EslintMetrics | undefined;
 export declare function runScript(script: string): 'pass' | 'fail';
 export declare function runScripts(scripts: string[]): Record<string, 'pass' | 'fail'>;
 /**

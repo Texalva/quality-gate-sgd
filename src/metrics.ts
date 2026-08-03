@@ -21,7 +21,14 @@ import {
   type CustomDimensionConfig,
 } from './dimensions/index.js';
 import { eslintLintProvider } from './providers/eslint.js';
+import { typescriptTypecheckProvider } from './providers/typescript.js';
 import { DEFAULT_MEASUREMENT_LIMITS } from './providers/result.js';
+import type {
+  LintReading,
+  MeasurementFailure,
+  Result,
+  TypecheckReading,
+} from './providers/types.js';
 
 /**
  * spawnSync defaults to a 1 MiB stdout buffer. Past that, Node truncates the
@@ -471,6 +478,9 @@ export function runSonarqubeScan(): { success: boolean; error?: string } {
       shell: true,
       timeout: 300000, // 5 minutes for scan
       stdio: ['pipe', 'pipe', 'pipe'],
+      // A scanner run is chatty enough to cross 1 MiB routinely, and being cut
+      // off there kills the child mid-scan and reads back as a failed scan.
+      maxBuffer: SUBPROCESS_MAX_BUFFER,
     });
 
     const errorOutput = (result.stderr || '') + (result.stdout || '');
@@ -518,120 +528,64 @@ export function runSonarqubeScan(): { success: boolean; error?: string } {
 // TypeScript Metrics
 // =============================================================================
 
-interface TypeScriptError {
-  file: string;
-  line: number;
-  column: number;
-  code: string;
-  message: string;
-}
-
 /**
- * Parse TypeScript error output into structured errors.
- * Format: src/file.ts(10,5): error TS2345: Message here
+ * Measures the type-check once, so callers that want the totals and callers
+ * that want the located errors cannot end up disagreeing about the same run.
  */
-function parseTypescriptErrors(output: string): TypeScriptError[] {
-  const errors: TypeScriptError[] = [];
-  // Match: file(line,col): error TSxxxx: message
-  const errorRegex = /^(.+?)\((\d+),(\d+)\): error (TS\d+): (.+)$/gm;
-
-  let match;
-  while ((match = errorRegex.exec(output)) !== null) {
-    errors.push({
-      file: match[1],
-      line: parseInt(match[2], 10),
-      column: parseInt(match[3], 10),
-      code: match[4],
-      message: match[5],
-    });
-  }
-
-  return errors;
-}
-
-/**
- * Count distinct root causes from TypeScript errors.
- * Root cause = unique (file, code) combination.
- *
- * Rationale: Cascading type errors often share the same error code in the same file.
- * For example, a missing property causes TS2339 on every access attempt.
- * Fixing the root cause fixes all instances.
- *
- * For finer granularity, we could also use symbol paths, but (file, code)
- * is a reasonable first approximation that restores local continuity.
- */
-function countTypescriptRootCauses(errors: TypeScriptError[]): number {
-  const rootCauses = new Set<string>();
-
-  for (const err of errors) {
-    // Group by file + error code
-    // This collapses cascading errors from the same root cause
-    const key = `${err.file}:${err.code}`;
-    rootCauses.add(key);
-  }
-
-  return rootCauses.size;
-}
-
-export function extractTypescriptMetrics(): TypescriptMetrics {
+function measureTypescript(): Result<TypecheckReading, MeasurementFailure> {
   const config = getConfig();
-  const result = spawnSync('npm', ['run', 'type-check'], {
-    cwd: config.projectRoot,
-    encoding: 'utf-8',
-    shell: true,
-    timeout: 60000,
-    maxBuffer: SUBPROCESS_MAX_BUFFER,
+  return typescriptTypecheckProvider.measure({
+    projectRoot: config.projectRoot,
+    timeoutMs: DEFAULT_MEASUREMENT_LIMITS.typecheckTimeoutMs,
+    maxBufferBytes: DEFAULT_MEASUREMENT_LIMITS.maxBufferBytes,
   });
+}
 
-  const output = (result.stdout || '') + (result.stderr || '');
-
-  // Parse structured errors
-  const errors = parseTypescriptErrors(output);
-
-  // Also do simple regex count as fallback (for non-standard output formats)
-  const errorMatches = output.match(/error TS\d+/g) || [];
-  const rawCount = Math.max(errors.length, errorMatches.length);
-
-  return {
-    errors: rawCount,
-    warnings: 0, // TypeScript doesn't have warnings in strict mode
-    rootCauses: countTypescriptRootCauses(errors),
-  };
+/**
+ * Type-check totals, or `undefined` when the type-check could not be run.
+ *
+ * `undefined` rather than `{errors: 0}`. Returning zero was the vacuous pass:
+ * the old inline implementation scanned whatever output arrived with no
+ * exit-code check at all, so a crashed, killed, or missing type-check produced
+ * an empty string, matched no diagnostics, and satisfied a
+ * `typescript.errors: 0` ceiling.
+ *
+ * Absence alone would not fix that -- `evaluateCeilings` skips a missing metric
+ * just as quietly. What makes it loud is `extractAllMetrics` recording the
+ * MeasurementFailure alongside, which `evaluateRules` fails on. Callers using
+ * this function directly get the honest `undefined` and no diagnosis; that is
+ * why the gate path does not use it.
+ */
+export function extractTypescriptMetrics(): TypescriptMetrics | undefined {
+  const reading = measureTypescript();
+  return reading.ok ? reading.value.metrics : undefined;
 }
 
 // =============================================================================
 // ESLint Metrics
 // =============================================================================
 
-/**
- * Delegates to the eslint provider. The parsing that used to live here now
- * lives in src/providers/eslint.ts, unchanged.
- */
-export function extractEslintMetrics(): EslintMetrics {
+function measureEslint(): Result<LintReading, MeasurementFailure> {
   const config = getConfig();
-
-  const reading = eslintLintProvider.measure({
+  return eslintLintProvider.measure({
     projectRoot: config.projectRoot,
     timeoutMs: DEFAULT_MEASUREMENT_LIMITS.lintTimeoutMs,
     maxBufferBytes: DEFAULT_MEASUREMENT_LIMITS.maxBufferBytes,
   });
+}
 
-  if (reading.ok) {
-    return reading.value.metrics;
-  }
-
-  // Preserved verbatim from the pre-extraction implementation so this step
-  // changes structure only. It is wrong -- a linter that could not run is
-  // reported as one ordinary error, and a failure with exit code 0 as a clean
-  // project -- and the provider now returns a MeasurementFailure carrying the
-  // real reason. Consuming that properly is the next step; keeping the old
-  // shape here means the golden baseline can prove the extraction alone
-  // altered nothing.
-  return {
-    errors: reading.error.evidence.exitCode === 0 ? 0 : 1,
-    warnings: 0,
-    rootCauses: undefined,
-  };
+/**
+ * Lint totals, or `undefined` when eslint could not be run.
+ *
+ * Replaces `errors: exitCode === 0 ? 0 : 1`, which was wrong twice over: a
+ * linter that could not run was reported as one ordinary lint error, and a
+ * failure that happened to exit 0 -- a broken config, an empty report -- as a
+ * clean project. See extractTypescriptMetrics for why absence is only half the
+ * fix.
+ */
+export function extractEslintMetrics(): EslintMetrics | undefined {
+  const reading = measureEslint();
+  return reading.ok ? reading.value.metrics : undefined;
 }
 
 // =============================================================================
@@ -646,6 +600,11 @@ export function runScript(script: string): 'pass' | 'fail' {
     encoding: 'utf-8',
     shell: true,
     timeout,
+    // Without this a *passing* script that prints more than 1 MiB -- a test
+    // suite, typically -- is killed at the buffer, comes back with a null
+    // status, and is recorded as a failure. It errs in the safe direction, but
+    // it is still the wrong answer about the script.
+    maxBuffer: SUBPROCESS_MAX_BUFFER,
   });
 
   return result.status === 0 ? 'pass' : 'fail';
@@ -789,14 +748,26 @@ export function extractAllMetrics(
     custom = extractAllCustomMetrics(options.customDimensions);
   }
 
+  // Measured once each, and both halves of every reading kept together: the
+  // metrics if it worked, the reason if it did not. Calling the public
+  // `extract*Metrics` wrappers here instead would discard the reason, which is
+  // the only thing that makes a missing ceiling metric fail rather than pass.
+  const typescript = measureTypescript();
+  const eslint = measureEslint();
+
+  const measurementFailures = [typescript, eslint]
+    .filter((reading): reading is Extract<typeof reading, { ok: false }> => !reading.ok)
+    .map((reading) => reading.error);
+
   return {
     coverage: extractAllCoverageMetrics(),
-    typescript: extractTypescriptMetrics(),
-    eslint: extractEslintMetrics(),
+    typescript: typescript.ok ? typescript.value.metrics : undefined,
+    eslint: eslint.ok ? eslint.value.metrics : undefined,
     sonarqube: skipSonarQube ? undefined : extractSonarqubeMetrics(),
     scripts: runScripts(scriptsToRun),
     sloc: extractSloc(),
     custom,
+    measurementFailures: measurementFailures.length > 0 ? measurementFailures : undefined,
   };
 }
 

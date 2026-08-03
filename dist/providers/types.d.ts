@@ -75,6 +75,13 @@ export interface MeasurementEvidence {
     readonly elapsedMs: number;
     /** Byte length of stdout. Equal to the buffer limit means truncation, not emptiness. */
     readonly stdoutBytes: number;
+    /**
+     * Byte length of stderr. maxBuffer is a budget shared with stdout rather than
+     * a per-stream one, so stderr can be what pushes a run over it. That matters
+     * for type-checking in particular, where diagnostics are scanned out of both
+     * streams, so a truncated stderr silently lowers the error count.
+     */
+    readonly stderrBytes: number;
     /** Leading stderr, truncated. For humans; never parsed. */
     readonly stderrExcerpt?: string;
 }

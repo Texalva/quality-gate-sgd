@@ -53,6 +53,7 @@ export function buildEvidence(spawn, command, elapsedMs) {
         signal: spawn.signal ?? null,
         elapsedMs,
         stdoutBytes: Buffer.byteLength(spawn.stdout ?? ''),
+        stderrBytes: Buffer.byteLength(stderr),
         stderrExcerpt: stderr.slice(0, STDERR_EXCERPT_BYTES) || undefined,
     };
 }
@@ -81,12 +82,31 @@ export function classifyProcessOutput(spawn, options) {
     if (spawnError?.code === 'ENOENT') {
         return fail('tool-missing', `\`${options.command}\` could not be run: the command was not found.`);
     }
-    // ENOBUFS, or stdout sitting exactly on the ceiling. Checked before the
-    // kill check below, because exceeding the buffer also kills the child and
-    // would otherwise be misreported as a crash.
-    if (spawnError?.code === 'ENOBUFS' || evidence.stdoutBytes >= options.maxBufferBytes) {
-        return fail('output-truncated', `\`${options.command}\` produced at least ${evidence.stdoutBytes} bytes and was cut off at the ` +
-            `${options.maxBufferBytes}-byte limit. The output is incomplete; any count derived from it would be wrong.`);
+    // ENOBUFS, or the two streams together past the ceiling.
+    //
+    // Measured on Node 26.5.1 against a 1000-byte limit, since every part of this
+    // is easy to get wrong:
+    //
+    //   999 bytes    -> status 0, 999 returned      (fine)
+    //   1000 bytes   -> status 0, 1000 returned     (fine -- EXACTLY the limit is
+    //                                                not truncation)
+    //   1001 bytes   -> ENOBUFS, status null
+    //   600 + 600    -> ENOBUFS, status 0           (budget is SHARED across the
+    //                                                two streams, not per-stream)
+    //
+    // Hence STRICTLY greater than. `>=` here rejected a complete run whose output
+    // happened to land exactly on the limit, and the caller then read that
+    // rejection as zero findings -- a false failure that becomes a false pass.
+    //
+    // ENOBUFS is the authoritative signal and the byte sum only backs it up. The
+    // order matters more than either: that 600+600 case pairs ENOBUFS with a
+    // CLEAN exit status, so testing the status first would hand back truncated
+    // output as a successful measurement.
+    const combinedBytes = evidence.stdoutBytes + evidence.stderrBytes;
+    if (spawnError?.code === 'ENOBUFS' || combinedBytes > options.maxBufferBytes) {
+        return fail('output-truncated', `\`${options.command}\` produced at least ${combinedBytes} bytes across stdout and stderr ` +
+            `(${evidence.stdoutBytes} + ${evidence.stderrBytes}) against a ${options.maxBufferBytes}-byte ` +
+            'limit, and was cut off. The output is incomplete; any count derived from it would be wrong.');
     }
     if (spawn.signal !== null && spawn.signal !== undefined) {
         const timedOut = options.elapsedMs >= options.timeoutMs * TIMEOUT_ATTRIBUTION_RATIO;

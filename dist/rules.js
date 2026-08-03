@@ -70,6 +70,36 @@ function getMetricValue(metrics, path) {
     return typeof current === 'number' ? current : undefined;
 }
 // =============================================================================
+// Measurement Evaluation
+// =============================================================================
+/**
+ * A measurement that could not be taken fails the gate.
+ *
+ * This is the check the floor/ceiling asymmetry below makes necessary. A
+ * missing FLOOR metric fails loudly (`Metric '...' not available`), but a
+ * missing CEILING metric is skipped without a word -- and ceilings are what
+ * guard `typescript.errors`, `eslint.errors`, `sonarqube.*` and every
+ * `custom.*` dimension, none of which have floors. So for exactly the
+ * dimensions where a crashed tool is likeliest, its output going missing used
+ * to read as a satisfied rule.
+ *
+ * Evaluated regardless of which rules are configured. A tool that was asked to
+ * run and could not is a broken build whether or not anyone wrote a threshold
+ * for it -- and making it conditional on a matching rule would restore the
+ * original hole for anyone who had not.
+ */
+function evaluateMeasurements(metrics) {
+    return (metrics.measurementFailures ?? []).map((failure) => ({
+        type: 'measurement',
+        rule: `${failure.dimension}.measurement`,
+        message: `${failure.dimension} could not be measured (${failure.kind}): ${failure.message} ` +
+            `[exit=${failure.evidence.exitCode ?? 'killed'}` +
+            `${failure.evidence.signal ? ` signal=${failure.evidence.signal}` : ''}` +
+            ` after ${failure.evidence.elapsedMs}ms, ` +
+            `${failure.evidence.stdoutBytes}B stdout, ${failure.evidence.stderrBytes}B stderr]`,
+    }));
+}
+// =============================================================================
 // Floor Evaluation
 // =============================================================================
 function evaluateFloors(rules, metrics) {
@@ -196,6 +226,9 @@ function evaluateScripts(rules, metrics) {
 export function evaluateRules(rules, currentMetrics, baselineEntry) {
     const baselineMetrics = baselineEntry?.metrics;
     const allFailures = [
+        // First, so the reason a dimension is absent is stated before the rules
+        // that read it start reporting it as absent.
+        ...evaluateMeasurements(currentMetrics),
         ...evaluateFloors(rules, currentMetrics),
         ...evaluateCeilings(rules, currentMetrics),
         ...evaluateMonotonic(rules, currentMetrics, baselineMetrics),

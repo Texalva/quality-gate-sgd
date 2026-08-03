@@ -20,6 +20,7 @@ import type {
 import { mapLocationToSymbol } from '../symbols/mapper.js';
 import type { SymbolTable, CodeSymbol } from '../symbols/types.js';
 import { eslintLintProvider } from '../providers/eslint.js';
+import { typescriptTypecheckProvider } from '../providers/typescript.js';
 import { DEFAULT_MEASUREMENT_LIMITS } from '../providers/result.js';
 
 /**
@@ -292,64 +293,30 @@ export function extractCoverageIssues(coverageDir?: string): LocatedIssue[] {
 // TypeScript Issue Extraction
 // =============================================================================
 
-interface TypeScriptError {
-  file: string;
-  line: number;
-  column: number;
-  code: string;
-  message: string;
-}
-
-function parseTypescriptOutput(output: string): TypeScriptError[] {
-  const errors: TypeScriptError[] = [];
-  // Match: file(line,col): error TSxxxx: message
-  const errorRegex = /^(.+?)\((\d+),(\d+)\): error (TS\d+): (.+)$/gm;
-
-  let match;
-  while ((match = errorRegex.exec(output)) !== null) {
-    errors.push({
-      file: match[1],
-      line: parseInt(match[2], 10),
-      column: parseInt(match[3], 10),
-      code: match[4],
-      message: match[5],
-    });
-  }
-
-  return errors;
-}
-
 /**
  * Extract TypeScript errors with location information.
+ *
+ * Delegates to the typecheck provider; the parsing that used to live here now
+ * lives in src/providers/typescript.ts, unchanged.
  */
 export function extractTypescriptIssues(): LocatedIssue[] {
   const config = getConfig();
-  const result = spawnSync('npm', ['run', 'type-check'], {
-    cwd: config.projectRoot,
-    encoding: 'utf-8',
-    shell: true,
-    timeout: 60000,
-    maxBuffer: SUBPROCESS_MAX_BUFFER,
+
+  const reading = typescriptTypecheckProvider.measure({
+    projectRoot: config.projectRoot,
+    timeoutMs: DEFAULT_MEASUREMENT_LIMITS.typecheckTimeoutMs,
+    maxBufferBytes: DEFAULT_MEASUREMENT_LIMITS.maxBufferBytes,
   });
 
-  const output = (result.stdout || '') + (result.stderr || '');
-  const errors = parseTypescriptOutput(output);
-
-  return errors.map((err): LocatedIssue => ({
-    file: err.file,
-    line: err.line,
-    column: err.column,
-    source: 'typescript',
-    dimension: 'typescript.errors',
-    code: err.code,
-    impact: {
-      dimension: 'typescript.errors',
-      delta: -1, // Fixing one error reduces count by 1
-      direction: 'lower-better',
-    },
-    message: err.message,
-    context: `${err.code}: ${err.message}`,
-  }));
+  // Still [] on failure, and still wrong for the same reason: a type-check that
+  // never ran is indistinguishable here from a project with no type errors.
+  //
+  // Not fixed in this pass, deliberately. The GATE VERDICT reads metrics, not
+  // issues, and extractAllMetrics now carries the MeasurementFailure through to
+  // evaluateRules -- so the vacuous PASS is closed. What survives is that the
+  // fix ADVICE says "nothing to fix" when it should say "could not look".
+  // Closing that means giving ExtractedIssues a failure channel of its own.
+  return reading.ok ? [...reading.value.issues] : [];
 }
 
 // =============================================================================
@@ -371,10 +338,8 @@ export function extractEslintIssues(): LocatedIssue[] {
     maxBufferBytes: DEFAULT_MEASUREMENT_LIMITS.maxBufferBytes,
   });
 
-  // Returning [] on failure is preserved verbatim, and is the same defect as
-  // in extractEslintMetrics: a linter that never ran is indistinguishable
-  // from a clean project. The provider now knows which one happened; step 6
-  // is where that reaches the caller.
+  // See extractTypescriptIssues: advisory-only, so still [] on failure while
+  // the gate verdict is protected through extractAllMetrics.
   return reading.ok ? [...reading.value.issues] : [];
 }
 
@@ -452,6 +417,11 @@ export function extractSonarqubeIssues(): LocatedIssue[] {
       ], {
         encoding: 'utf-8',
         timeout: 30000,
+        // A page of issues can exceed 1 MiB. Truncation kills curl, `status`
+        // comes back null, and the break below then returns whatever pages had
+        // already been fetched as if that were the whole result set -- a
+        // silently partial finding list, which is worse than none.
+        maxBuffer: SUBPROCESS_MAX_BUFFER,
       });
 
       if (result.status !== 0 || !result.stdout) {

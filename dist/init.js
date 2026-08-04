@@ -281,25 +281,83 @@ Respond with ONLY a JSON object (no markdown, no explanation outside JSON):
 // =============================================================================
 // Interactive Interview
 // =============================================================================
-async function askQuestion(question, defaultAnswer) {
+/**
+ * Reads one line, returning EXACTLY what the user typed -- '' for a bare Enter.
+ *
+ * Separate from the default-substituting `askQuestion` below because conflating the
+ * two is what inverted every yes/no prompt: `askQuestion` returns the DISPLAY string
+ * when the input is empty, and for a no-default prompt that display string is
+ * `'y/N'`, which starts with `y`.
+ */
+async function promptForLine(prompt) {
     const rl = readline.createInterface({
         input: process.stdin,
         output: process.stderr,
     });
     return new Promise((resolve) => {
-        rl.question(`${question} [${defaultAnswer}]: `, (answer) => {
+        rl.question(prompt, (answer) => {
             rl.close();
-            resolve(answer.trim() || defaultAnswer);
+            resolve(answer.trim());
         });
     });
 }
+async function askQuestion(question, defaultAnswer) {
+    const typed = await promptForLine(`${question} [${defaultAnswer}]: `);
+    return typed || defaultAnswer;
+}
+/**
+ * Which answer a typed line represents, or `undefined` for "the user did not say".
+ *
+ * A named function over a string rather than a branch inside the prompt, because the
+ * whole defect was that the decision was being made on a value that had already had
+ * the default substituted into it. Here the empty string is a distinguishable input,
+ * which is the only way the caller can honour its own printed default.
+ */
+export function interpretYesNo(typed) {
+    const answer = typed.trim().toLowerCase();
+    if (YES_ANSWERS.has(answer))
+        return true;
+    if (NO_ANSWERS.has(answer))
+        return false;
+    return undefined;
+}
+/**
+ * Closed sets rather than a `startsWith` prefix test, and the prompt text is why.
+ *
+ * `'y/N'.toLowerCase().startsWith('y')` is TRUE. That is not a hypothetical -- it is
+ * precisely the bug being fixed, where the display string reached the interpreter and
+ * was read as a yes. A prefix test leaves that landmine armed for the next caller who
+ * passes something other than a typed line, so the reading is exact.
+ *
+ * Matches how `QUALITY_COVERAGE_REQUIRED` is parsed in config.ts: a closed set of
+ * recognised words, with everything else falling to the safe answer rather than being
+ * guessed at. Here the safe answer is the default the prompt printed.
+ */
+const YES_ANSWERS = new Set(['y', 'yes']);
+const NO_ANSWERS = new Set(['n', 'no']);
+/**
+ * A yes/no prompt whose default is the one it prints.
+ *
+ * It printed `[y/N]` and answered YES on a bare Enter. `askQuestion` returns
+ * `answer.trim() || defaultAnswer`, where `defaultAnswer` was the display string
+ * `'y/N'` -- so pressing Enter returned the literal `"y/N"`, and
+ * `"y/n".startsWith('y')` is true. The `Y/n` branch was correct only by accident,
+ * since `!"y/n".startsWith('n')` is also true.
+ *
+ * Not a cosmetic prompt bug. Both call sites change what the generated config
+ * CONTAINS: `Enable strict mode? (zero tolerance for type/lint errors)` writes
+ * `typescript.errors: 0` and `eslint.errors: 0`, so an adopter who read `[y/N]` as
+ * "the safe default is no" and pressed Enter got the zero-tolerance ruleset anyway
+ * -- from a command whose entire purpose is to write a configuration the gate can
+ * actually satisfy. The other enables SonarQube, which then needs a server.
+ *
+ * An unrecognised line ("maybe", "1") also takes the default, deliberately: the
+ * default is printed on the same line, so falling back to it is the answer the user
+ * can already see, rather than a guess at what they meant.
+ */
 async function askYesNo(question, defaultYes) {
-    const defaultStr = defaultYes ? 'Y/n' : 'y/N';
-    const answer = await askQuestion(question, defaultStr);
-    if (defaultYes) {
-        return !answer.toLowerCase().startsWith('n');
-    }
-    return answer.toLowerCase().startsWith('y');
+    const typed = await promptForLine(`${question} [${defaultYes ? 'Y/n' : 'y/N'}]: `);
+    return interpretYesNo(typed) ?? defaultYes;
 }
 /**
  * Says out loud what the test-command choice means for coverage.

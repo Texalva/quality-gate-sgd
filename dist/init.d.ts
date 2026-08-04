@@ -81,6 +81,15 @@ export interface GeneratedConfig {
 }
 export declare function scriptWritesCoverage(name: string, body: string): boolean;
 export declare function analyzeRepo(projectRoot: string): RepoAnalysis;
+/**
+ * Which answer a typed line represents, or `undefined` for "the user did not say".
+ *
+ * A named function over a string rather than a branch inside the prompt, because the
+ * whole defect was that the decision was being made on a value that had already had
+ * the default substituted into it. Here the empty string is a distinguishable input,
+ * which is the only way the caller can honour its own printed default.
+ */
+export declare function interpretYesNo(typed: string): boolean | undefined;
 export interface InterviewAnswers {
     useSonarQube: boolean;
     coverageTarget: number;

@@ -21,6 +21,7 @@ import {
   classifyCoverageTotal,
   conductInterview,
   generateConfig,
+  interpretYesNo,
   scriptWritesCoverage,
 } from '../src/init.js'
 import type {
@@ -96,6 +97,56 @@ function generate(
     metricsWith(coverage)
   )
 }
+
+/**
+ * The yes/no prompts answered YES on a bare Enter, at both call sites.
+ *
+ * `askQuestion` returned `answer.trim() || defaultAnswer` where `defaultAnswer` was
+ * the DISPLAY string, so an empty line came back as the literal `"y/N"` -- and
+ * `"y/n".startsWith('y')` is true. The `Y/n` branch was right only by accident.
+ *
+ * In this file rather than treated as a prompt nicety, because both prompts change
+ * what the generated config CONTAINS: strict mode writes `typescript.errors: 0` and
+ * `eslint.errors: 0`, so an adopter reading `[y/N]` as "the safe default is no" and
+ * pressing Enter got the zero-tolerance ruleset from the command whose whole job is
+ * to write one the gate can satisfy.
+ *
+ * Tested through `interpretYesNo` -- a pure function over the typed line -- because
+ * that is the only seam where the bug is visible. A test that stubbed `askQuestion`
+ * would have passed against the defect: the defect WAS what `askQuestion` returned.
+ */
+describe('interpretYesNo', () => {
+  // The whole bug: an empty line must be "no answer", so the caller applies the
+  // default it printed. Anything that resolves '' to a value here reintroduces it.
+  it('reads a bare Enter as no answer at all', () => {
+    expect(interpretYesNo('')).toBeUndefined()
+    expect(interpretYesNo('   ')).toBeUndefined()
+  })
+
+  it('reads an explicit answer', () => {
+    for (const yes of ['y', 'Y', 'yes', 'YES', ' yes ']) expect(interpretYesNo(yes)).toBe(true)
+    for (const no of ['n', 'N', 'no', 'NO', ' no ']) expect(interpretYesNo(no)).toBe(false)
+  })
+
+  // The display strings themselves, which is what the old code was actually
+  // interpreting. Neither may read as an answer, or the defect returns by the route it
+  // arrived on. This is also why the reading is an exact match on a closed set rather
+  // than a `startsWith` prefix test: `'y/N'.toLowerCase().startsWith('y')` is true, so
+  // a prefix test leaves the landmine armed for the next caller who passes something
+  // that is not a typed line. Caught by this case against a prefix implementation.
+  it('does not read its own prompt text as an answer', () => {
+    expect(interpretYesNo('y/N')).toBeUndefined()
+    expect(interpretYesNo('Y/n')).toBeUndefined()
+  })
+
+  // An unrecognised line takes the default too. The default is printed on the same
+  // line, so falling back to it is the answer the user can already see.
+  it('takes the default for anything it cannot read', () => {
+    for (const junk of ['maybe', '1', '0', 'sure', 'yep', 'nope']) {
+      expect(interpretYesNo(junk)).toBeUndefined()
+    }
+  })
+})
 
 describe('scriptWritesCoverage', () => {
   it.each([

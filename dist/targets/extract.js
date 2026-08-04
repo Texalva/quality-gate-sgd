@@ -52,8 +52,15 @@ export function extractCoverageIssues(coverageDir) {
     }
     // The warning belongs HERE, not in the provider: this is the layer that
     // discards the failure, and the rule is to handle an error or log it, never
-    // both. `absent` is not reported -- a project with no coverage-lambda
-    // directory, or none at all, is the ordinary case rather than a fault.
+    // both.
+    //
+    // `absent` is not warned about on THIS path, and that is now a narrower claim
+    // than it used to be. The provider does report an absent unit summary, as
+    // `report-missing`, because the gate grades coverage rules against it -- see
+    // readFailure. What this loop is for is fix ADVICE, where a report that does not
+    // exist yields no findings and there is nothing to say beyond what the gate
+    // already said. The failure itself is discarded here along with every other one,
+    // which is #25.
     //
     // `shape: 'unexpected'` is reported alongside a failed read because from this
     // function's point of view they cost the same thing: a report that parsed but

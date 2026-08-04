@@ -60,15 +60,68 @@ export const SUITE_SETTING = {
     'coverage.unit': 'QUALITY_COVERAGE_UNIT_DIR',
     'coverage.lambda': 'QUALITY_COVERAGE_LAMBDA_DIR',
 };
-/** The suites this configuration actually has, unit first. */
+/**
+ * The suites this configuration actually has, unit first.
+ *
+ * "Configured" means the project named the directory, not that a directory exists.
+ * Both flags default to false, so a caller that cannot tell gets the conservative
+ * answer -- an absent summary for a suite nobody named is only required when NO
+ * suite produced one at all. See summaryIsRequired.
+ */
 function suitesOf(paths) {
     const suites = [
-        { suite: 'coverage.unit', dir: paths.unitDir },
+        {
+            suite: 'coverage.unit',
+            dir: paths.unitDir,
+            configured: paths.unitDirConfigured === true,
+        },
     ];
     if (paths.lambdaDir !== undefined) {
-        suites.push({ suite: 'coverage.lambda', dir: paths.lambdaDir });
+        suites.push({
+            suite: 'coverage.lambda',
+            dir: paths.lambdaDir,
+            configured: paths.lambdaDirConfigured === true,
+        });
     }
     return suites;
+}
+/**
+ * Whether an ABSENT summary for one suite is a failed measurement.
+ *
+ * Three inputs, and every one of them is load-bearing:
+ *
+ *   `absentIsFailure` -- the caller's policy. False only for a project that has
+ *     declared it has no coverage AND grades none; see `coverageAbsenceIsFailure`
+ *     in cli.ts, which is where that is decided, because it depends on the rules.
+ *
+ *   `configured` -- whether the project named this suite. An unconfigured suite is
+ *     one `config.ts` invented (see suitesOf), and failing on its absence would
+ *     fail nearly every project on a directory it has never heard of.
+ *
+ *   `anySuiteRead` -- whether ANY suite produced a summary. This is what makes a
+ *     lambda-only layout work: a project that points QUALITY_COVERAGE_LAMBDA_DIR at
+ *     its real report and leaves the unit directory at the default has coverage,
+ *     just not where the default looks. Requiring the unit summary unconditionally
+ *     produced `report-missing` on `coverage.unit` there, and since `coverage.union`
+ *     derives from `coverage.unit`, it failed a union floor that the union number
+ *     satisfied -- a false red on a project whose only real suite measured fine.
+ *     Found by adversarial review, which also pointed out that an existing test
+ *     ("reads lambda coverage independently of unit") documents that layout as
+ *     supported.
+ *
+ * So: a suite the project NAMED must produce a summary. A suite it did not name only
+ * has to when nothing was read anywhere, and then only the UNIT suite -- the one
+ * every project has by default. That last restriction is not cosmetic: without it, a
+ * CORRUPT unit report (outcome 'invalid-json', so nothing was "read") armed the
+ * phantom lambda suite, and one broken report produced two failures, the second
+ * about a directory the project has never heard of. Caught by existing tests.
+ */
+function summaryIsRequired(suite, absentIsFailure, anySuiteRead) {
+    if (!absentIsFailure)
+        return false;
+    if (suite.configured)
+        return true;
+    return suite.suite === 'coverage.unit' && !anySuiteRead;
 }
 /**
  * Shared by the metrics validators and the issue validators, because both halves
@@ -280,16 +333,49 @@ function mergeCoverageReports(unitData, lambdaData) {
  * nothing to parse when the answer is arithmetic.
  */
 function extractFromTotal(data, suite, evidence) {
-    // Absence stays silent, exactly as before. `lambdaDir` defaults to
-    // `coverage-lambda`, which almost no project has, so treating a missing
-    // summary as a failure would fail every single-suite project on the planet.
-    if (!data?.total)
-        return { metrics: undefined, failures: [] };
-    const total = data.total;
     const fail = (kind, message) => ({
         metrics: undefined,
         failures: [measurementFailure(kind, suite, message, evidence)],
     });
+    // The READ was already classified by readFailure -- absent, unreadable,
+    // invalid-json and wrong-shape all arrive here as `undefined`, and reporting
+    // them again would double-count one broken report as two failed measurements.
+    // This function judges the CONTENT of a summary that was read.
+    if (data === undefined)
+        return { metrics: undefined, failures: [] };
+    // A summary object with no `total` at all. Was silent, and silence here was the
+    // same hole as an absent report one layer up: no metrics and no failure, which a
+    // ceiling or a monotonic rule on `coverage.unit.*` reads as nothing to check.
+    // istanbul's json-summary reporter always writes `total`, so a report without
+    // one is not a summary this tool can grade -- and `readJsonReport` cannot catch
+    // it, since it validates only that the file parsed to a keyed object.
+    //
+    // Scoped to the suite rather than the whole reading, for the same reason
+    // `unmergeableFileEntries` is scoped to the union: `coverage.union` is summed from
+    // the per-file entries by `mergeCoverageReports` and does not read `total` at all,
+    // so a summary with real file entries and no `total` still yields an arithmetically
+    // honest union NUMBER. That number is still reported.
+    //
+    // But a `coverage.union.*` RULE fails anyway, and the message must not pretend
+    // otherwise -- two independent reviewers flagged the earlier wording for claiming
+    // the union was "unaffected" while the gate went red on a union floor the union
+    // satisfied. The cause is the derivation edge in rules.ts: `coverage.union` is
+    // declared as derived FROM `coverage.unit`, so a failure on the suite gates rules
+    // on the union. That edge is right in general -- the union is normally computed
+    // from the suites' totals -- and it is not worth a per-failure list of which
+    // derived dimensions a failure does NOT invalidate, for a shape istanbul never
+    // emits. So the behaviour is fail-closed on a malformed report and the message
+    // says so plainly.
+    if (!isRecord(data.total)) {
+        return fail('unparseable-output', `${evidence.command} has no \`total\` object (found ${JSON.stringify(data.total)}), so ` +
+            `${suite}.* cannot be read from it -- that is the only thing \`total\` provides. An ` +
+            `istanbul json-summary report always has one. Check that ${SUITE_SETTING[suite]} points ` +
+            'at a directory written by the `json-summary` reporter, and that the file was written ' +
+            'completely. A coverage.union number is still summed from the per-file entries, but a ' +
+            'coverage.union rule fails with this one, because the union is derived from the suite ' +
+            'that could not be read.');
+    }
+    const total = data.total;
     // Typed loosely on purpose. CoverageEntry declares these as required numbers,
     // but the value came from JSON.parse of a file this tool did not write, and
     // the declaration is an assumption rather than a guarantee -- a `pct` of the
@@ -630,6 +716,7 @@ function extractCoverageIssuesFromFinal(data) {
 }
 export function createIstanbulCoverageProvider(paths, options = {}) {
     const wantIssues = (options.issues ?? 'collect') === 'collect';
+    const absentIsFailure = (options.absentReport ?? 'fail') === 'fail';
     return {
         name: 'istanbul',
         dimension: 'coverage',
@@ -654,23 +741,60 @@ export function createIstanbulCoverageProvider(paths, options = {}) {
                     ...readJsonReport(path.join(context.projectRoot, dir, FINAL_REPORT_FILE)),
                 }))
                 : [];
-            const summaries = suites.map(({ suite, dir }) => ({
+            const summaryReads = suites.map((suite) => ({
                 suite,
-                ...readJsonReport(path.join(context.projectRoot, dir, paths.summaryFile)),
+                ...readJsonReport(path.join(context.projectRoot, suite.dir, paths.summaryFile)),
             }));
             const elapsedMs = Date.now() - startedAt;
+            // Decided AFTER every summary has been read, because whether an
+            // unconfigured suite's absence matters depends on whether ANOTHER suite
+            // produced one. See summaryIsRequired.
+            const anySuiteRead = summaryReads.some((r) => r.attempt.outcome === 'read');
+            const summaries = summaryReads.map((r) => ({
+                suite: r.suite.suite,
+                attempt: r.attempt,
+                data: r.data,
+                summaryRequired: summaryIsRequired(r.suite, absentIsFailure, anySuiteRead),
+            }));
             const evidenceFor = (attempt) => buildReportEvidence(`read ${attempt.path}`, elapsedMs, [attempt]);
-            // A report that EXISTS but cannot be read is a failure; one that is simply
-            // absent is not. That asymmetry is the point: `catch { /* Skip if invalid */ }`
-            // made a corrupt report and an unmeasured project the same thing, and the
-            // corrupt one then passed any ruleset without a coverage floor.
+            // What a read that did not produce a summary is worth.
             //
-            // Absence is NOT reported, deliberately, and not even for the detail
-            // report: apollo-client has a summary and no coverage-final.json at all,
-            // which is the documented fallback rather than a fault.
-            const readFailure = (attempt, suite) => {
-                if (attempt.outcome === 'read' || attempt.outcome === 'absent')
+            // A report that EXISTS but cannot be read is a failure: `catch { /* Skip if
+            // invalid */ }` made a corrupt report and an unmeasured project the same
+            // thing, and the corrupt one then passed any ruleset without a coverage
+            // floor.
+            //
+            // An ABSENT summary is a failure too, for the suite that requires one. It
+            // used to be silent, and silence was not neutral: `evaluateFloors` is the
+            // only evaluator that reports a missing metric, so a project whose only
+            // coverage rule was a ceiling or a ratchet lost coverage enforcement
+            // entirely and still cached the pass as fully earned. `report-missing` is
+            // exactly this shape -- the run succeeded and wrote no artifact -- and until
+            // now was the one declared kind nothing emitted. Rule scoping keeps the
+            // false-positive cost off projects that do not gate coverage: they get the
+            // ungated advisory rather than a failed gate, and can silence it for good
+            // with QUALITY_COVERAGE_REQUIRED=false.
+            //
+            // Called for the SUMMARIES only, which is why absence can be graded here at
+            // all. An absent detail report is genuinely not a fault -- apollo-client has
+            // a summary and no coverage-final.json -- and it is a documented fallback
+            // rather than a missing measurement.
+            const readFailure = (attempt, suite, summaryRequired) => {
+                if (attempt.outcome === 'read')
                     return [];
+                if (attempt.outcome === 'absent') {
+                    if (!summaryRequired)
+                        return [];
+                    return [
+                        measurementFailure('report-missing', suite, `${attempt.path} does not exist, so no coverage was measured. A ceiling or ` +
+                            'monotonic rule reads a missing coverage number as nothing to check, so this ' +
+                            'would otherwise pass silently. Run the script that writes coverage (the one ' +
+                            'that passes --coverage) before the gate and list it in `requiredScripts`, or ' +
+                            `point ${SUITE_SETTING[suite]} at the directory your coverage tool writes. If ` +
+                            'this project has no coverage at all and never will, set ' +
+                            'QUALITY_COVERAGE_REQUIRED=false to say so.', evidenceFor(attempt)),
+                    ];
+                }
                 const detail = attempt.outcome === 'invalid-json'
                     ? `contains ${String(attempt.bytesRead)} bytes that are not valid JSON`
                     : attempt.outcome === 'wrong-shape'
@@ -835,7 +959,7 @@ export function createIstanbulCoverageProvider(paths, options = {}) {
                 // before. Closing that hole properly means giving ExtractedIssues a
                 // failure channel of its own, which is its own step.
                 failures: [
-                    ...summaries.flatMap((s) => readFailure(s.attempt, s.suite)),
+                    ...summaries.flatMap((s) => readFailure(s.attempt, s.suite, s.summaryRequired)),
                     ...perSuite.flatMap((s) => s.failures),
                     // Appended last so the existing per-suite ordering that tests assert on
                     // is untouched.

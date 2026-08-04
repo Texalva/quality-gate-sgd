@@ -74,9 +74,13 @@ export type Result<T, E> = {
  * declared kind nothing can emit is a claim that the tool detects something it
  * does not, so the kind went with the rule. The open question is backlog #39.
  *
- * `report-missing` is the one kind that is declared and never emitted; it remains
- * the right kind for a run that succeeds and writes nothing, and is not a claim
- * about a report that exists.
+ * `report-missing` was for a long time declared and never emitted. It is now
+ * emitted for an absent coverage summary on the suite that requires one
+ * (providers/coverage.ts readFailure), which is precisely "the run succeeded and
+ * wrote nothing" and makes no claim about a report that exists. A project that
+ * genuinely has no coverage says so with QUALITY_COVERAGE_REQUIRED=false; every
+ * other project used to lose its coverage ceilings and ratchets in silence,
+ * because `evaluateFloors` is the only evaluator that reports a missing metric.
  */
 export type MeasurementFailureKind = 'tool-missing' | 'crashed' | 'timed-out' | 'output-truncated' | 'unparseable-output' | 'report-missing' | 'measured-nothing';
 /**

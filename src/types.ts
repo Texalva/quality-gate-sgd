@@ -36,7 +36,19 @@ import type { MeasurementFailure } from './providers/types.js';
  *   stored FAIL potentially spurious, so the entries cannot be salvaged in either
  *   direction.
  *
- *   Not a third reason, but worth recording next to them: a version-3 entry can
+ * 4 -- an ABSENT coverage summary became a `report-missing` measurement failure
+ *   for a suite that requires one (#43). This is squarely a change to what a pass
+ *   means, and the entries it invalidates are the dangerous ones: a version-3
+ *   entry can hold `coverage: {}`, no `measurementFailures`, and a PASS that a
+ *   ceiling or a ratchet reached by silently skipping the absent value -- because
+ *   `evaluateCeilings` and `evaluateMonotonic` both `continue` on an undefined
+ *   metric while only `evaluateFloors` reports one. Confirmed by adversarial
+ *   review: with the same key and the same rules, `isCacheValid` accepted exactly
+ *   that entry, so this version printed `PASSED (cached)` and exited 0 without
+ *   ever looking for the report. The fix would have been undone by any cache
+ *   written before it, which is the situation this counter exists for.
+ *
+ *   Not a further reason, but worth recording next to them: a version-4 entry can
  *   only ever hold a reading with no RECORDED measurement failure. `cli.ts`
  *   refuses to cache a run with any failure, gated or not, and `isCacheValid`
  *   refuses an entry that carries one -- which covers entries written by an
@@ -52,7 +64,7 @@ import type { MeasurementFailure } from './providers/types.js';
  *   Do not strengthen this claim back to "complete" until those are closed.
  */
 export interface QualityGateCache {
-  schemaVersion: 3;
+  schemaVersion: 4;
   entries: Record<string, CacheEntry>;
 }
 

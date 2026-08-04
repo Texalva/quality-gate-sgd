@@ -43,13 +43,15 @@ const SUBPROCESS_MAX_BUFFER = 64 * 1024 * 1024;
  * coverage-final.json at all; collecting here would parse and walk it on the
  * metrics pass and again on the findings pass. See CoverageProviderOptions.
  */
-function measureCoverageReading() {
+function measureCoverageReading(absentReport) {
     const config = getConfig();
     return createIstanbulCoverageProvider({
         unitDir: config.coverage.unitDir,
         lambdaDir: config.coverage.lambdaDir,
         summaryFile: config.coverage.summaryFile,
-    }, { issues: 'skip' }).measure({
+        unitDirConfigured: config.coverage.unitDirConfigured,
+        lambdaDirConfigured: config.coverage.lambdaDirConfigured,
+    }, { issues: 'skip', absentReport }).measure({
         projectRoot: config.projectRoot,
         // A file read has neither a timeout nor a buffer budget. The context carries
         // them because every spawn-based provider needs them, and inventing coverage
@@ -69,8 +71,15 @@ function measureCoverageReading() {
  * open question of how a report's provenance should be established. Returning a
  * field no caller reads would suggest something here checks it.
  */
-export function measureCoverage() {
-    const reading = measureCoverageReading();
+export function measureCoverage(options = {}) {
+    // Defaults to REQUIRING the report, so a caller that says nothing gets the loud
+    // reading. `QUALITY_COVERAGE_REQUIRED=false` is not consulted here on purpose:
+    // it is a statement about a project with no coverage, and honouring it for a
+    // project that DOES grade coverage would restore the exact silence this exists
+    // to remove -- an absent report, a ratchet that skips it, and a cached pass.
+    // Only the gate path knows the rules, so only the gate path resolves it. See
+    // `coverageAbsenceIsFailure` in cli.ts.
+    const reading = measureCoverageReading((options.absentReportIsFailure ?? true) ? 'fail' : 'ignore');
     if (!reading.ok) {
         return { metrics: {}, failures: [reading.error] };
     }
@@ -508,7 +517,9 @@ export function extractAllMetrics(scriptsToRunOrOptions = ['quality']) {
     // the only thing that makes a missing ceiling metric fail rather than pass.
     const typescript = measureTypescript();
     const eslint = measureEslint();
-    const coverage = measureCoverage();
+    const coverage = measureCoverage({
+        absentReportIsFailure: options.coverageAbsenceIsFailure ?? true,
+    });
     const sonarqube = skipSonarQube ? undefined : extractSonarqubeMetrics();
     const sloc = extractSloc();
     const measurementFailures = [

@@ -66,15 +66,19 @@ const SUBPROCESS_MAX_BUFFER = 64 * 1024 * 1024;
  * coverage-final.json at all; collecting here would parse and walk it on the
  * metrics pass and again on the findings pass. See CoverageProviderOptions.
  */
-function measureCoverageReading(): Result<CoverageReading, MeasurementFailure> {
+function measureCoverageReading(
+  absentReport: 'fail' | 'ignore'
+): Result<CoverageReading, MeasurementFailure> {
   const config = getConfig();
   return createIstanbulCoverageProvider(
     {
       unitDir: config.coverage.unitDir,
       lambdaDir: config.coverage.lambdaDir,
       summaryFile: config.coverage.summaryFile,
+      unitDirConfigured: config.coverage.unitDirConfigured,
+      lambdaDirConfigured: config.coverage.lambdaDirConfigured,
     },
-    { issues: 'skip' }
+    { issues: 'skip', absentReport }
   ).measure({
     projectRoot: config.projectRoot,
     // A file read has neither a timeout nor a buffer budget. The context carries
@@ -96,11 +100,22 @@ function measureCoverageReading(): Result<CoverageReading, MeasurementFailure> {
  * open question of how a report's provenance should be established. Returning a
  * field no caller reads would suggest something here checks it.
  */
-export function measureCoverage(): {
+export function measureCoverage(
+  options: { readonly absentReportIsFailure?: boolean } = {}
+): {
   readonly metrics: AllCoverageMetrics;
   readonly failures: readonly MeasurementFailure[];
 } {
-  const reading = measureCoverageReading();
+  // Defaults to REQUIRING the report, so a caller that says nothing gets the loud
+  // reading. `QUALITY_COVERAGE_REQUIRED=false` is not consulted here on purpose:
+  // it is a statement about a project with no coverage, and honouring it for a
+  // project that DOES grade coverage would restore the exact silence this exists
+  // to remove -- an absent report, a ratchet that skips it, and a cached pass.
+  // Only the gate path knows the rules, so only the gate path resolves it. See
+  // `coverageAbsenceIsFailure` in cli.ts.
+  const reading = measureCoverageReading(
+    (options.absentReportIsFailure ?? true) ? 'fail' : 'ignore'
+  );
 
   if (!reading.ok) {
     return { metrics: {}, failures: [reading.error] };
@@ -622,6 +637,19 @@ interface MetricsExtractionOptions {
   customDimensions?: CustomDimensionConfig[];
   /** Whether to skip custom dimension extraction (default: false) */
   skipCustomDimensions?: boolean;
+
+  /**
+   * Whether an absent coverage summary is a measurement failure. Defaults to
+   * TRUE, which is the safe direction: a caller that forgets this gets the loud
+   * reading.
+   *
+   * The caller resolves it because the answer depends on the RULES, which this
+   * module does not see. `QUALITY_COVERAGE_REQUIRED=false` is a project saying it
+   * has no coverage; a project that also grades coverage has contradicted that,
+   * and honouring the flag there would silently disable a rule it wrote. See
+   * `coverageAbsenceIsFailure` in cli.ts.
+   */
+  coverageAbsenceIsFailure?: boolean;
 }
 
 export function extractAllMetrics(
@@ -682,7 +710,9 @@ export function extractAllMetrics(
   // the only thing that makes a missing ceiling metric fail rather than pass.
   const typescript = measureTypescript();
   const eslint = measureEslint();
-  const coverage = measureCoverage();
+  const coverage = measureCoverage({
+    absentReportIsFailure: options.coverageAbsenceIsFailure ?? true,
+  });
 
   const sonarqube = skipSonarQube ? undefined : extractSonarqubeMetrics();
   const sloc = extractSloc();

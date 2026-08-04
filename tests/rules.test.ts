@@ -776,6 +776,41 @@ describe('evaluateRules', () => {
       expect(result.failedRules.some((f) => f.rule === 'coverage.unit.measurement')).toBe(true)
     })
 
+    // Pinned as a DECIDED trade rather than left as an accident, because two
+    // independent reviewers raised it as a false positive and it is arguable.
+    //
+    // A summary with real per-file entries and no `total` yields an honest union
+    // number -- `mergeCoverageReports` sums the entries and never reads `total` -- so
+    // the provider reports the number AND a `coverage.unit` failure. Here the union
+    // floor is satisfied by that number, and the gate still goes red through the
+    // derivation edge.
+    //
+    // That is deliberate. The edge is right in general: the union is normally
+    // computed from the suites' totals, so a suite that could not be read makes the
+    // union suspect. Suppressing it would need a per-failure list of which derived
+    // dimensions a failure does NOT invalidate, for a shape istanbul never emits --
+    // and the direction of the error matters: fail-closed on a malformed report costs
+    // a red gate with a message naming the file, while fail-open costs a
+    // `coverage.unit.*` rule that silently never runs. The provider's message says
+    // this explicitly rather than claiming the union is unaffected.
+    it('fails a satisfied union floor when the suite it derives from could not be read', () => {
+      const result = evaluateRules(
+        { version: '1.0.0', rules: { floors: { 'coverage.union.statements': 40 } } },
+        {
+          // The union was measured and clears the floor by a wide margin.
+          coverage: { union: { branches: 50, statements: 50, functions: 50, lines: 50 } },
+          scripts: {},
+          measurementFailures: [coverageFailure('coverage.unit')],
+        }
+      )
+
+      expect(result.status).toBe('fail')
+      expect(result.failedRules).toHaveLength(1)
+      expect(result.failedRules[0].rule).toBe('coverage.unit.measurement')
+      // Specifically NOT a floor failure: the number passed.
+      expect(result.failedRules.some((f) => f.type === 'floor')).toBe(false)
+    })
+
     it('gates a lambda failure through a union floor', () => {
       const result = evaluateRules(unionFloorOnly, {
         ...unionCoverage,
@@ -879,6 +914,80 @@ describe('evaluateRules', () => {
   })
 
   describe('monotonic evaluation', () => {
+    // #43, end to end at the rules layer. The ratchet is the ONLY coverage rule,
+    // there IS a baseline to ratchet against, and the current report is absent.
+    //
+    // Before an absent report was reported, this configuration was the worst case
+    // in the tool: no current value, so `evaluateMonotonic` hit its `continue` and
+    // the rule silently did not run; a baseline object WAS returned, so cli.ts did
+    // not count the run as having skipped its monotonic rules; and with no
+    // measurement failure recorded, the pass was cached as fully earned. A project
+    // whose coverage script stopped writing a report would ratchet forever against
+    // nothing and never be told.
+    it('fails a coverage ratchet whose current report is missing', () => {
+      const rules: QualityRules = {
+        version: '1.0.0',
+        rules: {
+          monotonic: [{ direction: 'up', metrics: ['coverage.unit.branches'] }],
+        },
+      }
+
+      const currentMetrics: Metrics = {
+        // Exactly what the provider hands back for an absent summary: no coverage
+        // numbers, and the reason why.
+        coverage: {},
+        typescript: { errors: 0, warnings: 0, rootCauses: 0 },
+        eslint: { errors: 0, warnings: 0, rootCauses: 0 },
+        scripts: {},
+        sloc: 1000,
+        measurementFailures: [
+          {
+            kind: 'report-missing' as MeasurementFailure['kind'],
+            dimension: 'coverage.unit',
+            message: '/p/coverage/coverage-summary.json does not exist',
+            evidence: {
+              via: 'report' as const,
+              command: 'read /p/coverage/coverage-summary.json',
+              elapsedMs: 1,
+              attempts: [
+                {
+                  path: '/p/coverage/coverage-summary.json',
+                  existed: false,
+                  bytesRead: null,
+                  modifiedMs: null,
+                  outcome: 'absent' as const,
+                },
+              ],
+            },
+          },
+        ],
+      }
+
+      const baselineEntry: CacheEntry = {
+        timestamp: Date.now(),
+        rulesHash: 'def',
+        rulesVersion: '1.0.0',
+        metrics: {
+          coverage: { unit: { branches: 80, statements: 85, functions: 75, lines: 80 } },
+          typescript: { errors: 0, warnings: 0, rootCauses: 0 },
+          eslint: { errors: 0, warnings: 0, rootCauses: 0 },
+          scripts: {},
+          sloc: 1000,
+        },
+        evaluation: { status: 'pass', failedRules: [] },
+      }
+
+      const result = evaluateRules(rules, currentMetrics, baselineEntry)
+
+      expect(result.status).toBe('fail')
+      // The MEASUREMENT is what failed, not the comparison -- there is nothing to
+      // compare. Naming the monotonic rule would claim coverage went down.
+      expect(result.failedRules).toHaveLength(1)
+      expect(result.failedRules[0].rule).toBe('coverage.unit.measurement')
+      expect(result.failedRules[0].type).toBe('measurement')
+      expect(result.failedRules[0].message).toContain('report-missing')
+    })
+
     it('passes when metric increases (direction: up)', () => {
       const rules: QualityRules = {
         version: '1.0.0',

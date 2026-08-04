@@ -32,6 +32,7 @@
 import { spawnSync } from "node:child_process";
 import {
   cpSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -46,6 +47,55 @@ import { fileURLToPath } from "node:url";
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SUBJECT = join(HERE, "synthetic-subject");
 const TOOL = resolve(process.argv[2] ?? join(HERE, "..", ".."));
+
+/**
+ * Coverage output left in the subject by an earlier run, NOT copied into the
+ * working directory each case gets.
+ *
+ * Both are gitignored, so whether they exist depends entirely on what was last run
+ * in this checkout -- and they were being copied. MEASURED: `synthetic-subject/`
+ * held a `coverage/` from a previous session, so every working copy started with a
+ * readable 25% report that no case had asked for, and the first case here to depend
+ * on the report being ABSENT reported a live measurement instead. Its probe caught
+ * that, which is what probes are for, but the contamination is the root cause and
+ * belongs here rather than in each case.
+ *
+ * Exact paths rather than a substring test: `src/lint-issues.ts` and the tool's own
+ * `coverage.ts` both contain the word.
+ *
+ * The consequence for the control below is deliberate -- it now runs
+ * `test:coverage` and grades a report THIS run wrote, instead of silently grading
+ * whatever the checkout happened to be carrying.
+ */
+const STALE_REPORT_DIRS = [join(SUBJECT, "coverage"), join(SUBJECT, "coverage-lambda")];
+
+/**
+ * The parent environment with every variable this tool reads stripped out.
+ *
+ * The subject is a throwaway copy and the rules are injected per case, but the
+ * ENVIRONMENT was inherited whole -- so the harness's answer depended on the shell
+ * it was run from. MEASURED by an adversarial reviewer: running this file from a
+ * project that exports `QUALITY_COVERAGE_REQUIRED=false` made a CORRECT
+ * implementation report two failures, because the two cases that need the coverage
+ * requirement ON silently ran with it off. The harness exited 1 while nothing was
+ * wrong with the tool.
+ *
+ * That is the same class of defect as a fixture going inert, and worse in one way:
+ * an inert fixture reports a false `ok`, whereas this reported a false FAILURE, so
+ * the next person would go looking for a bug that was not there.
+ *
+ * Stripped by PREFIX rather than by an allowlist of known names, so a variable added
+ * to config.ts later cannot silently start leaking in. Each case then sets exactly
+ * what it means through `env`, and the generated script sets the rest.
+ */
+function hermeticEnv(extra = {}) {
+  const clean = Object.fromEntries(
+    Object.entries(process.env).filter(
+      ([key]) => !key.startsWith("QUALITY_") && !key.startsWith("SONARQUBE_")
+    )
+  );
+  return { ...clean, ...extra };
+}
 
 /**
  * A custom dimension that genuinely works, carried alongside every sabotaged one.
@@ -252,6 +302,22 @@ const SABOTAGES = [
     dimension: null,
     expectKind: null,
     expectMetric: { name: "pipedCount", value: 2 },
+    // This case asserts ZERO failures of any kind, and it runs no scripts, so with
+    // the stale `coverage/` no longer copied into the working directory there is
+    // genuinely no coverage report for the gate to read. Declaring that is what a
+    // project in this shape does; the alternative -- running `test:coverage` to
+    // manufacture a report -- would add a full vitest run to a case that has nothing
+    // to do with coverage. The zero-failure assertion stays intact for everything
+    // this case is about.
+    //
+    // BOTH are needed, and the pair is instructive: the opt-out is honoured only
+    // when no rule grades coverage, and the default ruleset here is
+    // `loadRules({coverageOnly: true})`, which grades `coverage.unit.*`. Setting the
+    // variable alone left the report required -- correctly -- and this case failed
+    // with a `report-missing` it had no opinion about. So it also has to say that
+    // its project grades the build and nothing else.
+    env: { QUALITY_COVERAGE_REQUIRED: "false" },
+    gateRules: GATES_BUILD_ONLY,
     customDimensions: [
       { ...WORKING_CUSTOM_DIMENSION },
       {
@@ -397,6 +463,116 @@ const SABOTAGES = [
     },
     sabotage: (dir) => pointCoverageAtBranchlessSource(dir),
     fixtureProbe: (dir) => requireBranchlessMeasurement(dir),
+  },
+  // --- #43: the report that was never written ---------------------------------
+  //
+  // Three cases, and the trio is the claim. The first is the defect: a ratchet
+  // that cannot ratchet has to go red. The second is the false positive the fix
+  // must not create: the same absence, for a project that grades no coverage rule,
+  // is an advisory and not a verdict. The third is the escape hatch, without which
+  // the second case's project pays an advisory and a lost cache on every run
+  // forever. Any one of them alone is satisfiable by an implementation that gets
+  // the other two wrong.
+  //
+  // All three run `test`, not `test:coverage`. That is the real event: the subject's
+  // `test` is `vitest run` with no `--coverage`, so the script that
+  // `requiredScripts` names EXITS 0 and writes nothing. Nothing here has to look
+  // broken for the report to be missing.
+  {
+    name: "a coverage ratchet with no report",
+    stands_for:
+      "#43: a project whose only coverage rule is a monotonic ratchet, whose test script stopped writing a report -- a rename, a dropped --coverage flag, a reporter removed from the vitest config. An absent summary produced no metric AND no measurement failure, and evaluateFloors is the only evaluator that reports a missing metric: evaluateCeilings and evaluateMonotonic both `continue` on an undefined value. So the ratchet silently stopped ratcheting, the run still counted as having evaluated it, and the pass was cached as fully earned.",
+    dimension: "coverage.unit",
+    expectKind: "report-missing",
+    // The ratchet is the ONLY coverage rule. A floor would prove nothing: a missing
+    // floor metric has always failed loudly, which is the asymmetry this case is
+    // about. There is no baseline either (the library path passes `undefined`), so
+    // the monotonic rule cannot fail on its own comparison -- the only thing that
+    // can turn this red is the measurement failure reaching a rule that reads the
+    // dimension.
+    gateRules: {
+      ...GATES_BUILD_ONLY,
+      monotonic: [{ direction: "up", metrics: ["coverage.unit.branches"] }],
+    },
+    scriptsToRun: ["test"],
+    expectScriptsPassing: ["test"],
+    // And the dimension must not arrive as a number as well: a reported failure
+    // beside a fabricated 100% is the vacuous pass with a warning stapled to it.
+    expectNoCoverageMetrics: true,
+    sabotage: () => undefined,
+    fixtureProbe: (dir) => requireNoCoverageReport(dir),
+  },
+  {
+    name: "no report, and no coverage rule",
+    stands_for:
+      "The false positive the fix above must not create: a project that gates its type-checker and its linter, has no coverage directory, and never asked for any. Requiring the report unconditionally would fail it over a dimension no rule reads -- the same mistake that hard-failed two-suite projects on `coverage.lambda`. Rule scoping is what keeps the cost to an advisory.",
+    dimension: "coverage.unit",
+    expectKind: "report-missing",
+    expectReportedButUngated: true,
+    gateRules: GATES_BUILD_ONLY,
+    scriptsToRun: ["test"],
+    sabotage: () => undefined,
+    fixtureProbe: (dir) => requireNoCoverageReport(dir),
+  },
+  {
+    name: "the declared opt-out silences it",
+    stands_for:
+      "The escape hatch the case above needs: an ungated failure is printed on every run AND suppresses the cache write, so without a way to say `this project has no coverage`, a typescript-and-eslint-only project pays an advisory and a full re-measurement forever. QUALITY_COVERAGE_REQUIRED=false is that declaration, and it has to produce NO failure at all -- not a quieter one.",
+    env: { QUALITY_COVERAGE_REQUIRED: "false" },
+    gateRules: GATES_BUILD_ONLY,
+    scriptsToRun: ["test"],
+    // Three assertions, not one. `expectMetric` gives zero failures of any kind
+    // alongside a real measurement -- the opt-out removes the failure rather than
+    // demoting it, and does not take the other dimensions with it. The other two
+    // close the ways this case was satisfiable by a wrong implementation: coverage
+    // must still be ABSENT rather than fabricated as 100%, and the gate must PASS
+    // rather than fail with nothing recorded.
+    expectMetric: { name: "okCount", value: 7 },
+    expectNoCoverageMetrics: true,
+    expectGateStatus: "pass",
+    sabotage: () => undefined,
+    fixtureProbe: (dir) => requireNoCoverageReport(dir),
+  },
+  {
+    name: "the opt-out cannot silence a graded ratchet",
+    stands_for:
+      "Reproduced by two independent adversarial reviews of the first version, which consulted QUALITY_COVERAGE_REQUIRED alone: set the opt-out, keep (or later add) a coverage ratchet, remove the report, and the provider returned neither a number nor a failure -- so evaluateMonotonic hit its silent `continue`, the gate reported pass with zero failed rules, and the pass was cached. The requirement was added to close exactly that, and an env var reopened it. The opt-out is a claim that the project has no coverage; a project that grades coverage has contradicted it, and the contradiction resolves toward measuring.",
+    dimension: "coverage.unit",
+    expectKind: "report-missing",
+    // The opt-out is SET, and must not be honoured, because the ruleset below
+    // grades coverage.
+    env: { QUALITY_COVERAGE_REQUIRED: "false" },
+    gateRules: {
+      ...GATES_BUILD_ONLY,
+      monotonic: [{ direction: "up", metrics: ["coverage.unit.branches"] }],
+    },
+    scriptsToRun: ["test"],
+    expectScriptsPassing: ["test"],
+    expectNoCoverageMetrics: true,
+    sabotage: () => undefined,
+    fixtureProbe: (dir) => requireNoCoverageReport(dir),
+  },
+  {
+    name: "a configured second suite that wrote nothing",
+    stands_for:
+      "Reproduced by adversarial review. The first version hardcoded the lambda summary as never-required, because config.ts resolves the directory as `process.env.QUALITY_COVERAGE_LAMBDA_DIR || 'coverage-lambda'` and a project that asked for a second suite was indistinguishable from one that had never heard of the idea. So a project that DID configure one -- and gated it -- lost it in silence: no metric, no failure, pass, cached. The distinction now comes from config, not from the path.",
+    dimension: "coverage.lambda",
+    expectKind: "report-missing",
+    // Explicitly configured, and deliberately not the `coverage-lambda` default:
+    // a case that used the default would pass even if the fix only special-cased
+    // that one string.
+    env: { QUALITY_COVERAGE_LAMBDA_DIR: "coverage-integration" },
+    gateRules: {
+      ...GATES_BUILD_ONLY,
+      ceilings: { ...GATES_BUILD_ONLY.ceilings, "coverage.lambda.branches": 100 },
+    },
+    // The UNIT report is written by this run and is fine. That is the point: one
+    // suite measuring cleanly must not excuse the configured one that did not, and
+    // it also proves the failure is not just "nothing was measured anywhere".
+    scriptsToRun: ["test:coverage"],
+    expectScriptsPassing: ["test:coverage"],
+    sabotage: () => undefined,
+    fixtureProbe: (dir) => requireNoConfiguredLambdaReport(dir),
   },
   {
     name: "broken coverage no rule grades",
@@ -696,6 +872,55 @@ function coverageTotalOnDisk(dir) {
   return { total: parsed.total, statementsPct: parsed.total.statements?.pct };
 }
 
+/**
+ * The missing-report cases: there must be NO coverage summary after the run.
+ *
+ * The condition these cases reproduce is absence, and absence is the easiest
+ * fixture condition in this file to lose by accident -- anything that makes the
+ * subject's `test` script write coverage, or leaves a report behind from an
+ * earlier step, turns all three of them into assertions about a project that has
+ * coverage after all. Checked with existsSync rather than through
+ * coverageTotalOnDisk, because "unreadable" and "not there" are different
+ * conditions and only the second one is this fixture's.
+ */
+function requireNoCoverageReport(dir) {
+  const reportPath = join(dir, "coverage", "coverage-summary.json");
+  if (!existsSync(reportPath)) return undefined;
+
+  const seen = coverageTotalOnDisk(dir);
+  return (
+    `${reportPath} EXISTS after the run (${seen.why ?? `statements=${JSON.stringify(seen.statementsPct)}%`}), ` +
+    "so this case is not exercising a project whose coverage report was never written"
+  );
+}
+
+/**
+ * The configured-second-suite case: the lambda directory must be absent, and the
+ * UNIT report must be present.
+ *
+ * Both halves are the fixture. Without the second, the case degrades into "nothing
+ * was measured anywhere", which the unit cases already cover and which a wrong
+ * implementation could satisfy by requiring only the first suite.
+ */
+function requireNoConfiguredLambdaReport(dir) {
+  const lambdaPath = join(dir, "coverage-integration", "coverage-summary.json");
+  if (existsSync(lambdaPath)) {
+    return (
+      `${lambdaPath} EXISTS after the run, so this case is not exercising a configured ` +
+      "second suite that wrote nothing"
+    );
+  }
+
+  const unit = coverageTotalOnDisk(dir);
+  if (unit.why) {
+    return (
+      `the UNIT report is not usable after the run (${unit.why}), so this case cannot show ` +
+      "that a clean first suite fails to excuse a missing configured second one"
+    );
+  }
+  return undefined;
+}
+
 /** The ordering case: the run must actually have replaced the planted report. */
 function requireReportRewrittenByRun(dir) {
   const seen = coverageTotalOnDisk(dir);
@@ -941,23 +1166,38 @@ function runGateAgainst(subjectDir, testCase) {
     ? `await metricsMod.extractAllMetricsAsync({
       scriptsToRun: ${JSON.stringify(scriptsToRun)},
       skipSonarQube: true,
+      coverageAbsenceIsFailure,
     })`
     : `metricsMod.extractAllMetrics({
       scriptsToRun: ${JSON.stringify(scriptsToRun)},
       skipSonarQube: true,
       skipCustomDimensions: false,
       customDimensions: ${JSON.stringify(customDimensions)},
+      coverageAbsenceIsFailure,
     })`;
+
+  // Set BEFORE the tool is imported, and that ordering is the whole reason this is
+  // a template rather than a spawn option: `getConfig` memoises on first call, so a
+  // variable applied after any module has read config would be ignored without
+  // changing anything the case prints.
+  const caseEnv = Object.entries(testCase.env ?? {})
+    .map(([key, value]) => `    process.env[${JSON.stringify(key)}] = ${JSON.stringify(value)};`)
+    .join("\n");
 
   const script = `
     process.env.QUALITY_PROJECT_ROOT = ${JSON.stringify(subjectDir)};
     process.env.QUALITY_PROJECT_NAME = 'vacuous-pass-control';
     process.env.QUALITY_CACHE_FILE = ${JSON.stringify(join(subjectDir, ".qg-cache.json"))};
+${caseEnv}
 
     const metricsMod = await import(${JSON.stringify(`${TOOL}/dist/metrics.js`)});
     const rulesMod = await import(${JSON.stringify(`${TOOL}/dist/rules.js`)});
 
-    const metrics = ${extraction};
+    // RULES FIRST, then measure. The order is load-bearing now: whether an absent
+    // coverage report is a failed measurement depends on whether any rule grades
+    // coverage, so the effective ruleset has to exist before the measurement is
+    // taken. It used to measure first, which cost nothing while every measurement
+    // decision was rules-independent.
     const rules = rulesMod.loadRules({ coverageOnly: true, silent: true });
 
     // A whole ruleset in place of the defaults, for the cases that are about a
@@ -978,6 +1218,15 @@ function runGateAgainst(subjectDir, testCase) {
       rules.rules.ceilings = { ...(rules.rules.ceilings ?? {}), [gateCeiling]: 0 };
     }
 
+    // The SHIPPED resolver, imported rather than reimplemented. This decides
+    // whether QUALITY_COVERAGE_REQUIRED=false is honoured, and it is honoured only
+    // when no rule reads coverage. A harness that re-derived that rule would keep
+    // reporting ok while the binary decided something else -- which is the same
+    // class of defect as a fixture going inert.
+    const coverageAbsenceIsFailure = rulesMod.coverageAbsenceIsFailure(rules);
+
+    const metrics = ${extraction};
+
     const evaluation = rulesMod.evaluateRules(rules, metrics, undefined);
 
     process.stdout.write(JSON.stringify({
@@ -996,6 +1245,7 @@ function runGateAgainst(subjectDir, testCase) {
   // project being measured, not to wherever this harness was invoked from.
   const proc = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
     cwd: subjectDir,
+    env: hermeticEnv(),
     encoding: "utf8",
     maxBuffer: 64 * 1024 * 1024,
   });
@@ -1066,14 +1316,16 @@ function runCliAgainst(subjectDir, runs = 1) {
       [join(TOOL, "dist", "cli.js"), "run", "--coverage-only"],
       {
         cwd: subjectDir,
-        env: {
-          ...process.env,
+        // hermeticEnv, not `...process.env`: an inherited QUALITY_* variable made
+        // this harness's verdict depend on the shell it was launched from. See
+        // hermeticEnv.
+        env: hermeticEnv({
           QUALITY_PROJECT_ROOT: subjectDir,
           QUALITY_PROJECT_NAME: "vacuous-pass-cli",
           // Outside the subject: see the note above. `subjectDir` is
           // `<mkdtemp>/subject`, so this is the throwaway root, deleted with it.
           QUALITY_CACHE_FILE: join(subjectDir, "..", ".qg-cache.json"),
-        },
+        }),
         encoding: "utf8",
         maxBuffer: 64 * 1024 * 1024,
       }
@@ -1102,7 +1354,7 @@ function withSabotagedCopy(testCase) {
   cpSync(SUBJECT, work, {
     recursive: true,
     dereference: false,
-    filter: (src) => !src.includes("node_modules"),
+    filter: (src) => !src.includes("node_modules") && !STALE_REPORT_DIRS.includes(src),
   });
   symlinkSync(join(SUBJECT, "node_modules"), join(work, "node_modules"), "dir");
 
@@ -1136,7 +1388,13 @@ function withSabotagedCopy(testCase) {
 // pass below. The synthetic subject genuinely fails its coverage floors -- that
 // is what it is for -- so the assertion is specifically about the absence of a
 // MEASUREMENT failure, not about the verdict.
-const control = withSabotagedCopy({});
+//
+// `test:coverage` because the control has to WRITE the report it is then graded on.
+// It used to run no scripts at all and pass anyway, on a `coverage/` that STALE_REPORT_DIRS
+// now keeps out of the copy -- so the control's clean reading came from an artifact
+// of whatever was last run in the checkout, and deleting that directory by hand
+// would have broken the control with a message about coverage.
+const control = withSabotagedCopy({ scriptsToRun: ["test:coverage"] });
 const results = [];
 
 /** Every case decided so far, in the order they ran. */
@@ -1397,16 +1655,34 @@ for (const sabotage of SABOTAGES) {
   if (sabotage.expectMetric) {
     const { name, value } = sabotage.expectMetric;
     const got_value = got.custom?.[name];
-    const passed = got.failures.length === 0 && got_value === value;
+
+    // Two optional guards, and the case that needed them is the coverage opt-out.
+    // "No failures and okCount=7" was satisfiable by an implementation that turned
+    // an absent opted-out report into a fabricated 100% -- which is the vacuous pass
+    // itself -- and by one that returned `status: "fail"` with no failure recorded.
+    // A case whose whole claim is "nothing was measured and nothing broke" has to
+    // say both halves out loud. Found by adversarial review of the case.
+    const coverageAbsent =
+      sabotage.expectNoCoverageMetrics !== true || got.coverage === null;
+    const statusOk =
+      sabotage.expectGateStatus === undefined || got.status === sabotage.expectGateStatus;
+
+    const passed =
+      got.failures.length === 0 && got_value === value && coverageAbsent && statusOk;
 
     results.push({
       name: sabotage.name,
       passed,
       stands_for: sabotage.stands_for,
       detail: passed
-        ? `measured ${name}=${got_value} with no failures`
-        : `expected ${name}=${value} and no failures; got ${name}=${got_value}, ` +
-          `failures=${JSON.stringify(got.failures)}`,
+        ? `measured ${name}=${got_value} with no failures` +
+          `${sabotage.expectNoCoverageMetrics === true ? ", coverage.unit absent rather than fabricated" : ""}` +
+          `${sabotage.expectGateStatus === undefined ? "" : `, gate ${got.status}`}`
+        : `expected ${name}=${value} and no failures` +
+          `${sabotage.expectNoCoverageMetrics === true ? " and no coverage.unit number" : ""}` +
+          `${sabotage.expectGateStatus === undefined ? "" : ` and gate=${sabotage.expectGateStatus}`}` +
+          `; got ${name}=${got_value}, failures=${JSON.stringify(got.failures)}, ` +
+          `coverage.unit=${JSON.stringify(got.coverage)}, gate=${got.status}`,
     });
     continue;
   }

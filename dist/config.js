@@ -14,6 +14,34 @@ import * as fs from 'fs';
 // =============================================================================
 // Default Configuration
 // =============================================================================
+/**
+ * The values that turn the coverage requirement off, and the reason the set is
+ * closed.
+ *
+ * DEFAULT ON. An absent coverage summary used to produce no metrics AND no
+ * measurement failure, and `evaluateFloors` is the only rule evaluator that
+ * reports a missing metric -- `evaluateCeilings` and `evaluateMonotonic` both
+ * `continue` on an undefined value. So a project whose only coverage rule was a
+ * ratchet got no coverage enforcement whatsoever the moment its report stopped
+ * being written, and because a monotonic rule still returned a baseline the run
+ * counted as fully evaluated and cached the pass. A required script can exit 0
+ * while writing no report, so nothing had to look broken for this to happen.
+ *
+ * An UNRECOGNISED value leaves the requirement ON, and the asymmetry is
+ * deliberate. Reading a typo as "off" restores exactly the silence above and the
+ * reader gets no sign that their opt-out did nothing; reading it as "on" costs an
+ * advisory that says what to fix. Note that this includes the empty string, so
+ * `QUALITY_COVERAGE_REQUIRED=` does NOT disable it -- elsewhere in this file `||`
+ * makes an empty value mean "unset", and that convention would be the wrong one
+ * here for the same reason.
+ */
+const COVERAGE_REQUIREMENT_DISABLED_BY = new Set(['false', '0', 'no', 'off']);
+function coverageRequired() {
+    const raw = process.env.QUALITY_COVERAGE_REQUIRED;
+    if (raw === undefined)
+        return true;
+    return !COVERAGE_REQUIREMENT_DISABLED_BY.has(raw.trim().toLowerCase());
+}
 function resolveProjectRoot() {
     // Start from cwd and verify package.json exists
     const cwd = process.cwd();
@@ -56,6 +84,12 @@ export function loadConfig() {
             unitDir: process.env.QUALITY_COVERAGE_UNIT_DIR || 'coverage',
             lambdaDir: process.env.QUALITY_COVERAGE_LAMBDA_DIR || 'coverage-lambda',
             summaryFile: process.env.QUALITY_COVERAGE_SUMMARY_FILE || 'coverage-summary.json',
+            required: coverageRequired(),
+            // Emptiness counts as unset here, matching the `||` above it: a variable set
+            // to '' resolves to the default path, so calling it "configured" would claim
+            // the project named a directory it did not.
+            unitDirConfigured: !!process.env.QUALITY_COVERAGE_UNIT_DIR,
+            lambdaDirConfigured: !!process.env.QUALITY_COVERAGE_LAMBDA_DIR,
         },
         cache: {
             file: process.env.QUALITY_CACHE_FILE ||

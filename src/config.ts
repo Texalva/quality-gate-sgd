@@ -35,6 +35,19 @@ export interface QualityGateConfig {
     unitDir: string;
     lambdaDir: string; // or "integration", "e2e", etc.
     summaryFile: string;
+
+    /** False only for a project that deliberately has no coverage report at all. */
+    required: boolean;
+
+    /**
+     * Whether each directory above was named by the PROJECT rather than defaulted.
+     *
+     * Both are resolved with `||` against a hardcoded default, which loses exactly
+     * the distinction the coverage provider needs to decide whether an absent
+     * summary for that suite is a failed measurement. See CoverageReportPaths.
+     */
+    unitDirConfigured: boolean;
+    lambdaDirConfigured: boolean;
   };
 
   // Cache settings
@@ -57,6 +70,35 @@ export interface QualityGateConfig {
 // =============================================================================
 // Default Configuration
 // =============================================================================
+
+/**
+ * The values that turn the coverage requirement off, and the reason the set is
+ * closed.
+ *
+ * DEFAULT ON. An absent coverage summary used to produce no metrics AND no
+ * measurement failure, and `evaluateFloors` is the only rule evaluator that
+ * reports a missing metric -- `evaluateCeilings` and `evaluateMonotonic` both
+ * `continue` on an undefined value. So a project whose only coverage rule was a
+ * ratchet got no coverage enforcement whatsoever the moment its report stopped
+ * being written, and because a monotonic rule still returned a baseline the run
+ * counted as fully evaluated and cached the pass. A required script can exit 0
+ * while writing no report, so nothing had to look broken for this to happen.
+ *
+ * An UNRECOGNISED value leaves the requirement ON, and the asymmetry is
+ * deliberate. Reading a typo as "off" restores exactly the silence above and the
+ * reader gets no sign that their opt-out did nothing; reading it as "on" costs an
+ * advisory that says what to fix. Note that this includes the empty string, so
+ * `QUALITY_COVERAGE_REQUIRED=` does NOT disable it -- elsewhere in this file `||`
+ * makes an empty value mean "unset", and that convention would be the wrong one
+ * here for the same reason.
+ */
+const COVERAGE_REQUIREMENT_DISABLED_BY = new Set(['false', '0', 'no', 'off']);
+
+function coverageRequired(): boolean {
+  const raw = process.env.QUALITY_COVERAGE_REQUIRED;
+  if (raw === undefined) return true;
+  return !COVERAGE_REQUIREMENT_DISABLED_BY.has(raw.trim().toLowerCase());
+}
 
 function resolveProjectRoot(): string {
   // Start from cwd and verify package.json exists
@@ -107,6 +149,12 @@ export function loadConfig(): QualityGateConfig {
       lambdaDir: process.env.QUALITY_COVERAGE_LAMBDA_DIR || 'coverage-lambda',
       summaryFile:
         process.env.QUALITY_COVERAGE_SUMMARY_FILE || 'coverage-summary.json',
+      required: coverageRequired(),
+      // Emptiness counts as unset here, matching the `||` above it: a variable set
+      // to '' resolves to the default path, so calling it "configured" would claim
+      // the project named a directory it did not.
+      unitDirConfigured: !!process.env.QUALITY_COVERAGE_UNIT_DIR,
+      lambdaDirConfigured: !!process.env.QUALITY_COVERAGE_LAMBDA_DIR,
     },
 
     cache: {

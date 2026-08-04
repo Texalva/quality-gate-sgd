@@ -149,6 +149,38 @@ describe('loadConfig', () => {
     expect(config.coverage.lambdaDir).toBe('custom-lambda-coverage')
   })
 
+  // The requirement is ON unless the project says otherwise, and only the four
+  // words below say it. See COVERAGE_REQUIREMENT_DISABLED_BY for why an
+  // unrecognised value has to leave it on rather than off.
+  it('requires a coverage report by default', () => {
+    delete process.env.QUALITY_COVERAGE_REQUIRED
+
+    expect(loadConfig().coverage.required).toBe(true)
+  })
+
+  it.each(['false', 'FALSE', ' false ', '0', 'no', 'off'])(
+    'accepts %j as QUALITY_COVERAGE_REQUIRED off',
+    (value) => {
+      process.env.QUALITY_COVERAGE_REQUIRED = value
+
+      expect(loadConfig().coverage.required).toBe(false)
+    }
+  )
+
+  // The empty string is the trap: everything else in loadConfig resolves with
+  // `||`, where empty means "unset" and falls back to the default. Here the
+  // default is ON, so reading empty as "unset" and reading it as "off" are
+  // opposite answers -- and `QUALITY_COVERAGE_REQUIRED=` is a plausible way to
+  // write either. It stays ON, with the failure loud rather than silent.
+  it.each(['', 'true', 'yes', 'flase', 'maybe'])(
+    'leaves the requirement on for %j',
+    (value) => {
+      process.env.QUALITY_COVERAGE_REQUIRED = value
+
+      expect(loadConfig().coverage.required).toBe(true)
+    }
+  )
+
   it('respects QUALITY_COVERAGE_SUMMARY_FILE environment variable', () => {
     process.env.QUALITY_COVERAGE_SUMMARY_FILE = 'custom-summary.json'
 

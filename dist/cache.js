@@ -9,14 +9,17 @@ import { execSync } from 'child_process';
 import { computeRulesHash } from './rules.js';
 import { getConfig } from './config.js';
 /**
- * 3 since zero-denominator dimensions changed value and only rule-graded
- * measurement failures fail. Either one moves the definition of a pass, and
- * `cli.ts` exits 0 on a cached pass without measuring anything, so a version-2
- * entry can assert a verdict this version would not reach. `loadCache` discards a
- * mismatched schema, which is the point: the fix must not be undone by a cache
- * written before it. Full reasoning on QualityGateCache in types.ts.
+ * 4 since an absent coverage summary became a measurement failure. Before that, 3
+ * since zero-denominator dimensions changed value and only rule-graded measurement
+ * failures fail. Each one moves the definition of a pass, and `cli.ts` exits 0 on a
+ * cached pass without measuring anything, so an older entry can assert a verdict
+ * this version would not reach -- a version-3 entry holding `coverage: {}` and a
+ * PASS that a ratchet reached by skipping the absent value was accepted by
+ * `isCacheValid` verbatim. `loadCache` discards a mismatched schema, which is the
+ * point: the fix must not be undone by a cache written before it. Full reasoning on
+ * QualityGateCache in types.ts.
  */
-const CURRENT_SCHEMA_VERSION = 3;
+const CURRENT_SCHEMA_VERSION = 4;
 /**
  * Buffer ceiling for the git reads whose output scales with the repository.
  *

@@ -15,7 +15,9 @@ import type { MeasurementFailure } from './providers/types.js';
  * open question of how a report's provenance should be established. Returning a
  * field no caller reads would suggest something here checks it.
  */
-export declare function measureCoverage(): {
+export declare function measureCoverage(options?: {
+    readonly absentReportIsFailure?: boolean;
+}): {
     readonly metrics: AllCoverageMetrics;
     readonly failures: readonly MeasurementFailure[];
 };
@@ -93,6 +95,18 @@ interface MetricsExtractionOptions {
     customDimensions?: CustomDimensionConfig[];
     /** Whether to skip custom dimension extraction (default: false) */
     skipCustomDimensions?: boolean;
+    /**
+     * Whether an absent coverage summary is a measurement failure. Defaults to
+     * TRUE, which is the safe direction: a caller that forgets this gets the loud
+     * reading.
+     *
+     * The caller resolves it because the answer depends on the RULES, which this
+     * module does not see. `QUALITY_COVERAGE_REQUIRED=false` is a project saying it
+     * has no coverage; a project that also grades coverage has contradicted that,
+     * and honouring the flag there would silently disable a rule it wrote. See
+     * `coverageAbsenceIsFailure` in cli.ts.
+     */
+    coverageAbsenceIsFailure?: boolean;
 }
 export declare function extractAllMetrics(scriptsToRunOrOptions?: string[] | MetricsExtractionOptions): Metrics;
 /**

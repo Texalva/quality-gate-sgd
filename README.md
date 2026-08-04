@@ -254,6 +254,62 @@ console.log(prioritized[0].priority);  // Priority score
 | `QUALITY_RULES_FILE` | `rules.json` | Rules file path |
 | `QUALITY_CODE_PATHSPECS` | `src/,tests/,scripts/` | Paths for cache hashing |
 | `QUALITY_CACHE_FILE` | `.quality-gate-cache.json` | Cache file |
+| `QUALITY_COVERAGE_UNIT_DIR` | `coverage` | Directory holding the coverage summary |
+| `QUALITY_COVERAGE_SUMMARY_FILE` | `coverage-summary.json` | Summary filename within it |
+| `QUALITY_COVERAGE_REQUIRED` | `true` | Whether a missing coverage report is an error |
+
+### Projects with no coverage
+
+The gate treats a missing `coverage/coverage-summary.json` as a **failed
+measurement**, not as zero coverage and not as nothing at all. The reason is an
+asymmetry between the rule kinds: a floor on a metric that is absent fails loudly
+(`Metric 'coverage.unit.branches' not available`), but a **ceiling or a monotonic
+ratchet on an absent value is silently skipped**. So a project whose only coverage
+rule is a ratchet used to lose coverage enforcement entirely, and permanently, the
+moment its test script stopped writing a report — while still reporting a pass and
+caching it. A script can exit 0 having written nothing, so nothing has to look
+broken for that to happen.
+
+What you see depends on whether you gate coverage:
+
+- **You have coverage rules.** The gate fails, naming the file it looked for and
+  the setting that produced the path. Fix it by running the script that passes
+  `--coverage` before the gate and listing it in `requiredScripts`.
+- **You have no coverage rules.** The gate still passes — a measurement no rule
+  reads cannot change a verdict — but it prints an advisory every run and does not
+  write a cache entry, because an incomplete reading is not worth remembering.
+
+If the project genuinely has no coverage and never will, say so once:
+
+```bash
+QUALITY_COVERAGE_REQUIRED=false
+```
+
+That silences the advisory and restores caching. Only `false`, `0`, `no` and `off`
+disable it; anything else — including an empty value — leaves it on, deliberately,
+so a typo cannot quietly reopen the hole.
+
+**The opt-out cannot switch off a coverage rule you wrote.** It is honoured only
+when no rule reads coverage, directly or through `coverage.union`. A configuration
+that sets the variable *and* grades coverage has contradicted itself, and the gate
+resolves that by measuring: otherwise setting one environment variable would
+silently disable a ratchet, which is the defect the requirement exists to close.
+The narrow reading is also why toggling the variable does not invalidate a cached
+entry — it can only ever suppress an advisory, never change a verdict.
+
+### Coverage suites
+
+`QUALITY_COVERAGE_UNIT_DIR` is the main suite. `QUALITY_COVERAGE_LAMBDA_DIR`
+declares a second one (integration, e2e, lambda — the name is historical), read
+into `coverage.lambda.*`, with `coverage.union.*` summed across both.
+
+A suite you **name** must produce a report: if you set
+`QUALITY_COVERAGE_LAMBDA_DIR` and nothing writes a summary there, that is a failed
+measurement even when the main suite is healthy. A suite you did not name is not
+required — the second suite has a default path that almost no project has, so
+failing on its absence would fail nearly everyone. This is also why a project whose
+only coverage lives in a named second suite is fine: the main suite's absence is
+not faulted when another suite produced a report.
 
 ### SonarQube Setup
 

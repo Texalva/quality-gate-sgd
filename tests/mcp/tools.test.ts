@@ -72,7 +72,7 @@ vi.mock('../../src/cache.js', async () => {
   const actual = await vi.importActual<typeof import('../../src/cache.js')>('../../src/cache.js');
   return {
     ...actual,
-    loadCache: vi.fn(() => ({ schemaVersion: 3, entries: {} })),
+    loadCache: vi.fn(() => ({ schemaVersion: 4, entries: {} })),
     getCacheKey: vi.fn(() => ({ key: 'wip:abc', isWIP: true })),
     findBaselineEntry: vi.fn(() => undefined),
   };

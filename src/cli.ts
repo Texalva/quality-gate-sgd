@@ -29,6 +29,7 @@ import {
   evaluateRules,
   isCacheValid,
   isMeasurementUnderRule,
+  coverageAbsenceIsFailure,
 } from './rules.js';
 import {
   loadCache,
@@ -385,6 +386,7 @@ async function runQualityGate(options: RunOptions = { skipSonarQube: false }): P
   const metrics = await extractAllMetricsAsync({
     scriptsToRun: requiredScripts,
     skipSonarQube: options.skipSonarQube,
+    coverageAbsenceIsFailure: coverageAbsenceIsFailure(rules),
   });
 
   // Log extracted metrics.
@@ -493,7 +495,8 @@ async function runQualityGate(options: RunOptions = { skipSonarQube: false }): P
         'the reading is fixed: add a floor, ceiling or monotonic rule on the dimension to make ' +
         'it gating, or stop measuring it (for a stray coverage-lambda directory, point ' +
         'QUALITY_COVERAGE_LAMBDA_DIR at a directory that does not exist -- setting it empty ' +
-        'falls back to the default).'
+        'falls back to the default; for a project with no coverage at all, set ' +
+        'QUALITY_COVERAGE_REQUIRED=false).'
     );
   }
 

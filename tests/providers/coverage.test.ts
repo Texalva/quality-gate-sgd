@@ -135,6 +135,60 @@ describe('istanbul coverage provider', () => {
       expect(metrics.unit).toBeUndefined();
     });
 
+    // The other half of the case above, and the reason it is not enough on its own:
+    // it never asserted on `failures`. A lambda-only layout points
+    // QUALITY_COVERAGE_LAMBDA_DIR at the real report and leaves the unit directory at
+    // its default, so the unit summary is absent -- and requiring it unconditionally
+    // reported `report-missing` on `coverage.unit`, which gates every
+    // `coverage.union.*` rule through the derivation edge. That is a red gate on a
+    // project whose only real suite measured 80%. Found by adversarial review.
+    it('does not fault the absent unit summary when a configured lambda suite read', () => {
+      mockFiles({ [LAMBDA_SUMMARY]: summary() });
+
+      const result = createIstanbulCoverageProvider({
+        ...PATHS,
+        lambdaDirConfigured: true,
+      }).measure(CONTEXT);
+      if (!isOk(result)) throw new Error('expected a reading');
+
+      expect(result.value.failures).toEqual([]);
+      expect(result.value.metrics.lambda).toBeDefined();
+      expect(result.value.metrics.union).toBeDefined();
+    });
+
+    // A suite the project NAMED must produce a summary, even when the other one is
+    // perfectly healthy. The first version hardcoded lambda as never-required, on the
+    // grounds that `config.ts` invents it for everyone -- which is true of the
+    // DEFAULT, and false of a directory the project asked for by name. Reproduced by
+    // adversarial review: valid unit report, QUALITY_COVERAGE_LAMBDA_DIR set, no such
+    // summary, an `up` ratchet on coverage.lambda.branches against a 90% baseline --
+    // no metric, no failure, pass, cached.
+    it('faults a configured lambda summary that does not exist, beside a healthy unit', () => {
+      mockFiles({ [UNIT_SUMMARY]: summary() });
+
+      const result = createIstanbulCoverageProvider({
+        ...PATHS,
+        lambdaDirConfigured: true,
+      }).measure(CONTEXT);
+      if (!isOk(result)) throw new Error('expected a reading');
+
+      expect(result.value.metrics.unit).toBeDefined();
+      expect(result.value.failures).toHaveLength(1);
+      expect(result.value.failures[0]).toMatchObject({
+        kind: 'report-missing',
+        dimension: 'coverage.lambda',
+      });
+      expect(result.value.failures[0].message).toContain('QUALITY_COVERAGE_LAMBDA_DIR');
+    });
+
+    // And the default second suite stays silent, which is the false positive the
+    // `configured` flag exists to avoid: almost no project has `coverage-lambda/`.
+    it('stays silent about the DEFAULT lambda suite when unit read fine', () => {
+      mockFiles({ [UNIT_SUMMARY]: summary() });
+
+      expect(measure().failures).toEqual([]);
+    });
+
     // union is NOT a rounded duplicate of unit: istanbul rounds total.pct to 2 dp
     // while this is recomputed from the per-file entries at full precision.
     it('recomputes union from per-file entries at full precision', () => {
@@ -212,7 +266,11 @@ describe('istanbul coverage provider', () => {
       expect(Object.keys(measure().metrics)).toEqual(['lambda', 'unit', 'union']);
     });
 
-    it('reports a summary with no total but real file entries as union-only', () => {
+    // The union survives and the SUITE is what failed: `total` is the only source
+    // of `coverage.unit.*`, while the union is summed from the per-file entries.
+    // The failure is the point -- with no `total` and no failure, a ceiling or a
+    // monotonic rule on coverage.unit.* has nothing to compare and skips.
+    it('reports a summary with no total as a failed suite, keeping the union', () => {
       mockFiles({
         [UNIT_SUMMARY]: JSON.stringify({
           '/p/src/a.ts': {
@@ -228,7 +286,12 @@ describe('istanbul coverage provider', () => {
 
       expect(metrics.unit).toBeUndefined();
       expect(metrics.union).toBeDefined();
-      expect(failures).toEqual([]);
+      expect(failures).toHaveLength(1);
+      expect(failures[0]).toMatchObject({
+        kind: 'unparseable-output',
+        dimension: 'coverage.unit',
+      });
+      expect(failures[0].message).toContain('no `total` object');
     });
   });
 
@@ -809,15 +872,32 @@ describe('istanbul coverage provider', () => {
   });
 
   describe('failure classification', () => {
-    it('stays silent when nothing exists anywhere', () => {
+    // The absent unit summary is the whole of #43: it produced no metric AND no
+    // failure, and only `evaluateFloors` reports a missing metric -- a ceiling or a
+    // monotonic rule `continue`s on an undefined value. So a coverage ratchet
+    // stopped ratcheting the moment the report stopped being written, silently, and
+    // the run still cached its pass.
+    it('reports an absent unit summary as report-missing', () => {
       mockFiles({});
 
       const { metrics, failures, reads } = measure();
 
-      expect(failures).toEqual([]);
       expect(metrics.unit).toBeUndefined();
-      // A project with no coverage has not failed to measure it -- it never asked.
-      // Emitting report-missing here would fail every project without coverage.
+      expect(failures).toHaveLength(1);
+      expect(failures[0]).toMatchObject({
+        kind: 'report-missing',
+        dimension: 'coverage.unit',
+      });
+      // Names the file, the setting that produced the path, and the opt-out.
+      expect(failures[0].message).toContain(UNIT_SUMMARY);
+      expect(failures[0].message).toContain('QUALITY_COVERAGE_UNIT_DIR');
+      expect(failures[0].message).toContain('QUALITY_COVERAGE_REQUIRED=false');
+
+      // The lambda summary is absent too and is NOT reported, because `lambdaDir`
+      // is populated unconditionally from a default nearly no project has -- see
+      // suitesOf and #38.
+      expect(failures.every((f) => f.dimension !== 'coverage.lambda')).toBe(true);
+
       expect(reads.every((r) => r.attempt.outcome === 'absent')).toBe(true);
       expect(reads.map((r) => r.attempt.path)).toEqual([
         UNIT_FINAL,
@@ -825,6 +905,40 @@ describe('istanbul coverage provider', () => {
         UNIT_SUMMARY,
         LAMBDA_SUMMARY,
       ]);
+    });
+
+    // The explicit opt-out for a project that has no coverage and never will.
+    // Without one, option (c) of #43 charges an advisory on every run -- and the
+    // loss of the cache, since any measurement failure suppresses the write -- to a
+    // project that gates only its type-checker and its linter.
+    it('stays silent about an absent summary when absentReport is ignore', () => {
+      mockFiles({});
+
+      const result = createIstanbulCoverageProvider(PATHS, {
+        absentReport: 'ignore',
+      }).measure(CONTEXT);
+      if (!isOk(result)) throw new Error('expected a reading');
+
+      expect(result.value.failures).toEqual([]);
+      expect(result.value.metrics.unit).toBeUndefined();
+    });
+
+    // The opt-out is about ABSENCE only. A report that exists and cannot be read is
+    // still a failed measurement, because the project plainly does have coverage
+    // and the tool cannot say what it is.
+    it('still reports a corrupt summary when absentReport is ignore', () => {
+      mockFiles({ [UNIT_SUMMARY]: 'this is not json' });
+
+      const result = createIstanbulCoverageProvider(PATHS, {
+        absentReport: 'ignore',
+      }).measure(CONTEXT);
+      if (!isOk(result)) throw new Error('expected a reading');
+
+      expect(result.value.failures).toHaveLength(1);
+      expect(result.value.failures[0]).toMatchObject({
+        kind: 'unparseable-output',
+        dimension: 'coverage.unit',
+      });
     });
 
     it('reports a corrupt summary as unparseable, naming the file and the setting', () => {

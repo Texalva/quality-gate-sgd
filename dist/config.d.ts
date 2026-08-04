@@ -25,6 +25,17 @@ export interface QualityGateConfig {
         unitDir: string;
         lambdaDir: string;
         summaryFile: string;
+        /** False only for a project that deliberately has no coverage report at all. */
+        required: boolean;
+        /**
+         * Whether each directory above was named by the PROJECT rather than defaulted.
+         *
+         * Both are resolved with `||` against a hardcoded default, which loses exactly
+         * the distinction the coverage provider needs to decide whether an absent
+         * summary for that suite is a failed measurement. See CoverageReportPaths.
+         */
+        unitDirConfigured: boolean;
+        lambdaDirConfigured: boolean;
     };
     cache: {
         file: string;

@@ -51,6 +51,32 @@ export interface CoverageReportPaths {
     readonly unitDir: string;
     readonly lambdaDir?: string;
     readonly summaryFile: string;
+    /**
+     * Whether each directory above came from the PROJECT or from a default.
+     *
+     * These exist for one question -- is an ABSENT summary for that suite a failed
+     * measurement -- and it cannot be answered from the paths alone, because
+     * `config.ts` resolves both with `||` against a hardcoded default. Without the
+     * distinction, a project that deliberately configured a suite is
+     * indistinguishable from one that has never heard of it, and the choice collapses
+     * to failing everyone on a directory they never named or letting a
+     * deliberately-configured suite vanish in silence.
+     *
+     * Both halves of that were reproduced by adversarial review of the first version,
+     * which hardcoded the answer per suite:
+     *   - lambda never required: a valid unit report, `QUALITY_COVERAGE_LAMBDA_DIR`
+     *     set, no such summary, and an `up` ratchet on `coverage.lambda.branches`
+     *     against a 90% baseline -- no metric, no failure, `status: "pass"`, cached.
+     *   - unit always required: no unit summary, a valid LAMBDA summary at 25%, and a
+     *     `coverage.union.statements` floor of 20 -- the union was correctly 25 and
+     *     satisfied the floor, but `report-missing` on `coverage.unit` gated it through
+     *     the derivation edge and the gate went red on a project that measured fine.
+     *
+     * Both default to false: a caller that cannot tell gets the conservative answer
+     * rather than a failure about a directory it invented.
+     */
+    readonly unitDirConfigured?: boolean;
+    readonly lambdaDirConfigured?: boolean;
 }
 /**
  * What the caller wants out of the reading.
@@ -73,6 +99,16 @@ export interface CoverageReportPaths {
 export interface CoverageProviderOptions {
     /** 'collect' (default) walks the detail reports; 'skip' does not open them. */
     readonly issues?: 'collect' | 'skip';
+    /**
+     * What an absent coverage summary means. 'fail' (default) reports it as
+     * `report-missing`; 'ignore' restores the silence, for a project that
+     * deliberately has no coverage report at all.
+     *
+     * Defaulting to 'fail' is the safe direction: a caller that forgets this option
+     * gets the loud reading, and the quiet one has to be asked for. See readFailure
+     * for what the silence cost.
+     */
+    readonly absentReport?: 'fail' | 'ignore';
 }
 export declare function createIstanbulCoverageProvider(paths: CoverageReportPaths, options?: CoverageProviderOptions): CoverageProvider;
 //# sourceMappingURL=coverage.d.ts.map

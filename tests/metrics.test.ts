@@ -45,6 +45,15 @@ vi.mock('../src/config.js', () => ({
       unitDir: 'coverage',
       lambdaDir: 'coverage-lambda',
       summaryFile: 'coverage-summary.json',
+      // Matches the real defaults. `required` is no longer read on this path -- the
+      // caller resolves the opt-out, because it depends on the rules -- but it stays
+      // here so the mock keeps describing a real config object.
+      required: true,
+      // Both false, which is what an unset QUALITY_COVERAGE_*_DIR gives. That makes
+      // this mock the ordinary single-suite project: the unit summary is required
+      // because nothing else was read, and the phantom lambda suite is not.
+      unitDirConfigured: false,
+      lambdaDirConfigured: false,
     },
     sonarqube: {
       url: 'http://localhost:9000',
@@ -567,16 +576,47 @@ describe('Coverage Metrics', () => {
       expect(evidence.attempts[0].outcome).toBe('wrong-shape')
     })
 
-    // A missing report stays silent. `lambdaDir` defaults to `coverage-lambda`,
-    // which almost no project has, so failing on absence would fail everyone.
-    it('stays silent when no report exists at all', () => {
+    // #43. The GATE path requires the unit report to exist, because an absent one
+    // produced no metric and no failure, and a ceiling or monotonic coverage rule
+    // reads an undefined value as nothing to check. The lambda report stays
+    // unrequired: `lambdaDir` defaults to `coverage-lambda`, which almost no
+    // project has, so failing on ITS absence would fail everyone (#38).
+    it('reports a missing unit report and stays silent about lambda', () => {
       vi.mocked(fs.existsSync).mockReturnValue(false)
 
       const reading = measureCoverage()
 
-      expect(reading.failures).toEqual([])
+      expect(reading.failures).toHaveLength(1)
+      expect(reading.failures[0]).toMatchObject({
+        kind: 'report-missing',
+        dimension: 'coverage.unit',
+      })
       expect(reading.metrics.unit).toBeUndefined()
       expect(reading.metrics.lambda).toBeUndefined()
+    })
+
+    // The opt-out is the CALLER's to pass, not this module's to read from config.
+    // `QUALITY_COVERAGE_REQUIRED=false` alone must not suppress the failure, because
+    // whether it applies depends on the rules -- see `coverageAbsenceIsFailure` in
+    // cli.ts. Two adversarial reviews reproduced the hole in the version that read
+    // the flag here: the flag plus a coverage ratchet plus no report gave a silent
+    // pass, cached.
+    it('suppresses the missing report only when the caller asks it to', () => {
+      vi.mocked(fs.existsSync).mockReturnValue(false)
+
+      const reading = measureCoverage({ absentReportIsFailure: false })
+
+      expect(reading.failures).toEqual([])
+      expect(reading.metrics.unit).toBeUndefined()
+    })
+
+    // The default is the loud one, so a caller that says nothing cannot lose the
+    // diagnosis by omission.
+    it('requires the report when the caller says nothing', () => {
+      vi.mocked(fs.existsSync).mockReturnValue(false)
+
+      expect(measureCoverage().failures).toHaveLength(1)
+      expect(measureCoverage({}).failures).toHaveLength(1)
     })
 
     // The healthy control: a normal report must be untouched by all of the above.
@@ -1815,6 +1855,17 @@ describe('coverage report ordering', () => {
   })
 })
 
+/**
+ * The custom-dimension failures only.
+ *
+ * These fixtures mock every file absent, which makes the coverage summary missing
+ * too -- a real measurement failure about a different dimension (#43). Asserting
+ * on the total count would couple a test about custom extractors to every other
+ * dimension's health and read an unrelated failure as this one.
+ */
+const customFailuresOf = (result: Metrics) =>
+  (result.measurementFailures ?? []).filter((f) => f.dimension.startsWith('custom'))
+
 describe('extractAllMetrics', () => {
   beforeEach(() => {
     vi.clearAllMocks()
@@ -1933,7 +1984,11 @@ describe('extractAllMetrics', () => {
 
     expect(result.custom).toBeDefined()
     expect(result.custom?.['test_dim']).toBe(42)
-    expect(result.measurementFailures).toBeUndefined()
+    // Scoped to the dimension under test rather than asserted on the total. This
+    // fixture mocks every file absent, so the coverage summary is missing too and
+    // the gate now says so (#43) -- a real failure about a different dimension,
+    // which a count assertion would dress up as a broken custom extractor.
+    expect(customFailuresOf(result)).toEqual([])
   })
 
   it('reports a broken custom extractor as a measurement failure, not as zero', async () => {
@@ -1967,8 +2022,9 @@ describe('extractAllMetrics', () => {
     })
 
     expect(result.custom?.['complexity']).toBeUndefined()
-    expect(result.measurementFailures).toHaveLength(1)
-    expect(result.measurementFailures?.[0]).toMatchObject({
+    const failures = customFailuresOf(result)
+    expect(failures).toHaveLength(1)
+    expect(failures[0]).toMatchObject({
       kind: 'crashed',
       dimension: 'custom.complexity',
     })

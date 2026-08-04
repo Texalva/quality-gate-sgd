@@ -17,7 +17,7 @@ import {
 // Deliberately not importing `extractAllMetrics`: it cannot load custom
 // dimensions, so any surface in here that used it silently omitted them.
 extractAllMetricsAsync, describeUnmeasured, isSonarqubeAvailable, runSonarqubeScan, getTopSonarIssues, } from './metrics.js';
-import { loadRules, evaluateRules, isCacheValid, isMeasurementUnderRule, } from './rules.js';
+import { loadRules, evaluateRules, isCacheValid, isMeasurementUnderRule, coverageAbsenceIsFailure, } from './rules.js';
 import { loadCache, saveCache, getCurrentCommitHash, getCacheKey, getCacheEntry, setCacheEntry, createCacheEntry, findBaselineEntry, resolveBaselineCommit, pruneOldEntries, } from './cache.js';
 import { getConfig } from './config.js';
 import { listIssues } from './list-issues.js';
@@ -255,6 +255,7 @@ async function runQualityGate(options = { skipSonarQube: false }) {
     const metrics = await extractAllMetricsAsync({
         scriptsToRun: requiredScripts,
         skipSonarQube: options.skipSonarQube,
+        coverageAbsenceIsFailure: coverageAbsenceIsFailure(rules),
     });
     // Log extracted metrics.
     //
@@ -337,7 +338,8 @@ async function runQualityGate(options = { skipSonarQube: false }) {
             'the reading is fixed: add a floor, ceiling or monotonic rule on the dimension to make ' +
             'it gating, or stop measuring it (for a stray coverage-lambda directory, point ' +
             'QUALITY_COVERAGE_LAMBDA_DIR at a directory that does not exist -- setting it empty ' +
-            'falls back to the default).');
+            'falls back to the default; for a project with no coverage at all, set ' +
+            'QUALITY_COVERAGE_REQUIRED=false).');
     }
     // The same argument covers a pass whose monotonic rules never ran. It is a
     // narrower reading than a complete one -- some configured rules were not

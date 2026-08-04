@@ -8,9 +8,17 @@
  */
 import type { LocatedIssue, ExtractedIssues, ExtractLocatedIssuesOptions } from './types.js';
 /**
- * Extract uncovered branches and lines from coverage-final.json.
+ * Extract uncovered branches and functions with location information.
  *
- * Each uncovered branch becomes a LocatedIssue with estimated coverage impact.
+ * Delegates to the coverage provider; the parsing that used to live here now
+ * lives in src/providers/coverage.ts, unchanged -- including the summary
+ * fallback, which fires on `issues.length === 0` rather than on the detail
+ * report's absence, so a detail report that parsed fine and found nothing
+ * uncovered still falls through to the coarser file-level findings.
+ *
+ * `coverageDir` keeps its exact previous meaning: it replaces ONLY the unit
+ * directory, for both the detail report and the summary, and the lambda
+ * directory still comes from config.
  */
 export declare function extractCoverageIssues(coverageDir?: string): LocatedIssue[];
 /**

@@ -25,6 +25,7 @@ export type {
   Metrics,
   AllCoverageMetrics,
   CoverageMetrics,
+  TotalCoverageMetrics,
   TypescriptMetrics,
   EslintMetrics,
   SonarqubeMetrics,
@@ -90,6 +91,7 @@ export {
 
 export {
   // Coverage
+  measureCoverage,
   extractAllCoverageMetrics,
   extractCoverageMetrics,
 

@@ -7,6 +7,7 @@ import * as path from 'path';
 import * as crypto from 'crypto';
 import { getConfig } from './config.js';
 import { getDefaultRules, isEmbeddedDefaults } from './defaults.js';
+import { getMetricValue as getFitnessMetricValue } from './fitness.js';
 // =============================================================================
 // Module State
 // =============================================================================
@@ -52,52 +53,217 @@ export function computeRulesHash(rules) {
 // Metric Value Access
 // =============================================================================
 /**
- * Get a nested metric value using dot notation
- * e.g., 'coverage.branches' -> metrics.coverage?.branches
+ * Metric lookup is `fitness.ts`'s exported `getMetricValue`, not a second copy.
+ *
+ * There used to be a private one here that walked the path segment by segment.
+ * It could not resolve any `custom.` path with more than one segment after the
+ * prefix, because `extractAllCustomMetrics` stores custom readings FLAT --
+ * `metrics.custom['bundle.size']`, not `metrics.custom.bundle.size` -- and
+ * `validateCustomDimensions` puts no constraint on segment count. So a ceiling
+ * on `custom.bundle.size` resolved to `undefined` and `evaluateCeilings` took
+ * its silent `continue`: measured 5,000,000 against a ceiling of 500,000, gate
+ * PASSED, and the reading was complete so the pass was cached.
+ *
+ * The asymmetry was exactly inverted from what is safe. A BROKEN extractor on
+ * that path WAS gated, because the failure's `dimension` string equals the rule
+ * path and `isMeasurementUnderRule` matched it -- while a WORKING extractor
+ * whose value violated the ceiling sailed through. `score` even printed the
+ * violating number in its own table on the same tree.
+ *
+ * Two accessors that disagree about what a path means is a fight the gate
+ * loses, so there is now one. Any future divergence has to be deliberate.
  */
-function getMetricValue(metrics, path) {
-    const parts = path.split('.');
-    let current = metrics;
-    for (const part of parts) {
-        if (current === null || current === undefined) {
-            return undefined;
-        }
-        if (typeof current !== 'object') {
-            return undefined;
-        }
-        current = current[part];
-    }
-    return typeof current === 'number' ? current : undefined;
-}
+const getMetricValue = getFitnessMetricValue;
 // =============================================================================
 // Measurement Evaluation
 // =============================================================================
 /**
- * A measurement that could not be taken fails the gate.
+ * Every metric path this configuration's rules name.
  *
- * This is the check the floor/ceiling asymmetry below makes necessary. A
- * missing FLOOR metric fails loudly (`Metric '...' not available`), but a
- * missing CEILING metric is skipped without a word -- and ceilings are what
- * guard `typescript.errors`, `eslint.errors`, `sonarqube.*` and every
- * `custom.*` dimension, none of which have floors. So for exactly the
- * dimensions where a crashed tool is likeliest, its output going missing used
- * to read as a satisfied rule.
+ * All four rule surfaces, because a dimension is "under rule" if ANY of them
+ * reads it: floors and ceilings key their thresholds by metric path, and a
+ * monotonic rule lists several. `requiredScripts` is deliberately not here --
+ * it names npm scripts, not dimensions, and a script name has no metric path to
+ * match against. Checked rather than assumed: `rules.rules` has exactly these
+ * four members (types.ts QualityRules), and grepping `rules.rules.` finds no
+ * fifth reader in src/.
  *
- * Evaluated regardless of which rules are configured. A tool that was asked to
- * run and could not is a broken build whether or not anyone wrote a threshold
- * for it -- and making it conditional on a matching rule would restore the
- * original hole for anyone who had not.
+ * The fitness score is not a rule surface either. It reads every registered
+ * dimension whether or not the project gates it, and it reports what it could
+ * not measure through `describeUnmeasured` instead of refusing to answer.
  */
-function evaluateMeasurements(metrics) {
-    return (metrics.measurementFailures ?? []).map((failure) => ({
+function ruledMetricPaths(rules) {
+    return [
+        ...Object.keys(rules.rules.floors ?? {}),
+        ...Object.keys(rules.rules.ceilings ?? {}),
+        ...(rules.rules.monotonic ?? []).flatMap((rule) => rule.metrics),
+    ];
+}
+/**
+ * Whether two metric paths name the same subtree, in either direction.
+ *
+ * Either can be the more specific one -- a failure names `coverage.unit` while a
+ * floor names `coverage.unit.branches`, and a failure names `custom.anyCount`
+ * while a ceiling names `custom` -- so both prefixes are tested. On a segment
+ * boundary, never a bare `startsWith`: `coverage.unit` must not match a rule on a
+ * hypothetical `coverage.unittest`, and `custom` must not match `customs.duty`.
+ */
+function sameSubtree(a, b) {
+    return a === b || a.startsWith(`${b}.`) || b.startsWith(`${a}.`);
+}
+/**
+ * Derived dimensions, and the dimensions their VALUE is computed from.
+ *
+ * A rule on a derived dimension is a rule on everything upstream of it, because
+ * the derived number is arithmetic over the upstream measurements: if one of those
+ * measurements failed, the derived number is not a reading of the project even
+ * though its own computation "succeeded". Name matching cannot see this --
+ * `coverage.union` and `coverage.unit` are unrelated strings one character apart --
+ * so the edges are declared.
+ *
+ * REPRODUCED, twice, when they were not: a project with a
+ * `coverage.union.statements` floor and a backdated unit report had its
+ * `coverage.unit` measurement failure demoted to an advisory while the union
+ * number DERIVED from that failed measurement was graded at 95 against a floor of
+ * 80, exit 0; and a truncated `coverage-lambda` summary was dropped from the merge
+ * with the union graded from the unit suite alone, exit 0. Both FAILED the gate
+ * before rule-scoping narrowed it, and the advisory printed the false sentence
+ * "nothing compares them against anything" -- the union rule compared them.
+ *
+ * ONE-DIRECTIONAL, deliberately. A failure upstream invalidates the derived
+ * number; a failure on the derived number says nothing about the suites it was
+ * summed from. `coverage.union`'s own `unparseable-output` (an unmergeable file
+ * entry, providers/coverage.ts) is exactly that case: `unit` and `lambda` come
+ * from `total`, which is validated on its own, and they are reported.
+ *
+ * `coverage.union` is the only edge here. The other derivations in the codebase
+ * are NOT cross-dimension:
+ *   - `typescript.rootCauses` / `eslint.rootCauses` are computed from the same
+ *     provider run as their `.errors` sibling, so a failure on `typescript` or
+ *     `eslint` already reaches them by subtree.
+ *   - the trajectory normalizer's `coverageBranches`, `*PerKsloc` etc. are derived
+ *     from `coverage.union ?? coverage.unit`, `sonarqube.*` and `sloc`, but they
+ *     are not metric paths any rule can name -- `getMetricValue` resolves rules
+ *     against `Metrics`, and no rule surface reaches NormalizedMetrics.
+ *   - the fitness score aggregates every registered dimension and is not a rule
+ *     surface either (see ruledMetricPaths).
+ *   - `sonarqube.coverage` is downstream of A coverage report, but not of the one
+ *     this tool reads: SonarQube imports its own configured lcov on its own
+ *     schedule and the gate reads the resulting measure from the API. An edge from
+ *     `coverage.unit` to it would assert a data path this tool cannot see, and
+ *     would gate a Sonar number on a report Sonar may never have been given.
+ */
+const DERIVED_FROM = {
+    'coverage.union': ['coverage.unit', 'coverage.lambda'],
+};
+/**
+ * The dimensions a rule on `metricPath` transitively depends on the measurement of.
+ *
+ * Itself, plus the upstreams of every derived dimension the path falls under. A
+ * floor on `coverage.union.statements` therefore depends on `coverage.unit` and
+ * `coverage.lambda` as well as on `coverage.union`.
+ */
+function measurementsBehind(metricPath) {
+    const upstreams = Object.entries(DERIVED_FROM)
+        .filter(([derived]) => sameSubtree(metricPath, derived))
+        .flatMap(([, sources]) => sources);
+    return [metricPath, ...upstreams];
+}
+/**
+ * Whether any rule grades the dimension a measurement failed on -- directly, or
+ * through a dimension DERIVED from it.
+ *
+ *   failure `coverage.unit`  + floor `coverage.unit.branches`   -> gated
+ *   failure `typescript`     + ceiling `typescript.errors`      -> gated
+ *   failure `custom.anyCount`+ ceiling `custom.anyCount`        -> gated
+ *   failure `coverage.unit`  + floor `coverage.union.statements` -> gated (derived)
+ *   failure `coverage.lambda`+ floor `coverage.union.statements` -> gated (derived)
+ *   failure `coverage.lambda`+ floor `coverage.unit.branches`   -> NOT gated
+ *   failure `coverage.union` + floor `coverage.unit.branches`   -> NOT gated
+ */
+export function isMeasurementUnderRule(rules, dimension) {
+    return ruledMetricPaths(rules)
+        .flatMap((metricPath) => measurementsBehind(metricPath))
+        .some((required) => sameSubtree(required, dimension));
+}
+/**
+ * A measurement that could not be taken fails the gate -- when some rule grades
+ * the dimension it was measuring.
+ *
+ * The failure itself is DETECTED and REPORTED unconditionally, and what this
+ * function decides is only which of them become failed RULES:
+ * `metrics.measurementFailures` carries them, `describeUnmeasured` renders them
+ * for `score` and `suggest`, and the CLI lists them by name.
+ *
+ * With ONE exception, which is a hole rather than a design: `sonarqube` has no
+ * failure channel at all. `extractSonarqubeMetrics` returns `undefined` from a
+ * bare catch and from an empty-`measures` check, and `extractAllMetrics` builds
+ * `measurementFailures` from typescript, eslint, coverage and custom only. So an
+ * expired token or an unprovisioned projectKey loses the whole dimension with an
+ * empty failure list, and every `sonarqube.*` ceiling hits the silent `continue`
+ * in `evaluateCeilings` while the run is graded as a complete reading. Filed as
+ * #23/#42. Read every "carries every failure" claim in this codebase as "every
+ * failure from a dimension that has a channel" until that is closed.
+ *
+ * This reverses the stance that stood here, and the reason is worth stating,
+ * because the old stance was right when it was written. Every failure the tool
+ * could then produce came from a dimension the default rules gate: a dead
+ * type-checker or linter is guarded by `typescript.errors` and `eslint.errors`
+ * ceilings that both embedded defaults ship, and the floor/ceiling asymmetry
+ * below is what made it necessary -- a missing FLOOR metric fails loudly
+ * (`Metric '...' not available`) while a missing CEILING metric is skipped
+ * without a word. So "evaluate regardless of the rules" cost nothing and closed
+ * a real hole.
+ *
+ * It stopped being right once a provider measured a suite nobody configured.
+ * `lambdaDir` defaults to `coverage-lambda` and is populated unconditionally, so
+ * the coverage provider always attempts a second suite; a project whose scripts
+ * rewrite only the unit report then hard-failed on `coverage.lambda`, a
+ * dimension no rule gates and which this codebase itself documents as "almost
+ * nobody has". Same shape for a project that gates only `typescript.errors` and
+ * `eslint.errors` and happens to have a stray gitignored `coverage/` directory,
+ * and for a declarations-only package whose blank summary is legitimate.
+ *
+ * The gate fails on the measurements it NEEDS, and reports the rest. A
+ * measurement nothing grades against cannot change a verdict, so promoting it to
+ * a failure is noise -- and noise in the loud channel is what trains adopters to
+ * stop reading it, which costs more than the hole it was closing.
+ */
+function evaluateMeasurements(rules, metrics) {
+    return (metrics.measurementFailures ?? [])
+        .filter((failure) => isMeasurementUnderRule(rules, failure.dimension))
+        .map((failure) => ({
         type: 'measurement',
         rule: `${failure.dimension}.measurement`,
         message: `${failure.dimension} could not be measured (${failure.kind}): ${failure.message} ` +
-            `[exit=${failure.evidence.exitCode ?? 'killed'}` +
-            `${failure.evidence.signal ? ` signal=${failure.evidence.signal}` : ''}` +
-            ` after ${failure.evidence.elapsedMs}ms, ` +
-            `${failure.evidence.stdoutBytes}B stdout, ${failure.evidence.stderrBytes}B stderr]`,
+            describeEvidence(failure.evidence),
     }));
+}
+/**
+ * Renders evidence for a human reading gate output.
+ *
+ * The REPORT variant is tested for explicitly and the process variant is the
+ * FALLBACK, deliberately -- not two arms of an exhaustive switch. Evidence
+ * objects built before the union existed carry no `via` tag at all (the
+ * literals in tests/rules.test.ts are exactly this shape), and a
+ * `switch (e.via)` with a `never` default would render those as nothing,
+ * silently dropping the signal and elapsed time that make a kill diagnosable.
+ * Ordering it this way makes the untagged case fall into the pre-existing
+ * behaviour instead of into a new hole.
+ */
+function describeEvidence(evidence) {
+    if (evidence.via === 'report') {
+        const attempts = evidence.attempts
+            .map((attempt) => `${attempt.path} ${attempt.outcome}` +
+            `${attempt.bytesRead === null ? '' : ` ${attempt.bytesRead}B`}` +
+            `${attempt.modifiedMs === null ? '' : ` mtime=${new Date(attempt.modifiedMs).toISOString()}`}`)
+            .join('; ');
+        return `[${evidence.attempts.length} path(s) tried: ${attempts}, after ${evidence.elapsedMs}ms]`;
+    }
+    return (`[exit=${evidence.exitCode ?? 'killed'}` +
+        `${evidence.signal ? ` signal=${evidence.signal}` : ''}` +
+        ` after ${evidence.elapsedMs}ms, ` +
+        `${evidence.stdoutBytes}B stdout, ${evidence.stderrBytes}B stderr]`);
 }
 // =============================================================================
 // Floor Evaluation
@@ -228,7 +394,7 @@ export function evaluateRules(rules, currentMetrics, baselineEntry) {
     const allFailures = [
         // First, so the reason a dimension is absent is stated before the rules
         // that read it start reporting it as absent.
-        ...evaluateMeasurements(currentMetrics),
+        ...evaluateMeasurements(rules, currentMetrics),
         ...evaluateFloors(rules, currentMetrics),
         ...evaluateCeilings(rules, currentMetrics),
         ...evaluateMonotonic(rules, currentMetrics, baselineMetrics),
@@ -243,12 +409,29 @@ export function evaluateRules(rules, currentMetrics, baselineEntry) {
  * Check if cached evaluation is still valid
  * Returns false if:
  * - Rules have changed since cache entry was created
+ * - The entry records a reading that was incomplete
  * - Required floor metrics were missing but may now be available
  */
 export function isCacheValid(entry, rules) {
     const currentHash = computeRulesHash(rules);
     // Rules changed - cache invalid
     if (entry.rulesHash !== currentHash || entry.rulesVersion !== rules.version) {
+        return false;
+    }
+    // An entry that RECORDS a measurement failure is an incomplete reading, and
+    // this version never writes one: `cli.ts` declines to cache any run with a
+    // measurement failure, gated or not. So this is the invariant made explicit
+    // rather than a condition that fires in normal operation.
+    //
+    // It is reachable, which is why it is a check and not a comment. Schema version
+    // 3 also covers an intermediate revision that scoped cache suppression to GATED
+    // failures, so a .qg-cache.json on disk can hold a version-3 PASS carrying an
+    // ungated failure. Serving it would exit 0 while printing only
+    // "Quality gate PASSED (cached)" -- the entry's failures are reported nowhere,
+    // because the cached path never reads them. Refusing the entry costs one
+    // re-measurement and reports the failure again, which is the outcome that
+    // converges.
+    if ((entry.metrics.measurementFailures ?? []).length > 0) {
         return false;
     }
     // If evaluation passed, cache is valid - no need to re-check metrics

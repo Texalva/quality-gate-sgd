@@ -4,8 +4,31 @@
  */
 import type { Metrics, CoverageMetrics, AllCoverageMetrics, SonarqubeMetrics, EslintMetrics, TypescriptMetrics } from './types.js';
 import { type CustomDimensionConfig } from './dimensions/index.js';
+import type { MeasurementFailure } from './providers/types.js';
+/**
+ * The coverage numbers and the reasons any of them are missing, together.
+ *
+ * `reads` is deliberately NOT surfaced here. The provider records what it looked
+ * at (CoverageReading.reads) and targets/extract.ts uses that to warn about a
+ * detail report it could not use, but nothing on the METRICS path judges the
+ * reports themselves -- see the note on ReportAttempt.modifiedMs, and #39 for the
+ * open question of how a report's provenance should be established. Returning a
+ * field no caller reads would suggest something here checks it.
+ */
+export declare function measureCoverage(): {
+    readonly metrics: AllCoverageMetrics;
+    readonly failures: readonly MeasurementFailure[];
+};
 /**
  * Extract all three coverage metrics: lambda-only, unit-only, and union.
+ *
+ * Returns `{}` rather than `undefined` when nothing could be read, because
+ * `extractAllMetrics` assigns this straight to `metrics.coverage` and callers
+ * distinguish "no coverage numbers" from "no coverage key" already.
+ *
+ * As with extractTypescriptMetrics, absence is only half the fix: this wrapper
+ * discards the REASON, so a caller using it directly gets an honest blank and no
+ * diagnosis. The gate path uses `measureCoverage` for exactly that reason.
  */
 export declare function extractAllCoverageMetrics(): AllCoverageMetrics;
 /**

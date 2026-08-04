@@ -1,6 +1,9 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import * as fs from 'fs'
+import { evaluateRules } from '../src/rules.js'
+import type { Metrics } from '../src/types.js'
 import {
+  measureCoverage,
   extractAllCoverageMetrics,
   extractCoverageMetrics,
   extractSloc,
@@ -246,7 +249,13 @@ describe('Coverage Metrics', () => {
       expect(result.union).toBeDefined()
     })
 
-    it('calculates percentages correctly with zero totals', () => {
+    // Fixture kept from the original 'calculates percentages correctly with zero
+    // totals'; what it asserts is inverted, because the rule changed. A report in
+    // which NOTHING was instrumented yields no numbers at all -- not the 0 this
+    // used to check for and not istanbul's 100. `union` is the one that moved:
+    // normalizeMetrics prefers it, so a fabricated number here reaches the
+    // quality score and the trajectory.
+    it('reports no numbers at all when every denominator is zero', () => {
       vi.mocked(fs.existsSync).mockReturnValue(true)
 
       vi.mocked(fs.readFileSync).mockReturnValue(JSON.stringify({
@@ -266,10 +275,9 @@ describe('Coverage Metrics', () => {
 
       const result = extractAllCoverageMetrics()
 
-      // Should return 0 not NaN for zero totals
-      expect(result.union).toBeDefined()
-      expect(result.union?.statements).toBe(0)
-      expect(result.union?.branches).toBe(0)
+      // Not NaN, and not 0 either: there is nothing to report a percentage of.
+      expect(result.union).toBeUndefined()
+      expect(result.unit).toBeUndefined()
     })
 
     it('handles coverage data without total property', () => {
@@ -290,6 +298,323 @@ describe('Coverage Metrics', () => {
       expect(result.unit).toBeUndefined()
       // But union should still work from file entries
       expect(result.union).toBeDefined()
+    })
+  })
+
+  // =========================================================================
+  // Zero denominators
+  // =========================================================================
+  //
+  // istanbul computes every pct as `percent(covered, total)`, which returns
+  // 100.0 when total is 0 (istanbul-lib-coverage/lib/percent.js). Every fixture
+  // in this block is a transcript of a REAL vitest 4 + @vitest/coverage-v8 run
+  // rather than a hand-written summary, because the whole question is what the
+  // tool actually emits.
+  describe('zero-denominator coverage', () => {
+    const mockUnitSummary = (summary: unknown) => {
+      vi.mocked(fs.existsSync).mockImplementation((p) =>
+        String(p).includes('coverage/coverage-summary.json')
+      )
+      vi.mocked(fs.readFileSync).mockReturnValue(JSON.stringify(summary))
+    }
+
+    // Verbatim from `vitest run --coverage` with `include: ['src/types-only.ts']`,
+    // a file containing only an interface and a type alias.
+    const MEASURED_NOTHING = {
+      total: {
+        lines: { total: 0, covered: 0, skipped: 0, pct: 100 },
+        statements: { total: 0, covered: 0, skipped: 0, pct: 100 },
+        functions: { total: 0, covered: 0, skipped: 0, pct: 100 },
+        branches: { total: 0, covered: 0, skipped: 0, pct: 100 },
+        branchesTrue: { total: 0, covered: 0, skipped: 0, pct: 'Unknown' },
+      },
+      '/p/src/types-only.ts': {
+        lines: { total: 0, covered: 0, skipped: 0, pct: 100 },
+        functions: { total: 0, covered: 0, skipped: 0, pct: 100 },
+        statements: { total: 0, covered: 0, skipped: 0, pct: 100 },
+        branches: { total: 0, covered: 0, skipped: 0, pct: 100 },
+      },
+    }
+
+    // Verbatim from the same setup with `include: ['src/branchless.ts']`: two
+    // functions, no conditionals anywhere. A legitimate project.
+    const BRANCHLESS = {
+      total: {
+        lines: { total: 3, covered: 0, skipped: 0, pct: 0 },
+        statements: { total: 3, covered: 0, skipped: 0, pct: 0 },
+        functions: { total: 2, covered: 0, skipped: 0, pct: 0 },
+        branches: { total: 0, covered: 0, skipped: 0, pct: 100 },
+        branchesTrue: { total: 0, covered: 0, skipped: 0, pct: 'Unknown' },
+      },
+    }
+
+    it('reports a coverage report that measured nothing as a failure, not as 100%', () => {
+      mockUnitSummary(MEASURED_NOTHING)
+
+      const reading = measureCoverage()
+
+      expect(reading.metrics.unit).toBeUndefined()
+      expect(reading.failures).toHaveLength(1)
+      expect(reading.failures[0]).toMatchObject({
+        kind: 'measured-nothing',
+        dimension: 'coverage.unit',
+      })
+    })
+
+    it('names the setting the adopter has to fix', () => {
+      mockUnitSummary(MEASURED_NOTHING)
+
+      const message = measureCoverage().failures[0].message
+
+      // A failure the reader cannot act on is half a fix.
+      expect(message).toContain('include')
+      expect(message).toContain('reportsDirectory')
+      expect(message).toContain('QUALITY_COVERAGE_UNIT_DIR')
+      // And it explains WHY the report looked fine.
+      expect(message).toContain('100%')
+    })
+
+    it('carries report evidence rather than a fabricated exit code', () => {
+      mockUnitSummary(MEASURED_NOTHING)
+
+      const evidence = measureCoverage().failures[0].evidence
+
+      // There was no child process, so claiming `exitCode: 0` would be a lie.
+      expect(evidence.via).toBe('report')
+      if (evidence.via !== 'report') throw new Error('expected report evidence')
+      expect(evidence.attempts).toHaveLength(1)
+      expect(evidence.attempts[0]).toMatchObject({
+        existed: true,
+        outcome: 'read',
+      })
+      expect(evidence.attempts[0].bytesRead).toBeGreaterThan(0)
+    })
+
+    // The load-bearing negative control. Without it, an implementation that
+    // rejected EVERY zero denominator would score perfectly on the case above
+    // while failing every project that happens not to use conditionals.
+    it('does NOT report a legitimately branchless project as broken', () => {
+      mockUnitSummary(BRANCHLESS)
+
+      const reading = measureCoverage()
+
+      expect(reading.failures).toEqual([])
+      expect(reading.metrics.unit).toBeDefined()
+      expect(reading.metrics.unit?.statements).toBe(0)
+      expect(reading.metrics.unit?.functions).toBe(0)
+      expect(reading.metrics.unit?.lines).toBe(0)
+      // 100, not absent: 0 of 0 branches missed IS complete coverage of the
+      // branches this codebase has. Safe here only because the all-zero report
+      // above is refused before this line can be reached.
+      expect(reading.metrics.unit?.branches).toBe(100)
+    })
+
+    // The dimension has to keep being ENFORCED, which is what dropping it
+    // silently undid: evaluateFloors reports an absent metric, but
+    // evaluateCeilings and evaluateMonotonic both `continue` past one.
+    it('lets a branchless project satisfy every rule type on the dimension it lacks', () => {
+      mockUnitSummary(BRANCHLESS)
+      const reading = measureCoverage()
+      const metrics: Metrics = {
+        coverage: reading.metrics,
+        scripts: {},
+        measurementFailures: reading.failures,
+      }
+
+      expect(
+        evaluateRules(
+          { version: '1.0.0', description: '', rules: { floors: { 'coverage.unit.statements': 0 } } },
+          metrics
+        ).status
+      ).toBe('pass')
+
+      // Previously a FAILURE reading `Metric '...' not available`, which init
+      // then wrote a floor for -- permanently unsatisfiable on a codebase with
+      // no conditionals in it.
+      const floored = evaluateRules(
+        { version: '1.0.0', description: '', rules: { floors: { 'coverage.unit.branches': 50 } } },
+        metrics
+      )
+      expect(floored.status).toBe('pass')
+
+      // And a rule type that used to be SKIPPED on an absent value is enforced
+      // against the same 100. This is the half of the defect the floors fix
+      // missed: a dropped dimension passed every ceiling and every monotonic
+      // rule written against it, silently, for want of a value to compare.
+      const ceilinged = evaluateRules(
+        { version: '1.0.0', description: '', rules: { ceilings: { 'coverage.unit.branches': 50 } } },
+        metrics
+      )
+      expect(ceilinged.status).toBe('fail')
+      expect(ceilinged.failedRules[0]).toMatchObject({ type: 'ceiling', current: 100 })
+    })
+
+    // istanbul's blankSummary emits the STRING "Unknown" for a report with no
+    // file entries, which the old code wrote straight into a `number` field.
+    it('treats a summary with no file entries as measuring nothing, not as "Unknown"', () => {
+      mockUnitSummary({
+        total: {
+          lines: { total: 0, covered: 0, skipped: 0, pct: 'Unknown' },
+          statements: { total: 0, covered: 0, skipped: 0, pct: 'Unknown' },
+          functions: { total: 0, covered: 0, skipped: 0, pct: 'Unknown' },
+          branches: { total: 0, covered: 0, skipped: 0, pct: 'Unknown' },
+        },
+      })
+
+      const reading = measureCoverage()
+
+      expect(reading.metrics.unit).toBeUndefined()
+      expect(reading.failures[0]).toMatchObject({ kind: 'measured-nothing' })
+    })
+
+    it('rejects a non-numeric denominator as unparseable rather than guessing', () => {
+      mockUnitSummary({
+        total: {
+          lines: { total: 10, covered: 5, pct: 50 },
+          statements: { total: 10, covered: 5, pct: 50 },
+          functions: { total: 2, covered: 1, pct: 50 },
+          branches: { total: 'lots', covered: 0, pct: 100 },
+        },
+      })
+
+      const reading = measureCoverage()
+
+      expect(reading.metrics.unit).toBeUndefined()
+      expect(reading.failures[0]).toMatchObject({
+        kind: 'unparseable-output',
+        dimension: 'coverage.unit',
+      })
+      expect(reading.failures[0].message).toContain('total.branches')
+    })
+
+    it('rejects a non-numeric pct over a real denominator', () => {
+      mockUnitSummary({
+        total: {
+          lines: { total: 10, covered: 5, pct: 50 },
+          statements: { total: 10, covered: 5, pct: 'fifty' },
+          functions: { total: 2, covered: 1, pct: 50 },
+          branches: { total: 4, covered: 2, pct: 50 },
+        },
+      })
+
+      const reading = measureCoverage()
+
+      expect(reading.metrics.unit).toBeUndefined()
+      expect(reading.failures[0]).toMatchObject({ kind: 'unparseable-output' })
+      expect(reading.failures[0].message).toContain('total.statements.pct')
+    })
+
+    // A report that exists but cannot be parsed used to be indistinguishable
+    // from an unmeasured project: `catch { // Skip if invalid }`.
+    it('reports a corrupt report as a failure, so a coverage floor fails instead of skipping', () => {
+      vi.mocked(fs.existsSync).mockImplementation((p) =>
+        String(p).includes('coverage/coverage-summary.json')
+      )
+      vi.mocked(fs.readFileSync).mockReturnValue('this is not json')
+
+      const reading = measureCoverage()
+
+      expect(reading.metrics.unit).toBeUndefined()
+      expect(reading.failures[0]).toMatchObject({
+        kind: 'unparseable-output',
+        dimension: 'coverage.unit',
+      })
+      const evidence = reading.failures[0].evidence
+      if (evidence.via !== 'report') throw new Error('expected report evidence')
+      expect(evidence.attempts[0]).toMatchObject({ outcome: 'invalid-json', existed: true })
+      expect(evidence.attempts[0].bytesRead).not.toBeNull()
+
+      // The whole point: green over a dimension that was never measured. A
+      // corrupt report leaves `coverage.unit.branches` absent, and a FLOOR on an
+      // absent metric is the one rule type that already complained -- so the
+      // assertion is that the verdict names the measurement rather than the
+      // absence, which is the difference between "the report is not JSON" and
+      // "Metric '...' not available".
+      const verdict = evaluateRules(
+        {
+          version: '1.0.0',
+          description: '',
+          rules: {
+            ceilings: { 'eslint.errors': 0 },
+            floors: { 'coverage.unit.branches': 50 },
+          },
+        },
+        { coverage: reading.metrics, scripts: {}, measurementFailures: reading.failures }
+      )
+      expect(verdict.status).toBe('fail')
+      expect(verdict.failedRules[0].rule).toBe('coverage.unit.measurement')
+
+      // And with no coverage rule at all it does not gate -- the scoping rule
+      // from evaluateMeasurements. Still recorded, still rendered by
+      // describeUnmeasured; just not a verdict about a dimension nobody grades.
+      const ungated = evaluateRules(
+        { version: '1.0.0', description: '', rules: { ceilings: { 'eslint.errors': 0 } } },
+        { coverage: reading.metrics, scripts: {}, eslint: { errors: 0, warnings: 0 }, measurementFailures: reading.failures }
+      )
+      expect(ungated.status).toBe('pass')
+    })
+
+    it('reports valid JSON that is not an object as the wrong shape', () => {
+      vi.mocked(fs.existsSync).mockImplementation((p) =>
+        String(p).includes('coverage/coverage-summary.json')
+      )
+      vi.mocked(fs.readFileSync).mockReturnValue('[1, 2, 3]')
+
+      const reading = measureCoverage()
+
+      const evidence = reading.failures[0].evidence
+      if (evidence.via !== 'report') throw new Error('expected report evidence')
+      expect(evidence.attempts[0].outcome).toBe('wrong-shape')
+    })
+
+    // A missing report stays silent. `lambdaDir` defaults to `coverage-lambda`,
+    // which almost no project has, so failing on absence would fail everyone.
+    it('stays silent when no report exists at all', () => {
+      vi.mocked(fs.existsSync).mockReturnValue(false)
+
+      const reading = measureCoverage()
+
+      expect(reading.failures).toEqual([])
+      expect(reading.metrics.unit).toBeUndefined()
+      expect(reading.metrics.lambda).toBeUndefined()
+    })
+
+    // The healthy control: a normal report must be untouched by all of the above.
+    it('leaves a healthy report exactly as it was', () => {
+      mockUnitSummary({
+        total: {
+          statements: { total: 16, covered: 4, pct: 25 },
+          branches: { total: 10, covered: 4, pct: 40 },
+          functions: { total: 7, covered: 1, pct: 14.28 },
+          lines: { total: 14, covered: 3, pct: 21.42 },
+        },
+      })
+
+      const reading = measureCoverage()
+
+      expect(reading.failures).toEqual([])
+      expect(reading.metrics.unit).toEqual({
+        statements: 25,
+        branches: 40,
+        functions: 14.28,
+        lines: 21.42,
+      })
+    })
+
+    it('keeps the metrics key order the refactor harness compares byte-for-byte', () => {
+      mockUnitSummary({
+        total: {
+          statements: { total: 16, covered: 4, pct: 25 },
+          branches: { total: 10, covered: 4, pct: 40 },
+          functions: { total: 7, covered: 1, pct: 14.28 },
+          lines: { total: 14, covered: 3, pct: 21.42 },
+        },
+      })
+
+      // accept-refactor.mjs compares sections with raw JSON.stringify and does
+      // NOT sort keys, so `{unit, union}` and `{union, unit}` are a rejection
+      // with no numeric change at all.
+      expect(Object.keys(measureCoverage().metrics)).toEqual(['lambda', 'unit', 'union'])
     })
   })
 
@@ -1422,6 +1747,71 @@ describe('SonarQube Metrics', () => {
       // Should succeed because no task ID found
       expect(result.success).toBe(true)
     })
+  })
+})
+
+// ===========================================================================
+// Coverage report ordering
+// ===========================================================================
+//
+// extractAllMetrics built its result as ONE object literal, and JS evaluates
+// literal properties top-to-bottom -- so `coverage:` read the report before
+// `scripts:` ran the npm scripts that rewrite it. Reproduced end to end against
+// the synthetic subject: with a 10%-statements report planted and scriptsToRun
+// ['test:coverage'], the gate reported 10 while the file on disk afterwards said
+// 25.
+//
+// What the ordering does NOT establish is that a report no script the gate ran
+// rewrote describes the code being graded. A freshness rule for that was built
+// (report mtime vs. the newest source file) and removed -- inert without a
+// literal top-level `src/`, false-positive on mtime-preserving restores, branch
+// switches and clock skew -- so its tests are gone with it. Backlog #39.
+describe('coverage report ordering', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  // The cheap fast regression for the ordering itself. NOT the proof -- with fs
+  // mocked nothing actually writes coverage, so only the harness case can show
+  // the numbers moving. This pins the call order so a later reshuffle of the
+  // return literal fails here first.
+  it('runs the project scripts BEFORE reading the coverage report', async () => {
+    const { spawnSync, execSync } = await import('child_process')
+    const sequence: string[] = []
+
+    vi.mocked(fs.existsSync).mockImplementation((p) =>
+      String(p).includes('coverage/coverage-summary.json')
+    )
+    vi.mocked(fs.readFileSync).mockImplementation((p) => {
+      if (String(p).includes('coverage-summary.json')) sequence.push('read-coverage-report')
+      return JSON.stringify({
+        total: {
+          statements: { total: 10, covered: 5, pct: 50 },
+          branches: { total: 10, covered: 5, pct: 50 },
+          functions: { total: 10, covered: 5, pct: 50 },
+          lines: { total: 10, covered: 5, pct: 50 },
+        },
+      })
+    })
+    vi.mocked(spawnSync).mockImplementation(((cmd: string, args?: readonly string[]) => {
+      if (cmd === 'npm' && args?.[0] === 'run' && args?.[1] === 'test:coverage') {
+        sequence.push('run-test:coverage')
+      }
+      return { status: 0, stdout: '[]', stderr: '', pid: 1, signal: null, output: [] }
+    }) as unknown as typeof spawnSync)
+    vi.mocked(execSync).mockReturnValue('')
+
+    extractAllMetrics({
+      scriptsToRun: ['test:coverage'],
+      skipSonarQube: true,
+      skipCustomDimensions: true,
+    })
+
+    expect(sequence.indexOf('run-test:coverage')).toBeGreaterThanOrEqual(0)
+    expect(sequence.indexOf('read-coverage-report')).toBeGreaterThanOrEqual(0)
+    expect(sequence.indexOf('run-test:coverage')).toBeLessThan(
+      sequence.indexOf('read-coverage-report')
+    )
   })
 })
 

@@ -24,7 +24,12 @@ import {
   getTopSonarIssues,
   type SonarIssue,
 } from './metrics.js';
-import { loadRules, evaluateRules, isCacheValid } from './rules.js';
+import {
+  loadRules,
+  evaluateRules,
+  isCacheValid,
+  isMeasurementUnderRule,
+} from './rules.js';
 import {
   loadCache,
   saveCache,
@@ -250,6 +255,27 @@ async function runQualityGate(options: RunOptions = { skipSonarQube: false }): P
     );
 
     if (existingEntry.evaluation.status === 'pass') {
+      // This exit prints a verdict and exits 0 without looking at the metrics at
+      // all, so it depends entirely on the stored entry being a complete reading.
+      // `isCacheValid` refuses any entry carrying a measurement failure and the
+      // cache write below never produces one, which holds up the RECORDED half of
+      // that -- but be honest about the two ways the reading can still be stale
+      // for the tree in front of us, because both are reachable and neither is
+      // closed:
+      //
+      //   - `sonarqube` has no failure channel (see `evaluateMeasurements`), so a
+      //     reading that lost that dimension wholesale records an empty failure
+      //     list and is cached as complete. #23/#42.
+      //   - The cache key covers tracked content only. Coverage reports are
+      //     untracked by design, so a report that is corrupted AFTER a clean
+      //     entry is written is never re-read: the same tree is a hard FAIL when
+      //     measured and a silent PASS when the cache answers. #41. And for a
+      //     project whose code is not under `codePathspecs` the WIP hash is
+      //     sha256("") for every working-tree state, so the key never moves at
+      //     all. #40.
+      //
+      // Those are pre-existing and out of scope here. What must not happen is
+      // this comment claiming they are handled.
       log('\n✓ Quality gate PASSED (cached)');
       process.exit(0);
     } else {
@@ -361,22 +387,31 @@ async function runQualityGate(options: RunOptions = { skipSonarQube: false }): P
     skipSonarQube: options.skipSonarQube,
   });
 
-  // Log extracted metrics
+  // Log extracted metrics.
+  //
+  // 'unavailable' for a dimension the reading does not carry. A fresh reading
+  // carries all four -- a zero denominator is reported as 100, see
+  // TotalCoverageMetrics -- so this now renders a baseline deserialized from an
+  // older cache entry rather than a live gap. Printing a number for an absent
+  // dimension would contradict whatever the rules say about it below.
+  const pct = (value: number | undefined): string =>
+    value === undefined ? 'unavailable' : `${value.toFixed(1)}%`;
+
   if (metrics.coverage) {
     const { lambda, unit, union } = metrics.coverage;
     if (lambda) {
       log(
-        `  Lambda:  branches=${lambda.branches.toFixed(1)}%, statements=${lambda.statements.toFixed(1)}%`
+        `  Lambda:  branches=${pct(lambda.branches)}, statements=${pct(lambda.statements)}`
       );
     }
     if (unit) {
       log(
-        `  Unit:    branches=${unit.branches.toFixed(1)}%, statements=${unit.statements.toFixed(1)}%`
+        `  Unit:    branches=${pct(unit.branches)}, statements=${pct(unit.statements)}`
       );
     }
     if (union) {
       log(
-        `  Union:   branches=${union.branches.toFixed(1)}%, statements=${union.statements.toFixed(1)}%`
+        `  Union:   branches=${pct(union.branches)}, statements=${pct(union.statements)}`
       );
     }
   }
@@ -414,21 +449,70 @@ async function runQualityGate(options: RunOptions = { skipSonarQube: false }): P
   // fixed. Storing the FAILURE is no better, since the next run would report a
   // stale breakage. Not writing means the next run re-measures, which is the
   // only outcome that converges.
+  //
+  // EVERY failure, gated or not. Scoping this to gated failures (which the rule
+  // scoping made tempting, since an ungated failure cannot change this run's
+  // verdict) breaks the advisory below in a way that is worse than the cost it
+  // saves: a run with an ungated failure writes a cache entry, and the cached-pass
+  // path prints `✓ Quality gate PASSED (cached)` and exits 0 without ever looking
+  // at `metrics.measurementFailures` -- which the entry demonstrably carries.
+  // MEASURED on the synthetic subject with a stray corrupt `coverage-lambda/` and
+  // a coverage-only ruleset: run 1 printed the advisory, run 2 printed
+  // `✓ Quality gate PASSED (cached)` and nothing else. The advisory became a
+  // ONE-SHOT on the surface an adopter actually watches, and the same mechanism
+  // let a coverage-only project cache a pass while type-check was missing and
+  // eslint had crashed, after which the next run exits 0 having measured nothing
+  // at all -- and CI reads the exit code.
+  //
+  // The cost is that a project with a stray `coverage-lambda` directory
+  // re-measures every run. That is the honest trade, and the advisory below tells
+  // them how to make it stop.
   const measurementFailures = metrics.measurementFailures ?? [];
+
+  const ungated = measurementFailures.filter(
+    (f) => !isMeasurementUnderRule(rules, f.dimension)
+  );
+
+  // Printed on EVERY run, which is the point: nothing else reports these, and the
+  // run they appear in is never cached, so there is no run that skips them.
+  if (ungated.length > 0) {
+    log(
+      `\n${ungated.length} dimension(s) could not be measured, and no rule grades them:`
+    );
+    for (const failure of ungated) {
+      log(`  ${failure.dimension} (${failure.kind}): ${failure.message}`);
+    }
+    // The lambda remedy has to name a NONEXISTENT directory, not an empty value.
+    // `config.ts` resolves the variable as `process.env.X || 'coverage-lambda'`,
+    // so emptying it -- the natural reading of "turn it off" -- falls straight
+    // back to the default and the advisory repeats forever with no sign that the
+    // fix did nothing.
+    log(
+      '  Not failing the gate on these -- no rule reads them, directly or through a dimension ' +
+        'derived from them. This run is not cached either way, so this repeats every run until ' +
+        'the reading is fixed: add a floor, ceiling or monotonic rule on the dimension to make ' +
+        'it gating, or stop measuring it (for a stray coverage-lambda directory, point ' +
+        'QUALITY_COVERAGE_LAMBDA_DIR at a directory that does not exist -- setting it empty ' +
+        'falls back to the default).'
+    );
+  }
 
   // The same argument covers a pass whose monotonic rules never ran. It is a
   // narrower reading than a complete one -- some configured rules were not
   // applied -- so caching it would let a later run short-circuit to a PASS that
-  // no run ever fully earned, and `isCacheValid` returns true for any cached
-  // pass without re-checking. Recording nothing means the next run, which may
-  // well have a baseline by then, evaluates them for real.
+  // no run ever fully earned: `isCacheValid` accepts any cached pass whose metrics
+  // carry no measurement failure, and an unevaluated monotonic rule leaves no
+  // trace in the metrics for it to catch. Recording nothing means the next run,
+  // which may well have a baseline by then, evaluates them for real.
   //
   // NOT the same as failing the gate on it, which is a live question -- see the
   // note above `describeMissingBaseline` and the monotonic gap it links to.
   const monotonicSkipped =
     (rules.rules.monotonic?.length ?? 0) > 0 && baselineEntry === undefined;
 
-  if (measurementFailures.length > 0 || monotonicSkipped) {
+  const cachedThisRun = !(measurementFailures.length > 0 || monotonicSkipped);
+
+  if (!cachedThisRun) {
     const reasons = [
       ...measurementFailures.map((f) => `${f.dimension}: ${f.kind}`),
       ...(monotonicSkipped ? ['monotonic rules were not evaluated (no baseline)'] : []),
@@ -454,9 +538,14 @@ async function runQualityGate(options: RunOptions = { skipSonarQube: false }): P
     log(`\nPruned ${pruned} old cache entries`);
   }
 
-  // Save cache
+  // Save cache. The file is rewritten either way -- pruning alone changes it --
+  // but the message must not say "updated" after the run has just been told it is
+  // not being cached. That contradiction used to be an edge case; now that ANY
+  // measurement failure blocks the write, gated or not, it is the normal path for
+  // a project with a stray dimension, and the advisory above depends on the
+  // adopter believing the first message.
   saveCache(cache);
-  log('\nCache updated');
+  log(cachedThisRun ? '\nCache updated' : '\nCache file rewritten (no entry added)');
 
   // Report result
   if (result.status === 'pass') {
@@ -714,6 +803,22 @@ async function runSuggest(args: string[]): Promise<void> {
   // Compute current score
   const currentScore = computeFitness(metrics);
 
+  // `suggest` is the documented SGD gradient surface -- the one an agent drives
+  // off -- and it was the only surface that computed metrics and reported nothing
+  // about what it could not read. `score` printed this and every MCP suggest
+  // response carried it, so an agent asking for the ranked list got a quality
+  // space one dimension smaller than the project configured and was told nothing.
+  // The comment above the async call already stated the concern; this is the half
+  // that acts on it. Printed once here rather than per mode, because all four
+  // modes rank over the same metrics.
+  const unmeasured = describeUnmeasured(metrics);
+
+  if (unmeasured && !jsonFlag) {
+    log(`${unmeasured.length} dimension(s) could NOT be measured, so nothing below ranks them:`);
+    for (const u of unmeasured) log(`  ${u.dimension} (${u.kind})`);
+    log('');
+  }
+
   // Quick mode: dimension-level suggestions only (original behavior)
   if (quickMode) {
     const suggestions = suggestNextFixes(metrics, limit);
@@ -722,6 +827,7 @@ async function runSuggest(args: string[]): Promise<void> {
       console.log(JSON.stringify({
         mode: 'dimension',
         currentScore,
+        unmeasured,
         suggestions,
       }, null, 2));
       return;
@@ -813,6 +919,7 @@ async function runSuggest(args: string[]): Promise<void> {
       console.log(JSON.stringify({
         mode: 'unified-symbols',
         currentScore,
+        unmeasured,
         fixabilityEstimated: estimateFixability,
         addressFitness,
         ...formatSymbolIssuesForJson(symbolIssues),
@@ -864,6 +971,7 @@ async function runSuggest(args: string[]): Promise<void> {
     console.log(JSON.stringify({
       mode: granularity,
       currentScore,
+      unmeasured,
       ...formatTargetsForJson(targets),
     }, null, 2));
     return;

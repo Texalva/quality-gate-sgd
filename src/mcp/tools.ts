@@ -155,6 +155,12 @@ export async function handleRun(args: RunArguments): Promise<{
       status: result.status,
       fitnessScore: Math.round(fitness * 10) / 10,
       metrics: formatMetricsSummary(metrics),
+      // Alongside the verdict, because a measurement failure only becomes a
+      // failed RULE when some rule grades that dimension (see
+      // evaluateMeasurements). Without this key, an ungated failure would be
+      // invisible to an MCP client -- reported nowhere, on a response that looks
+      // complete.
+      unmeasured: describeUnmeasured(metrics),
       failedRules: result.failedRules.map(f => ({
         type: f.type,
         rule: f.rule,
@@ -401,10 +407,20 @@ The trajectory command shows detailed convergence analysis.`,
 function formatMetricsSummary(metrics: Metrics): Record<string, unknown> {
   const summary: Record<string, unknown> = {};
 
-  if (metrics.coverage?.unit) {
+  const unitCoverage = metrics.coverage?.unit;
+  if (unitCoverage) {
+    // Per dimension, because a dimension can still be absent -- not from a fresh
+    // reading, which reports a zero denominator as 100 (see
+    // TotalCoverageMetrics), but from a cache entry an older version wrote.
+    // Leaving the key out is the honest rendering: an MCP client should see the
+    // dimension missing, not a fabricated number it will go on to reason about.
     summary.coverage = {
-      branches: Math.round(metrics.coverage.unit.branches * 10) / 10,
-      statements: Math.round(metrics.coverage.unit.statements * 10) / 10,
+      ...(unitCoverage.branches === undefined
+        ? {}
+        : { branches: Math.round(unitCoverage.branches * 10) / 10 }),
+      ...(unitCoverage.statements === undefined
+        ? {}
+        : { statements: Math.round(unitCoverage.statements * 10) / 10 }),
     };
   }
 

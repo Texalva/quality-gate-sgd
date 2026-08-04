@@ -6,13 +6,12 @@
  * Unlike the metrics extraction (which aggregates to counts), this preserves
  * the file:line:column information so we can compute target-space gradients.
  */
-import { existsSync, readFileSync } from 'fs';
 import { spawnSync } from 'child_process';
-import path from 'path';
 import { getConfig, getSonarAuthToken } from '../config.js';
 import { mapLocationToSymbol } from '../symbols/mapper.js';
 import { eslintLintProvider } from '../providers/eslint.js';
 import { typescriptTypecheckProvider } from '../providers/typescript.js';
+import { createIstanbulCoverageProvider } from '../providers/coverage.js';
 import { DEFAULT_MEASUREMENT_LIMITS } from '../providers/result.js';
 /**
  * See the identical constant in ../metrics.ts. spawnSync's 1 MiB default
@@ -20,177 +19,60 @@ import { DEFAULT_MEASUREMENT_LIMITS } from '../providers/result.js';
  * then report zero issues instead of failing, so a noisy codebase looks clean.
  */
 const SUBPROCESS_MAX_BUFFER = 64 * 1024 * 1024;
-function shouldSkipCoverageFile(filePath) {
-    return (filePath.includes('node_modules') ||
-        filePath.includes('.test.') ||
-        filePath.includes('.spec.'));
-}
-function extractCoverageIssuesFromSummary(summaryPath, dimensionPrefix) {
-    if (!existsSync(summaryPath))
-        return [];
-    try {
-        const data = JSON.parse(readFileSync(summaryPath, 'utf-8'));
-        const issues = [];
-        for (const [filePath, entry] of Object.entries(data)) {
-            if (filePath === 'total' || !entry)
-                continue;
-            if (shouldSkipCoverageFile(filePath))
-                continue;
-            const branchTotal = entry.branches.total ?? 0;
-            const branchCovered = entry.branches.covered ?? 0;
-            const branchMissing = Math.max(branchTotal - branchCovered, 0);
-            if (branchTotal > 0 && branchMissing > 0) {
-                const delta = branchMissing / branchTotal;
-                issues.push({
-                    file: filePath,
-                    source: 'coverage',
-                    dimension: `${dimensionPrefix}.branches`,
-                    code: 'uncovered-branches',
-                    impact: {
-                        dimension: `${dimensionPrefix}.branches`,
-                        delta,
-                        direction: 'higher-better',
-                    },
-                    message: `Low branch coverage (${entry.branches.pct.toFixed(1)}%)`,
-                    context: `${branchMissing}/${branchTotal} branches uncovered`,
-                });
-            }
-            const fnTotal = entry.functions.total ?? 0;
-            const fnCovered = entry.functions.covered ?? 0;
-            const fnMissing = Math.max(fnTotal - fnCovered, 0);
-            if (fnTotal > 0 && fnMissing > 0) {
-                const delta = fnMissing / fnTotal;
-                issues.push({
-                    file: filePath,
-                    source: 'coverage',
-                    dimension: `${dimensionPrefix}.functions`,
-                    code: 'uncovered-functions',
-                    impact: {
-                        dimension: `${dimensionPrefix}.functions`,
-                        delta,
-                        direction: 'higher-better',
-                    },
-                    message: `Low function coverage (${entry.functions.pct.toFixed(1)}%)`,
-                    context: `${fnMissing}/${fnTotal} functions uncovered`,
-                });
-            }
-        }
-        return issues;
-    }
-    catch (error) {
-        console.error(`Warning: Could not parse ${summaryPath}: ${error}`);
-        return [];
-    }
-}
+// =============================================================================
+// Coverage Issue Extraction
+// =============================================================================
 /**
- * Extract uncovered branches and lines from coverage-final.json.
+ * Extract uncovered branches and functions with location information.
  *
- * Each uncovered branch becomes a LocatedIssue with estimated coverage impact.
+ * Delegates to the coverage provider; the parsing that used to live here now
+ * lives in src/providers/coverage.ts, unchanged -- including the summary
+ * fallback, which fires on `issues.length === 0` rather than on the detail
+ * report's absence, so a detail report that parsed fine and found nothing
+ * uncovered still falls through to the coarser file-level findings.
+ *
+ * `coverageDir` keeps its exact previous meaning: it replaces ONLY the unit
+ * directory, for both the detail report and the summary, and the lambda
+ * directory still comes from config.
  */
 export function extractCoverageIssues(coverageDir) {
     const config = getConfig();
-    const issues = [];
-    let foundCoverageFinal = false;
-    // Try unit coverage first, then lambda
-    const coveragePaths = [
-        path.join(config.projectRoot, coverageDir ?? config.coverage.unitDir, 'coverage-final.json'),
-        path.join(config.projectRoot, config.coverage.lambdaDir, 'coverage-final.json'),
-    ];
-    for (const coveragePath of coveragePaths) {
-        if (!existsSync(coveragePath))
+    const reading = createIstanbulCoverageProvider({
+        unitDir: coverageDir ?? config.coverage.unitDir,
+        lambdaDir: config.coverage.lambdaDir,
+        summaryFile: config.coverage.summaryFile,
+    }).measure({
+        projectRoot: config.projectRoot,
+        timeoutMs: DEFAULT_MEASUREMENT_LIMITS.typecheckTimeoutMs,
+        maxBufferBytes: DEFAULT_MEASUREMENT_LIMITS.maxBufferBytes,
+    });
+    if (!reading.ok) {
+        console.error(`Warning: Could not parse coverage reports: ${reading.error.message}`);
+        return [];
+    }
+    // The warning belongs HERE, not in the provider: this is the layer that
+    // discards the failure, and the rule is to handle an error or log it, never
+    // both. `absent` is not reported -- a project with no coverage-lambda
+    // directory, or none at all, is the ordinary case rather than a fault.
+    //
+    // `shape: 'unexpected'` is reported alongside a failed read because from this
+    // function's point of view they cost the same thing: a report that parsed but
+    // is not the shape findings come from yields none, exactly as an unparseable
+    // one does.
+    for (const read of reading.value.reads) {
+        const unreadable = read.attempt.outcome !== 'read' && read.attempt.outcome !== 'absent';
+        if (!unreadable && read.shape === 'expected')
             continue;
-        foundCoverageFinal = true;
-        try {
-            const data = JSON.parse(readFileSync(coveragePath, 'utf-8'));
-            for (const [filePath, fileCoverage] of Object.entries(data)) {
-                // Skip node_modules and test files
-                if (shouldSkipCoverageFile(filePath)) {
-                    continue;
-                }
-                // Count total branches for this file to estimate per-branch impact
-                const totalBranches = Object.values(fileCoverage.branchMap).reduce((sum, branch) => sum + branch.locations.length, 0);
-                // Extract uncovered branches
-                for (const [branchId, branch] of Object.entries(fileCoverage.branchMap)) {
-                    const hitCounts = fileCoverage.b[branchId] || [];
-                    for (let i = 0; i < branch.locations.length; i++) {
-                        const loc = branch.locations[i];
-                        const hits = hitCounts[i] ?? 0;
-                        if (hits === 0) {
-                            // Estimate impact: each branch is roughly equal fraction of file's branch coverage
-                            // If file has 10 branches and 5 uncovered, covering 1 branch adds ~10% to file's coverage
-                            const estimatedImpact = totalBranches > 0 ? 100 / totalBranches : 1;
-                            issues.push({
-                                file: filePath,
-                                line: loc.start.line,
-                                column: loc.start.column,
-                                endLine: loc.end.line,
-                                endColumn: loc.end.column,
-                                source: 'coverage',
-                                dimension: 'coverage.unit.branches',
-                                code: `branch-${branch.type}`,
-                                impact: {
-                                    dimension: 'coverage.unit.branches',
-                                    delta: estimatedImpact / 100, // Fractional coverage gain
-                                    direction: 'higher-better',
-                                },
-                                message: `Uncovered ${branch.type} branch`,
-                                context: `Branch ${branchId}[${i}] at line ${loc.start.line}`,
-                            });
-                        }
-                    }
-                }
-                // Extract uncovered functions
-                for (const [fnId, fn] of Object.entries(fileCoverage.fnMap)) {
-                    const hits = fileCoverage.f[fnId] ?? 0;
-                    if (hits === 0) {
-                        issues.push({
-                            file: filePath,
-                            line: fn.loc.start.line,
-                            column: fn.loc.start.column,
-                            endLine: fn.loc.end.line,
-                            endColumn: fn.loc.end.column,
-                            symbol: fn.name || `anonymous_${fnId}`,
-                            source: 'coverage',
-                            dimension: 'coverage.unit.functions',
-                            code: 'uncovered-function',
-                            impact: {
-                                dimension: 'coverage.unit.functions',
-                                delta: 0.5, // Rough estimate: covering a function helps
-                                direction: 'higher-better',
-                            },
-                            message: `Uncovered function: ${fn.name || 'anonymous'}`,
-                            context: `Function at line ${fn.loc.start.line}`,
-                        });
-                    }
-                }
-            }
-        }
-        catch (error) {
-            // Silently skip if coverage file is malformed
-            console.error(`Warning: Could not parse ${coveragePath}: ${error}`);
-        }
+        const reason = unreadable ? read.attempt.outcome : 'not a coverage report';
+        console.error(`Warning: Could not parse ${read.attempt.path}: ${reason}`);
     }
-    // Fallback: use coverage-summary.json when coverage-final.json is missing
-    if (issues.length === 0) {
-        const summaryPaths = [
-            {
-                path: path.join(config.projectRoot, coverageDir ?? config.coverage.unitDir, config.coverage.summaryFile),
-                prefix: 'coverage.unit',
-            },
-            {
-                path: path.join(config.projectRoot, config.coverage.lambdaDir, config.coverage.summaryFile),
-                prefix: 'coverage.lambda',
-            },
-        ];
-        for (const summary of summaryPaths) {
-            const summaryIssues = extractCoverageIssuesFromSummary(summary.path, summary.prefix);
-            if (summaryIssues.length > 0 && foundCoverageFinal) {
-                console.error(`Warning: Using ${config.coverage.summaryFile} fallback for ${summary.prefix} coverage`);
-            }
-            issues.push(...summaryIssues);
-        }
-    }
-    return issues;
+    // Still [] when a report was unreadable, and still wrong for the same reason
+    // extractTypescriptIssues is: fix advice that says "nothing to fix" when it
+    // should say "could not look". The GATE VERDICT is safe -- extractAllMetrics
+    // carries the coverage MeasurementFailure through to evaluateRules -- so what
+    // survives here is degraded advice, not a vacuous pass. Closing it means
+    // giving ExtractedIssues a failure channel of its own.
+    return [...reading.value.issues];
 }
 // =============================================================================
 // TypeScript Issue Extraction

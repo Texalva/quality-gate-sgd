@@ -25,7 +25,7 @@ export { getDefaultRules, isEmbeddedDefaults, COVERAGE_ONLY_DEFAULTS, FULL_DEFAU
 // =============================================================================
 export { 
 // Coverage
-extractAllCoverageMetrics, extractCoverageMetrics, 
+measureCoverage, extractAllCoverageMetrics, extractCoverageMetrics, 
 // SonarQube
 extractSonarqubeMetrics, isSonarqubeAvailable, runSonarqubeScan, getTopSonarIssues, 
 // TypeScript & ESLint

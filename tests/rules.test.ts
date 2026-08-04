@@ -239,6 +239,57 @@ describe('evaluateRules', () => {
   })
 
   describe('ceiling evaluation', () => {
+    // `extractAllCustomMetrics` stores custom readings FLAT --
+    // `metrics.custom['bundle.size']`, from `config.path.replace('custom.','')` --
+    // and `validateCustomDimensions` puts no constraint on segment count. The
+    // private path-walking accessor that used to live in rules.ts resolved
+    // `custom.bundle.size` to undefined and `evaluateCeilings` skipped it in
+    // silence, so a measured 5,000,000 passed a ceiling of 500,000 and the pass
+    // was cached because the reading was complete. Reproduced through the CLI
+    // before the fix; these two pin the flat lookup in both directions.
+    it('enforces a ceiling on a dotted custom dimension path', () => {
+      const rules: QualityRules = {
+        version: '1.0.0',
+        rules: {
+          ceilings: { 'custom.bundle.size': 500_000 },
+        },
+      }
+
+      const metrics: Metrics = {
+        coverage: {},
+        typescript: { errors: 0, warnings: 0, rootCauses: 0 },
+        eslint: { errors: 0, warnings: 0, rootCauses: 0 },
+        scripts: {},
+        sloc: 1000,
+        custom: { 'bundle.size': 5_000_000 },
+      }
+
+      const result = evaluateRules(rules, metrics)
+
+      expect(result.status).toBe('fail')
+      expect(result.failedRules.map((f) => f.rule)).toContain('custom.bundle.size')
+    })
+
+    it('passes a dotted custom dimension that is under its ceiling', () => {
+      const rules: QualityRules = {
+        version: '1.0.0',
+        rules: {
+          ceilings: { 'custom.bundle.size': 500_000 },
+        },
+      }
+
+      const metrics: Metrics = {
+        coverage: {},
+        typescript: { errors: 0, warnings: 0, rootCauses: 0 },
+        eslint: { errors: 0, warnings: 0, rootCauses: 0 },
+        scripts: {},
+        sloc: 1000,
+        custom: { 'bundle.size': 400_000 },
+      }
+
+      expect(evaluateRules(rules, metrics).status).toBe('pass')
+    })
+
     it('passes when metric is below ceiling', () => {
       const rules: QualityRules = {
         version: '1.0.0',
@@ -318,6 +369,13 @@ describe('evaluateRules', () => {
   // typescript.errors, eslint.errors, sonarqube.* and every custom.* dimension
   // -- none of which have floors -- so before this, a tool that crashed made
   // its own ceiling disappear.
+  //
+  // Every case here now carries a RULE on the dimension it breaks, because that
+  // is the condition for a failed measurement to become a failed rule. The
+  // ungated direction is covered by its own block below ('measurement failures
+  // nothing grades'), which is the part that had to be added: an unconditional
+  // failure hard-failed projects over `coverage.lambda`, a suite the provider
+  // always attempts and almost no project has.
   describe('measurement failures', () => {
     const failure = (dimension: 'eslint' | 'typescript', kind: string) => ({
       kind: kind as MeasurementFailure['kind'],
@@ -334,7 +392,10 @@ describe('evaluateRules', () => {
     })
 
     it('fails the gate when a measurement could not be taken', () => {
-      const rules: QualityRules = { version: '1.0.0', rules: {} }
+      const rules: QualityRules = {
+        version: '1.0.0',
+        rules: { ceilings: { 'eslint.errors': 0 } },
+      }
       const metrics: Metrics = {
         scripts: {},
         measurementFailures: [failure('eslint', 'crashed')],
@@ -366,29 +427,45 @@ describe('evaluateRules', () => {
       expect(result.failedRules.some((f) => f.type === 'measurement')).toBe(true)
     })
 
-    // Not conditional on a matching rule: a tool asked to run and unable to is
-    // a broken build whether or not anyone wrote a threshold for it. Making it
-    // conditional would leave the original hole open for everyone who had not.
-    it('fails with no rules configured at all', () => {
-      const result = evaluateRules({ version: '1.0.0', rules: {} }, {
-        scripts: {},
-        measurementFailures: [failure('typescript', 'timed-out')],
-      })
+    // A monotonic rule is enough on its own. It is the surface a project most
+    // easily forgets it has: both embedded defaults ratchet typescript.errors
+    // down without giving it a floor.
+    it('fails when a monotonic rule is the only thing naming the dimension', () => {
+      const result = evaluateRules(
+        {
+          version: '1.0.0',
+          rules: { monotonic: [{ direction: 'down', metrics: ['typescript.errors'] }] },
+        },
+        {
+          scripts: {},
+          measurementFailures: [failure('typescript', 'timed-out')],
+        }
+      )
 
       expect(result.status).toBe('fail')
+      expect(result.failedRules[0].rule).toBe('typescript.measurement')
     })
 
     it('reports every failure, not just the first', () => {
-      const result = evaluateRules({ version: '1.0.0', rules: {} }, {
-        scripts: {},
-        measurementFailures: [failure('eslint', 'crashed'), failure('typescript', 'tool-missing')],
-      })
+      const result = evaluateRules(
+        {
+          version: '1.0.0',
+          rules: { ceilings: { 'eslint.errors': 0, 'typescript.errors': 0 } },
+        },
+        {
+          scripts: {},
+          measurementFailures: [failure('eslint', 'crashed'), failure('typescript', 'tool-missing')],
+        }
+      )
 
       expect(result.failedRules.filter((f) => f.type === 'measurement')).toHaveLength(2)
     })
 
     it('carries the evidence into the message so the cause is diagnosable', () => {
-      const result = evaluateRules({ version: '1.0.0', rules: {} }, {
+      const result = evaluateRules({
+        version: '1.0.0',
+        rules: { ceilings: { 'typescript.errors': 0 } },
+      }, {
         scripts: {},
         measurementFailures: [failure('typescript', 'timed-out')],
       })
@@ -405,6 +482,399 @@ describe('evaluateRules', () => {
       })
 
       expect(result.status).toBe('pass')
+    })
+
+    // A provider that reads an artifact has no exit status, so its evidence is a
+    // different shape. The cases above are now ALSO the regression test for the
+    // process variant staying the fallback: their evidence literals carry no
+    // `via` tag, and an exhaustive `switch (e.via)` would render them as nothing
+    // -- dropping exactly the SIGKILL and 1234ms those cases assert on.
+    it('renders report evidence for a measurement that read a file', () => {
+      const result = evaluateRules({
+        version: '1.0.0',
+        rules: { floors: { 'coverage.unit.branches': 50 } },
+      }, {
+        scripts: {},
+        measurementFailures: [
+          {
+            kind: 'measured-nothing' as MeasurementFailure['kind'],
+            dimension: 'coverage.unit',
+            message: 'the report measured nothing',
+            evidence: {
+              via: 'report',
+              command: 'read /p/coverage/coverage-summary.json',
+              elapsedMs: 7,
+              attempts: [
+                {
+                  path: '/p/coverage/coverage-summary.json',
+                  existed: true,
+                  bytesRead: 1757,
+                  modifiedMs: 1_700_000_000_000,
+                  outcome: 'read',
+                },
+              ],
+            },
+          },
+        ],
+      })
+
+      expect(result.status).toBe('fail')
+      expect(result.failedRules[0].rule).toBe('coverage.unit.measurement')
+
+      const message = result.failedRules[0].message
+      expect(message).toContain('measured-nothing')
+      expect(message).toContain('/p/coverage/coverage-summary.json')
+      expect(message).toContain('1757B')
+      expect(message).toContain('mtime=2023-11-14T22:13:20.000Z')
+      expect(message).toContain('after 7ms')
+      // No fabricated process fields.
+      expect(message).not.toContain('exit=')
+      expect(message).not.toContain('stdout')
+    })
+
+    // The bare `coverage` dimension, gated by a rule one level DOWN from it --
+    // the reverse of the prefix direction the cases above exercise.
+    it('omits byte count and mtime for a report it never read', () => {
+      const result = evaluateRules({
+        version: '1.0.0',
+        rules: { floors: { 'coverage.unit.branches': 50 } },
+      }, {
+        scripts: {},
+        measurementFailures: [
+          {
+            kind: 'report-missing' as MeasurementFailure['kind'],
+            dimension: 'coverage',
+            message: 'no report',
+            evidence: {
+              via: 'report',
+              command: 'read /p/coverage/coverage-summary.json',
+              elapsedMs: 1,
+              attempts: [
+                {
+                  path: '/p/coverage/coverage-summary.json',
+                  existed: false,
+                  bytesRead: null,
+                  modifiedMs: null,
+                  outcome: 'absent',
+                },
+              ],
+            },
+          },
+        ],
+      })
+
+      const message = result.failedRules[0].message
+      expect(message).toContain('absent')
+      expect(message).not.toContain('B,')
+      expect(message).not.toContain('mtime=')
+    })
+  })
+
+  // =========================================================================
+  // Measurement failures nothing grades
+  // =========================================================================
+  //
+  // The three defects that made unconditional evaluation wrong, each reduced to
+  // the rules and the failure that produce it:
+  //
+  //   (i)   a two-suite project whose scripts rewrite only the unit report
+  //         hard-failed on `coverage.lambda`. `lambdaDir` defaults to
+  //         `coverage-lambda` and is populated unconditionally, so BOTH suites
+  //         always reach the reader.
+  //   (ii)  a project gating only typescript.errors and eslint.errors, with a
+  //         stray gitignored coverage/ directory, failed on coverage it never
+  //         asked to have measured.
+  //   (iii) a declarations-only package writes a legitimately blank summary and
+  //         was refused with no opt-out.
+  describe('measurement failures nothing grades', () => {
+    const coverageFailure = (dimension: string) => ({
+      kind: 'measured-nothing' as MeasurementFailure['kind'],
+      dimension: dimension as MeasurementFailure['dimension'],
+      message: `${dimension} measured nothing`,
+      evidence: {
+        via: 'report' as const,
+        command: `read ${dimension}`,
+        elapsedMs: 3,
+        attempts: [
+          {
+            path: `/p/${dimension}/coverage-summary.json`,
+            existed: true,
+            bytesRead: 120,
+            modifiedMs: 1_700_000_000_000,
+            outcome: 'read' as const,
+          },
+        ],
+      },
+    })
+
+    // (i). The unit floors are configured and satisfied; the lambda suite is
+    // measured because the provider always attempts it, not because anyone asked.
+    it('passes a project whose lambda suite nothing gates', () => {
+      const result = evaluateRules(
+        {
+          version: '1.0.0',
+          rules: { floors: { 'coverage.unit.branches': 50, 'coverage.unit.statements': 50 } },
+        },
+        {
+          coverage: { unit: { branches: 80, statements: 80, functions: 80, lines: 80 } },
+          scripts: {},
+          measurementFailures: [coverageFailure('coverage.lambda')],
+        }
+      )
+
+      expect(result.status).toBe('pass')
+      expect(result.failedRules).toEqual([])
+    })
+
+    // (ii) and (iii). No coverage rule anywhere, so a coverage report that
+    // measured nothing is a fact about a dimension this project does not grade.
+    it('passes an eslint-only project with an unreadable coverage report', () => {
+      const result = evaluateRules(
+        {
+          version: '1.0.0',
+          rules: { ceilings: { 'typescript.errors': 0, 'eslint.errors': 0 } },
+        },
+        {
+          typescript: { errors: 0, warnings: 0 },
+          eslint: { errors: 0, warnings: 0 },
+          scripts: {},
+          measurementFailures: [coverageFailure('coverage.unit')],
+        }
+      )
+
+      expect(result.status).toBe('pass')
+    })
+
+    // And the same failure DOES gate the moment a rule reads the dimension. This
+    // is the pair that makes the case above evidence of scoping rather than of a
+    // check that stopped working.
+    it('fails the same project once a coverage floor is configured', () => {
+      const result = evaluateRules(
+        {
+          version: '1.0.0',
+          rules: {
+            ceilings: { 'eslint.errors': 0 },
+            floors: { 'coverage.unit.branches': 50 },
+          },
+        },
+        {
+          eslint: { errors: 0, warnings: 0 },
+          scripts: {},
+          measurementFailures: [coverageFailure('coverage.unit')],
+        }
+      )
+
+      expect(result.status).toBe('fail')
+      expect(result.failedRules.some((f) => f.rule === 'coverage.unit.measurement')).toBe(true)
+    })
+
+    // A rule on the OTHER suite is not a rule on this one.
+    it('does not let a unit floor gate a lambda failure', () => {
+      const result = evaluateRules(
+        { version: '1.0.0', rules: { floors: { 'coverage.unit.branches': 0 } } },
+        {
+          coverage: { unit: { branches: 1, statements: 1, functions: 1, lines: 1 } },
+          scripts: {},
+          measurementFailures: [coverageFailure('coverage.lambda')],
+        }
+      )
+
+      expect(result.status).toBe('pass')
+    })
+
+    // Matched on segment boundaries, so a rule cannot gate a dimension it merely
+    // shares a prefix of its name with.
+    it('does not match a dimension that is only a string prefix of a rule', () => {
+      const result = evaluateRules(
+        { version: '1.0.0', rules: { ceilings: { 'customs.dutyCount': 0 } } },
+        {
+          scripts: {},
+          measurementFailures: [
+            {
+              ...coverageFailure('coverage.unit'),
+              dimension: 'custom' as MeasurementFailure['dimension'],
+            },
+          ],
+        }
+      )
+
+      expect(result.status).toBe('pass')
+    })
+
+    // The reported-but-not-gating half of the contract. Detection is
+    // unconditional -- describeUnmeasured and the fix advice both read this list
+    // -- and only the VERDICT is scoped.
+    it('leaves the failure in metrics for the surfaces that report it', () => {
+      const metrics: Metrics = {
+        scripts: {},
+        measurementFailures: [coverageFailure('coverage.lambda')],
+      }
+
+      expect(evaluateRules({ version: '1.0.0', rules: {} }, metrics).status).toBe('pass')
+      expect(metrics.measurementFailures).toHaveLength(1)
+    })
+  })
+
+  // =========================================================================
+  // Derived dimensions
+  // =========================================================================
+  //
+  // `coverage.union.*` is COMPUTED from the unit and lambda summaries by
+  // mergeCoverageReports, and the two prefixes are one character apart, so name
+  // matching alone treated them as unrelated. REPRODUCED: a project with a
+  // `coverage.union.statements` floor had every unit/lambda measurement failure
+  // demoted to an advisory while the union number DERIVED from the failed
+  // measurement was graded -- a backdated unit report graded at 95 against a
+  // floor of 80, exit 0, and a truncated lambda summary dropped from the merge
+  // with the union summed from the unit suite alone, exit 0.
+  //
+  // Both directions are asserted for every edge, because either alone is
+  // satisfiable by the wrong implementation: a matcher that gated everything
+  // would pass the upstream half, and one that gated nothing would pass the
+  // unrelated half.
+  describe('measurement failures on a dimension something is derived from', () => {
+    const coverageFailure = (dimension: string) => ({
+      kind: 'unparseable-output' as MeasurementFailure['kind'],
+      dimension: dimension as MeasurementFailure['dimension'],
+      message: `${dimension} could not be read`,
+      evidence: {
+        via: 'report' as const,
+        command: `read ${dimension}`,
+        elapsedMs: 3,
+        attempts: [
+          {
+            path: `/p/${dimension}/coverage-summary.json`,
+            existed: true,
+            bytesRead: 120,
+            modifiedMs: 1_700_000_000_000,
+            outcome: 'read' as const,
+          },
+        ],
+      },
+    })
+
+    // The union floor is satisfied by the number the merge produced. That number
+    // is the one under suspicion: it was summed from a report that failed to
+    // read, so grading it is grading arithmetic over a measurement that is not
+    // there.
+    const unionFloorOnly = {
+      version: '1.0.0',
+      rules: { floors: { 'coverage.union.statements': 80 } },
+    }
+    const unionCoverage = {
+      coverage: { union: { branches: 95, statements: 95, functions: 95, lines: 95 } },
+      scripts: {},
+    }
+
+    it('gates a unit failure through a union floor', () => {
+      const result = evaluateRules(unionFloorOnly, {
+        ...unionCoverage,
+        measurementFailures: [coverageFailure('coverage.unit')],
+      })
+
+      expect(result.status).toBe('fail')
+      expect(result.failedRules.some((f) => f.rule === 'coverage.unit.measurement')).toBe(true)
+    })
+
+    it('gates a lambda failure through a union floor', () => {
+      const result = evaluateRules(unionFloorOnly, {
+        ...unionCoverage,
+        measurementFailures: [coverageFailure('coverage.lambda')],
+      })
+
+      expect(result.status).toBe('fail')
+      expect(result.failedRules.some((f) => f.rule === 'coverage.lambda.measurement')).toBe(true)
+    })
+
+    // A monotonic rule on the union is the same edge through a different surface,
+    // and it is the surface a project is likeliest to have without noticing.
+    it('gates through a union monotonic rule as well as a floor', () => {
+      const result = evaluateRules(
+        {
+          version: '1.0.0',
+          rules: { monotonic: [{ direction: 'up', metrics: ['coverage.union.branches'] }] },
+        },
+        { ...unionCoverage, measurementFailures: [coverageFailure('coverage.unit')] }
+      )
+
+      expect(result.status).toBe('fail')
+      expect(result.failedRules.some((f) => f.rule === 'coverage.unit.measurement')).toBe(true)
+    })
+
+    // The OTHER direction of the same edge. Derivation is one-way: `unit` and
+    // `lambda` come from each report's own `total`, which is validated
+    // independently, so a union that could not be summed says nothing about them.
+    // This is a real failure the provider emits (an unmergeable file entry is
+    // reported on `coverage.union`), not a hypothetical.
+    it('does not gate a union failure through a unit floor', () => {
+      const result = evaluateRules(
+        { version: '1.0.0', rules: { floors: { 'coverage.unit.statements': 80 } } },
+        {
+          coverage: { unit: { branches: 95, statements: 95, functions: 95, lines: 95 } },
+          scripts: {},
+          measurementFailures: [coverageFailure('coverage.union')],
+        }
+      )
+
+      expect(result.status).toBe('pass')
+    })
+
+    // And the edge does not leak sideways: a union rule must not gate a dimension
+    // the union is not computed from.
+    it('does not gate an unrelated dimension through a union floor', () => {
+      const result = evaluateRules(unionFloorOnly, {
+        ...unionCoverage,
+        measurementFailures: [
+          {
+            ...coverageFailure('coverage.unit'),
+            dimension: 'eslint' as MeasurementFailure['dimension'],
+          },
+        ],
+      })
+
+      expect(result.status).toBe('pass')
+    })
+
+    // `typescript.rootCauses` is derived from the same tsc run as
+    // `typescript.errors`, which is why it needs no edge in DERIVED_FROM: the
+    // failure's dimension is the provider, and subtree matching already reaches
+    // any rule under it. Pinned so a future narrowing of the matcher cannot
+    // silently drop it.
+    it('gates a typescript failure through a rootCauses ceiling', () => {
+      const result = evaluateRules(
+        { version: '1.0.0', rules: { ceilings: { 'typescript.rootCauses': 0 } } },
+        {
+          scripts: {},
+          measurementFailures: [
+            {
+              ...coverageFailure('coverage.unit'),
+              dimension: 'typescript' as MeasurementFailure['dimension'],
+            },
+          ],
+        }
+      )
+
+      expect(result.status).toBe('fail')
+      expect(result.failedRules.some((f) => f.rule === 'typescript.measurement')).toBe(true)
+    })
+
+    // Segment boundaries still hold for the derived path, so a project that
+    // invents `coverage.unionised.*` does not inherit the union's upstreams.
+    //
+    // Asserted on the failed RULES rather than on the verdict: a floor on a
+    // dimension no reading carries fails on its own (`Metric '...' not
+    // available`), so a `pass` here would be unreachable and this test would be
+    // asserting the wrong thing.
+    it('does not treat a longer name sharing the union prefix as derived', () => {
+      const result = evaluateRules(
+        { version: '1.0.0', rules: { floors: { 'coverage.unionised.statements': 80 } } },
+        {
+          scripts: {},
+          measurementFailures: [coverageFailure('coverage.lambda')],
+        }
+      )
+
+      expect(result.failedRules.map((f) => f.type)).toEqual(['floor'])
     })
   })
 
@@ -882,5 +1352,61 @@ describe('isCacheValid', () => {
 
     // Should return true - no floor metrics to check for missing values
     expect(isCacheValid(entry, rules)).toBe(true)
+  })
+
+  // An entry carrying a measurement failure is an incomplete reading, and this
+  // version never writes one -- `cli.ts` declines to cache any run with a
+  // measurement failure, gated or not. The state is still reachable: schema
+  // version 3 also covers an intermediate revision that suppressed the cache only
+  // for GATED failures, so a version-3 PASS on disk can carry an ungated one.
+  //
+  // Serving it is the vacuous pass with the report deleted: the cached-pass path
+  // prints "✓ Quality gate PASSED (cached)" and exits 0 without reading
+  // `metrics.measurementFailures`, so the advisory that appeared on run 1 appears
+  // nowhere afterwards.
+  //
+  // BOTH verdicts, because the pass branch returns early -- a check placed after
+  // it would leave exactly the case that matters uncovered.
+  it('refuses an entry that recorded a measurement failure', () => {
+    const rules: QualityRules = {
+      version: '1.0.0',
+      rules: { ceilings: { 'eslint.errors': 0 } },
+    }
+
+    const withFailure = (status: 'pass' | 'fail'): CacheEntry => ({
+      timestamp: Date.now(),
+      rulesHash: computeRulesHash(rules),
+      rulesVersion: '1.0.0',
+      metrics: {
+        eslint: { errors: 0, warnings: 0, rootCauses: 0 },
+        scripts: {},
+        sloc: 1000,
+        measurementFailures: [
+          {
+            kind: 'unparseable-output' as MeasurementFailure['kind'],
+            dimension: 'coverage.lambda' as MeasurementFailure['dimension'],
+            message: 'coverage-lambda/coverage-summary.json is not JSON',
+            evidence: {
+              via: 'report' as const,
+              command: 'read coverage-lambda/coverage-summary.json',
+              elapsedMs: 2,
+              attempts: [
+                {
+                  path: '/p/coverage-lambda/coverage-summary.json',
+                  existed: true,
+                  bytesRead: 61,
+                  modifiedMs: 1_700_000_000_000,
+                  outcome: 'read' as const,
+                },
+              ],
+            },
+          },
+        ],
+      },
+      evaluation: { status, failedRules: [] },
+    })
+
+    expect(isCacheValid(withFailure('pass'), rules)).toBe(false)
+    expect(isCacheValid(withFailure('fail'), rules)).toBe(false)
   })
 })

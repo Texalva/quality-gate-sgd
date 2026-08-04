@@ -9,13 +9,14 @@ import { execSync } from 'child_process';
 import { computeRulesHash } from './rules.js';
 import { getConfig } from './config.js';
 /**
- * 2 since measurement failures started failing the gate. Every version-1 entry
- * was scored under the old semantics, where a crashed tool became `{errors: 0}`,
- * so a stored PASS from then may be a vacuous one. `loadCache` discards a
+ * 3 since zero-denominator dimensions changed value and only rule-graded
+ * measurement failures fail. Either one moves the definition of a pass, and
+ * `cli.ts` exits 0 on a cached pass without measuring anything, so a version-2
+ * entry can assert a verdict this version would not reach. `loadCache` discards a
  * mismatched schema, which is the point: the fix must not be undone by a cache
- * written before it.
+ * written before it. Full reasoning on QualityGateCache in types.ts.
  */
-const CURRENT_SCHEMA_VERSION = 2;
+const CURRENT_SCHEMA_VERSION = 3;
 /**
  * Buffer ceiling for the git reads whose output scales with the repository.
  *
@@ -315,7 +316,7 @@ export function findBaselineEntry(cache, _rules, isWIP = false) {
     if (isWIP) {
         // For WIP: baseline is HEAD commit (last committed state)
         const headCommit = getCurrentCommitHash();
-        return cache.entries[headCommit];
+        return usableBaseline(cache.entries[headCommit]);
     }
     // For committed code: baseline is the parent of HEAD
     const baseline = resolveBaselineCommit();
@@ -338,7 +339,33 @@ export function findBaselineEntry(cache, _rules, isWIP = false) {
     }
     // Note: We still use old entries even if rules changed
     // The evaluation will be re-done, but we can compare metrics
-    return entry;
+    return usableBaseline(entry);
+}
+/**
+ * A baseline whose own reading was incomplete is not a baseline.
+ *
+ * `isCacheValid` already refuses such an entry when it would be served as a
+ * verdict, but this function bypassed that check entirely and monotonic
+ * evaluation is where it hurts: `evaluateMonotonic` skips a comparison whose
+ * baseline value is `undefined`, so a stored failure for the ratcheted dimension
+ * silently disables the ratchet -- and because a baseline object WAS returned,
+ * `cli.ts` does not count the rule as unevaluated and caches the pass as fully
+ * earned. Floors fail loudly on a missing metric; monotonic rules do not, which
+ * is what makes this the quiet direction.
+ *
+ * `cli.ts` no longer writes such an entry (any measurement failure blocks the
+ * write), so the reachable population is entries left by an earlier build that
+ * scoped that suppression to gated failures only. Discarding them costs one
+ * re-measurement and removes the whole shape.
+ *
+ * Returning `undefined` deliberately routes into the SAME path as "no baseline
+ * exists", which suppresses caching rather than failing the gate -- see the
+ * monotonic-without-baseline policy question this leaves open (#28).
+ */
+function usableBaseline(entry) {
+    if (!entry)
+        return undefined;
+    return (entry.metrics.measurementFailures?.length ?? 0) > 0 ? undefined : entry;
 }
 // =============================================================================
 // Cache Pruning

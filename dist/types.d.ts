@@ -1,18 +1,52 @@
 /**
  * Type definitions for the Quality Gate system
- * Schema Version: 2
+ * Schema Version: 3
  */
 import type { MeasurementFailure } from './providers/types.js';
 /**
- * Bumped to 2 when measurement failures started failing the gate.
+ * Bumped whenever the DEFINITION OF A PASS changes, because `cli.ts` exits 0 on a
+ * cached pass without measuring anything. A stored verdict is a claim about
+ * semantics that no longer exist, and reusing it carries the defect forward past
+ * its fix. `loadCache` discards a mismatched schema, which is exactly the wanted
+ * effect: the cost of a bump is one re-measurement per commit.
  *
- * Version 1 entries were computed under the old semantics, where a crashed
- * linter or type-checker became `{errors: 0}` -- so a stored PASS from then may
- * be a vacuous one, and reusing it would carry the defect forward past its fix.
- * `loadCache` discards a mismatched schema, which is exactly the wanted effect.
+ * 2 -- measurement failures started failing the gate. Version 1 entries were
+ *   computed under the old semantics, where a crashed linter or type-checker
+ *   became `{errors: 0}`, so a stored PASS from then may be a vacuous one.
+ *
+ * 3 -- two separate changes to what a pass means, either sufficient on its own:
+ *
+ *     - Zero-denominator dimensions changed VALUE. A branchless project's
+ *       `coverage.*.branches` was 0 (union) or istanbul's copied-through 100
+ *       (unit) and is now a deliberate 100 in both, with the all-zero report
+ *       refused as `measured-nothing`. Stored metrics and stored verdicts about
+ *       them disagree with what this version would compute from the same report.
+ *     - Which measurement failures FAIL changed: only dimensions some rule grades
+ *       do, now including the dimensions a graded one is DERIVED from. A
+ *       version-2 entry can hold a stored FAIL for a dimension nothing grades --
+ *       a stray `coverage-lambda` -- that this version passes.
+ *
+ *   The first makes a stored PASS potentially vacuous and the second makes a
+ *   stored FAIL potentially spurious, so the entries cannot be salvaged in either
+ *   direction.
+ *
+ *   Not a third reason, but worth recording next to them: a version-3 entry can
+ *   only ever hold a reading with no RECORDED measurement failure. `cli.ts`
+ *   refuses to cache a run with any failure, gated or not, and `isCacheValid`
+ *   refuses an entry that carries one -- which covers entries written by an
+ *   intermediate build that scoped the suppression to gated failures only.
+ *
+ *   "No recorded failure" is weaker than COMPLETE, and the gap is not closed:
+ *     - `sonarqube` has no failure channel at all, so a reading that lost that
+ *       whole dimension records an empty failure list and caches as clean (#42).
+ *     - The key covers tracked content only, so a coverage report corrupted after
+ *       a clean entry was written is never re-read (#41) -- and for a project
+ *       whose code falls outside `codePathspecs` the WIP hash is sha256("") for
+ *       every working-tree state, so the key never moves (#40).
+ *   Do not strengthen this claim back to "complete" until those are closed.
  */
 export interface QualityGateCache {
-    schemaVersion: 2;
+    schemaVersion: 3;
     entries: Record<string, CacheEntry>;
 }
 export interface CacheEntry {
@@ -89,9 +123,40 @@ export interface Trajectory {
 }
 export type ConvergenceState = 'improving' | 'converged' | 'stagnating' | 'oscillating';
 export interface AllCoverageMetrics {
-    lambda?: CoverageMetrics;
-    unit?: CoverageMetrics;
+    lambda?: TotalCoverageMetrics;
+    unit?: TotalCoverageMetrics;
     union?: CoverageMetrics;
+}
+/**
+ * Coverage read from one report's `total`.
+ *
+ * A fresh reading populates all four dimensions: a zero denominator beside a
+ * non-zero one is reported as 100 (every one of the zero branches in a
+ * branchless file is covered), and a report where EVERY denominator is zero is
+ * refused outright as `measured-nothing` rather than yielding metrics at all.
+ * See extractFromTotal in providers/coverage.ts for why those two zero cases
+ * must not be treated alike.
+ *
+ * The fields stay optional anyway, for one reason that is not about fresh
+ * readings: baseline metrics are deserialized from `.quality-gate-cache.json`,
+ * written by whatever version of this tool last ran, and an earlier version
+ * DROPPED zero-denominator dimensions instead of reporting them. Declaring them
+ * required would be a claim about data this process did not produce. Every
+ * consumer therefore still has to handle absence -- and `evaluateCeilings` and
+ * `evaluateMonotonic` handling it by SKIPPING is exactly why the reader stopped
+ * dropping dimensions.
+ *
+ * A separate type from CoverageMetrics rather than loosening that one, so the
+ * ripple stops here. CoverageMetrics is also `FileInfo.coverage` and the
+ * recomputed `union`, both of which are consumed arithmetically
+ * (`Math.min(coverage.branches, ...)`, `cov.branches.toFixed(0)`) by code that
+ * has nothing to do with this defect.
+ */
+export interface TotalCoverageMetrics {
+    readonly statements?: number;
+    readonly branches?: number;
+    readonly functions?: number;
+    readonly lines?: number;
 }
 export interface CoverageMetrics {
     statements: number;

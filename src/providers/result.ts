@@ -14,12 +14,16 @@
  */
 
 import type { SpawnSyncReturns } from 'child_process';
+import * as fs from 'fs';
 
 import type {
   MeasurementDimension,
   MeasurementEvidence,
   MeasurementFailure,
   MeasurementFailureKind,
+  ProcessEvidence,
+  ReportAttempt,
+  ReportEvidence,
   Result,
 } from './types.js';
 
@@ -77,9 +81,10 @@ export function buildEvidence(
   spawn: SpawnSyncReturns<string>,
   command: string,
   elapsedMs: number
-): MeasurementEvidence {
+): ProcessEvidence {
   const stderr = spawn.stderr ?? '';
   return {
+    via: 'process',
     command,
     exitCode: spawn.status,
     signal: spawn.signal ?? null,
@@ -88,6 +93,117 @@ export function buildEvidence(
     stderrBytes: Buffer.byteLength(stderr),
     stderrExcerpt: stderr.slice(0, STDERR_EXCERPT_BYTES) || undefined,
   };
+}
+
+/**
+ * Reads one JSON report, recording what happened rather than collapsing it.
+ *
+ * `classifyProcessOutput` exists so no provider can decide on its own that a
+ * dead process found nothing. This is the same argument for a dead FILE, which
+ * the tool got wrong in two places at once: `loadCoverageData` swallowed every
+ * parse error into `undefined` with a bare `catch { // Skip if invalid }`, and
+ * `extractCoverageIssues` swallowed into `[]` plus a warning. In both, a corrupt
+ * report was indistinguishable from an unmeasured project -- and a project with
+ * no coverage floor then passed green over a dimension nobody measured.
+ *
+ * The four ways to fail are kept apart for the same reason the failure KINDS
+ * are: absent means the tool never wrote it, unreadable is a filesystem
+ * problem, invalid JSON means the writer was cut off mid-file, and a wrong
+ * shape means this is not the report we were told to read. One boolean would
+ * make them all "no coverage".
+ *
+ * Existence is probed with `existsSync` first, preserving the contract the
+ * previous implementation had, so "the tool never wrote a lambda report" stays
+ * the ordinary silent case it has always been. `statSync` is called only for
+ * `modifiedMs`, inside its own try, and CANNOT change the outcome -- mtime is
+ * supplementary evidence for a human, never a verdict.
+ *
+ * Does not log. The caller decides whether this failure is fatal or discarded,
+ * and only the layer that discards an error should be talking about it.
+ */
+export function readJsonReport(absolutePath: string): {
+  readonly attempt: ReportAttempt;
+  readonly data?: unknown;
+} {
+  if (!fs.existsSync(absolutePath)) {
+    return {
+      attempt: {
+        path: absolutePath,
+        existed: false,
+        bytesRead: null,
+        modifiedMs: null,
+        outcome: 'absent',
+      },
+    };
+  }
+
+  let raw: unknown;
+  try {
+    raw = fs.readFileSync(absolutePath, 'utf-8');
+  } catch (error) {
+    return {
+      attempt: {
+        path: absolutePath,
+        existed: true,
+        bytesRead: null,
+        modifiedMs: null,
+        outcome: 'unreadable',
+        errorCode: (error as { code?: string } | undefined)?.code,
+      },
+    };
+  }
+
+  if (typeof raw !== 'string') {
+    return {
+      attempt: {
+        path: absolutePath,
+        existed: true,
+        bytesRead: null,
+        modifiedMs: null,
+        outcome: 'unreadable',
+      },
+    };
+  }
+
+  let modifiedMs: number | null = null;
+  try {
+    const stat: unknown = fs.statSync(absolutePath);
+    const mtimeMs = (stat as { mtimeMs?: unknown } | undefined)?.mtimeMs;
+    if (typeof mtimeMs === 'number') modifiedMs = mtimeMs;
+  } catch {
+    // Evidence only. A report we just read successfully is not un-measured
+    // because its mtime was unavailable.
+  }
+
+  const base = {
+    path: absolutePath,
+    existed: true,
+    bytesRead: Buffer.byteLength(raw),
+    modifiedMs,
+  } as const;
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return { attempt: { ...base, outcome: 'invalid-json' } };
+  }
+
+  // An array or a scalar parses perfectly and then yields nothing when iterated
+  // as a keyed report -- the shape of failure that reads as a clean project.
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return { attempt: { ...base, outcome: 'wrong-shape' } };
+  }
+
+  return { attempt: { ...base, outcome: 'read' }, data: parsed };
+}
+
+export function buildReportEvidence(
+  command: string,
+  elapsedMs: number,
+  attempts: readonly ReportAttempt[]
+): ReportEvidence {
+  return { via: 'report', command, elapsedMs, attempts };
 }
 
 /**

@@ -10,6 +10,7 @@ import { extractAllCustomMetrics, registerCustomDimensions, } from './dimensions
 import { eslintLintProvider } from './providers/eslint.js';
 import { typescriptTypecheckProvider } from './providers/typescript.js';
 import { DEFAULT_MEASUREMENT_LIMITS } from './providers/result.js';
+import { createIstanbulCoverageProvider } from './providers/coverage.js';
 /**
  * spawnSync defaults to a 1 MiB stdout buffer. Past that, Node truncates the
  * output and kills the child, leaving status === null -- and every parse path
@@ -22,133 +23,75 @@ import { DEFAULT_MEASUREMENT_LIMITS } from './providers/result.js';
  * 64 MiB is far beyond any plausible linter or compiler output.
  */
 const SUBPROCESS_MAX_BUFFER = 64 * 1024 * 1024;
+// =============================================================================
+// Coverage Metrics
+// =============================================================================
 /**
- * Merge two coverage reports by file.
- * For files appearing in both reports, take the max coverage per file.
- * Then recalculate totals from merged file data.
+ * Measures coverage once, so the metrics and the located findings cannot end up
+ * describing two different reads of the same report.
+ *
+ * The parsing that used to live here now lives in src/providers/coverage.ts,
+ * unchanged. Before the extraction the two halves came from DIFFERENT files read
+ * at DIFFERENT times -- metrics from coverage-summary.json here, findings from
+ * coverage-final.json in targets/extract.ts -- with nothing checking that they
+ * agreed about anything.
+ *
+ * `issues: 'skip'` because this path discards them, and the cost of building them
+ * is not notional: `measureCoverage` returns metrics and failures and has no
+ * issues field to put them in, while the detail report they come from is the
+ * biggest artifact the tool reads. Before the extraction this path never opened
+ * coverage-final.json at all; collecting here would parse and walk it on the
+ * metrics pass and again on the findings pass. See CoverageProviderOptions.
  */
-function mergeCoverageReports(unitData, lambdaData) {
-    // Collect all file entries (excluding 'total')
-    const mergedFiles = new Map();
-    // Process unit test coverage
-    if (unitData) {
-        for (const [file, entry] of Object.entries(unitData)) {
-            if (file === 'total' || !entry)
-                continue;
-            mergedFiles.set(file, entry);
-        }
-    }
-    // Process lambda test coverage - take max covered for overlapping files
-    if (lambdaData) {
-        for (const [file, entry] of Object.entries(lambdaData)) {
-            if (file === 'total' || !entry)
-                continue;
-            const existing = mergedFiles.get(file);
-            if (!existing) {
-                mergedFiles.set(file, entry);
-            }
-            else {
-                // File exists in both - take max covered for each metric
-                mergedFiles.set(file, {
-                    statements: {
-                        total: existing.statements.total,
-                        covered: Math.max(existing.statements.covered, entry.statements.covered),
-                        pct: 0, // Will recalculate
-                    },
-                    branches: {
-                        total: existing.branches.total,
-                        covered: Math.max(existing.branches.covered, entry.branches.covered),
-                        pct: 0,
-                    },
-                    functions: {
-                        total: existing.functions.total,
-                        covered: Math.max(existing.functions.covered, entry.functions.covered),
-                        pct: 0,
-                    },
-                    lines: {
-                        total: existing.lines.total,
-                        covered: Math.max(existing.lines.covered, entry.lines.covered),
-                        pct: 0,
-                    },
-                });
-            }
-        }
-    }
-    if (mergedFiles.size === 0) {
-        return undefined;
-    }
-    // Calculate totals from merged files
-    let totalStatements = 0, coveredStatements = 0;
-    let totalBranches = 0, coveredBranches = 0;
-    let totalFunctions = 0, coveredFunctions = 0;
-    let totalLines = 0, coveredLines = 0;
-    for (const entry of Array.from(mergedFiles.values())) {
-        totalStatements += entry.statements.total;
-        coveredStatements += entry.statements.covered;
-        totalBranches += entry.branches.total;
-        coveredBranches += entry.branches.covered;
-        totalFunctions += entry.functions.total;
-        coveredFunctions += entry.functions.covered;
-        totalLines += entry.lines.total;
-        coveredLines += entry.lines.covered;
-    }
-    return {
-        statements: totalStatements > 0 ? (coveredStatements / totalStatements) * 100 : 0,
-        branches: totalBranches > 0 ? (coveredBranches / totalBranches) * 100 : 0,
-        functions: totalFunctions > 0 ? (coveredFunctions / totalFunctions) * 100 : 0,
-        lines: totalLines > 0 ? (coveredLines / totalLines) * 100 : 0,
-    };
-}
-/**
- * Extract coverage from a single report's total.
- */
-function extractFromTotal(data) {
-    if (!data?.total)
-        return undefined;
-    return {
-        statements: data.total.statements.pct,
-        branches: data.total.branches.pct,
-        functions: data.total.functions.pct,
-        lines: data.total.lines.pct,
-    };
-}
-/**
- * Load coverage data from both test suites.
- */
-function loadCoverageData() {
+function measureCoverageReading() {
     const config = getConfig();
-    const unitPath = path.join(config.projectRoot, config.coverage.unitDir, config.coverage.summaryFile);
-    const lambdaPath = path.join(config.projectRoot, config.coverage.lambdaDir, config.coverage.summaryFile);
-    let unitData;
-    let lambdaData;
-    if (fs.existsSync(unitPath)) {
-        try {
-            unitData = JSON.parse(fs.readFileSync(unitPath, 'utf-8'));
-        }
-        catch {
-            // Skip if invalid
-        }
+    return createIstanbulCoverageProvider({
+        unitDir: config.coverage.unitDir,
+        lambdaDir: config.coverage.lambdaDir,
+        summaryFile: config.coverage.summaryFile,
+    }, { issues: 'skip' }).measure({
+        projectRoot: config.projectRoot,
+        // A file read has neither a timeout nor a buffer budget. The context carries
+        // them because every spawn-based provider needs them, and inventing coverage
+        // -specific numbers here would put a limit in the contract that nothing
+        // enforces.
+        timeoutMs: DEFAULT_MEASUREMENT_LIMITS.typecheckTimeoutMs,
+        maxBufferBytes: DEFAULT_MEASUREMENT_LIMITS.maxBufferBytes,
+    });
+}
+/**
+ * The coverage numbers and the reasons any of them are missing, together.
+ *
+ * `reads` is deliberately NOT surfaced here. The provider records what it looked
+ * at (CoverageReading.reads) and targets/extract.ts uses that to warn about a
+ * detail report it could not use, but nothing on the METRICS path judges the
+ * reports themselves -- see the note on ReportAttempt.modifiedMs, and #39 for the
+ * open question of how a report's provenance should be established. Returning a
+ * field no caller reads would suggest something here checks it.
+ */
+export function measureCoverage() {
+    const reading = measureCoverageReading();
+    if (!reading.ok) {
+        return { metrics: {}, failures: [reading.error] };
     }
-    if (fs.existsSync(lambdaPath)) {
-        try {
-            lambdaData = JSON.parse(fs.readFileSync(lambdaPath, 'utf-8'));
-        }
-        catch {
-            // Skip if invalid
-        }
-    }
-    return { unitData, lambdaData };
+    return {
+        metrics: reading.value.metrics,
+        failures: reading.value.failures,
+    };
 }
 /**
  * Extract all three coverage metrics: lambda-only, unit-only, and union.
+ *
+ * Returns `{}` rather than `undefined` when nothing could be read, because
+ * `extractAllMetrics` assigns this straight to `metrics.coverage` and callers
+ * distinguish "no coverage numbers" from "no coverage key" already.
+ *
+ * As with extractTypescriptMetrics, absence is only half the fix: this wrapper
+ * discards the REASON, so a caller using it directly gets an honest blank and no
+ * diagnosis. The gate path uses `measureCoverage` for exactly that reason.
  */
 export function extractAllCoverageMetrics() {
-    const { unitData, lambdaData } = loadCoverageData();
-    return {
-        lambda: extractFromTotal(lambdaData),
-        unit: extractFromTotal(unitData),
-        union: mergeCoverageReports(unitData, lambdaData),
-    };
+    return measureCoverage().metrics;
 }
 /**
  * Extract coverage metrics for quality gate.
@@ -156,8 +99,7 @@ export function extractAllCoverageMetrics() {
  * @deprecated Use extractAllCoverageMetrics() for full coverage data.
  */
 export function extractCoverageMetrics() {
-    const { unitData, lambdaData } = loadCoverageData();
-    return mergeCoverageReports(unitData, lambdaData);
+    return measureCoverage().metrics.union;
 }
 export function getTopSonarIssues(limit = 10) {
     const config = getConfig();
@@ -523,6 +465,35 @@ export function extractAllMetrics(scriptsToRunOrOptions = ['quality']) {
     const scriptsToRun = options.scriptsToRun ?? ['quality'];
     const skipSonarQube = options.skipSonarQube ?? false;
     const skipCustomDimensions = options.skipCustomDimensions ?? false;
+    // ---------------------------------------------------------------------------
+    // Every measurement is hoisted OUT of the return literal below, in the order
+    // it must actually happen.
+    //
+    // Object-literal properties are evaluated top-to-bottom, so writing
+    // `{coverage: read(), ..., scripts: runScripts()}` read the coverage report
+    // BEFORE running the scripts that rewrite it. Confirmed end to end: with a
+    // 10%-statements report planted and `scriptsToRun: ['test:coverage']`, the
+    // gate reported `coverage.unit.statements = 10` while the same file on disk
+    // afterwards said 25. Four reads were on the wrong side of `runScripts` --
+    // both coverage summaries, the SonarQube measures, and the custom-dimension
+    // shell extractors, which commonly read build artifacts.
+    //
+    // What this does NOT establish is that the report describes the code being
+    // graded when no script the gate ran wrote it: a project that generates
+    // coverage outside the gate is graded on whatever is on disk. That hole is
+    // deliberate and open -- backlog #39 -- after an mtime-comparison rule was
+    // built for it and removed for being inert on any project without a literal
+    // top-level `src/` while false-failing mtime-preserving archive restores,
+    // branch switches and clock skew.
+    //
+    // The return literal's property ORDER is deliberately left exactly as it was,
+    // because the refactor harness compares capture sections with raw
+    // `JSON.stringify` equality and does not sort keys: moving `scripts:` up
+    // inside the literal would reject the frozen baseline for a pure
+    // serialization change, with no number different anywhere.
+    // ---------------------------------------------------------------------------
+    // First: this is the step that MUTATES the project.
+    const scripts = runScripts(scriptsToRun);
     // Extract custom metrics if configs are provided and not skipped
     let custom;
     const customFailures = [];
@@ -537,19 +508,25 @@ export function extractAllMetrics(scriptsToRunOrOptions = ['quality']) {
     // the only thing that makes a missing ceiling metric fail rather than pass.
     const typescript = measureTypescript();
     const eslint = measureEslint();
+    const coverage = measureCoverage();
+    const sonarqube = skipSonarQube ? undefined : extractSonarqubeMetrics();
+    const sloc = extractSloc();
     const measurementFailures = [
         ...[typescript, eslint]
             .filter((reading) => !reading.ok)
             .map((reading) => reading.error),
+        // Appended rather than prepended so the existing typescript-then-eslint
+        // ordering that tests assert on is untouched.
+        ...coverage.failures,
         ...customFailures,
     ];
     return {
-        coverage: extractAllCoverageMetrics(),
+        coverage: coverage.metrics,
         typescript: typescript.ok ? typescript.value.metrics : undefined,
         eslint: eslint.ok ? eslint.value.metrics : undefined,
-        sonarqube: skipSonarQube ? undefined : extractSonarqubeMetrics(),
-        scripts: runScripts(scriptsToRun),
-        sloc: extractSloc(),
+        sonarqube,
+        scripts,
+        sloc,
         custom,
         measurementFailures: measurementFailures.length > 0 ? measurementFailures : undefined,
     };

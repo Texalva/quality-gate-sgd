@@ -13,7 +13,7 @@
  * on its own that a dead process found nothing.
  */
 import type { SpawnSyncReturns } from 'child_process';
-import type { MeasurementDimension, MeasurementEvidence, MeasurementFailure, MeasurementFailureKind, Result } from './types.js';
+import type { MeasurementDimension, MeasurementEvidence, MeasurementFailure, MeasurementFailureKind, ProcessEvidence, ReportAttempt, ReportEvidence, Result } from './types.js';
 /**
  * Matches the timeouts already in use so the extraction changes no behaviour.
  * The buffer does not match: spawnSync's 1 MiB default silently truncated a
@@ -43,7 +43,38 @@ export declare function measurementFailure(kind: MeasurementFailureKind, dimensi
  * does not parse -- a failure it can classify but `classifyProcessOutput`
  * cannot, since only the caller knows the expected shape.
  */
-export declare function buildEvidence(spawn: SpawnSyncReturns<string>, command: string, elapsedMs: number): MeasurementEvidence;
+export declare function buildEvidence(spawn: SpawnSyncReturns<string>, command: string, elapsedMs: number): ProcessEvidence;
+/**
+ * Reads one JSON report, recording what happened rather than collapsing it.
+ *
+ * `classifyProcessOutput` exists so no provider can decide on its own that a
+ * dead process found nothing. This is the same argument for a dead FILE, which
+ * the tool got wrong in two places at once: `loadCoverageData` swallowed every
+ * parse error into `undefined` with a bare `catch { // Skip if invalid }`, and
+ * `extractCoverageIssues` swallowed into `[]` plus a warning. In both, a corrupt
+ * report was indistinguishable from an unmeasured project -- and a project with
+ * no coverage floor then passed green over a dimension nobody measured.
+ *
+ * The four ways to fail are kept apart for the same reason the failure KINDS
+ * are: absent means the tool never wrote it, unreadable is a filesystem
+ * problem, invalid JSON means the writer was cut off mid-file, and a wrong
+ * shape means this is not the report we were told to read. One boolean would
+ * make them all "no coverage".
+ *
+ * Existence is probed with `existsSync` first, preserving the contract the
+ * previous implementation had, so "the tool never wrote a lambda report" stays
+ * the ordinary silent case it has always been. `statSync` is called only for
+ * `modifiedMs`, inside its own try, and CANNOT change the outcome -- mtime is
+ * supplementary evidence for a human, never a verdict.
+ *
+ * Does not log. The caller decides whether this failure is fatal or discarded,
+ * and only the layer that discards an error should be talking about it.
+ */
+export declare function readJsonReport(absolutePath: string): {
+    readonly attempt: ReportAttempt;
+    readonly data?: unknown;
+};
+export declare function buildReportEvidence(command: string, elapsedMs: number, attempts: readonly ReportAttempt[]): ReportEvidence;
 /**
  * Turns a finished spawnSync into either its stdout or a classified failure.
  *

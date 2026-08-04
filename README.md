@@ -36,10 +36,24 @@ npm install quality-gate-sgd
 
 ### 1. Create Rules Configuration
 
+The easy path calibrates the thresholds from your current metrics and picks a
+coverage-writing test script for you:
+
+```bash
+npx quality-gate-sgd init
+```
+
+To write it by hand instead, start from the template:
+
 ```bash
 # Copy the template
 cp node_modules/quality-gate-sgd/templates/rules.template.json rules.json
 ```
+
+Then **replace `test:coverage` in `requiredScripts` with the script in your
+`package.json` that actually writes the coverage report** - see
+[Pairing coverage floors with a coverage-writing script](#pairing-coverage-floors-with-a-coverage-writing-script)
+below for why that pairing matters.
 
 Edit `rules.json` for your project:
 
@@ -59,10 +73,14 @@ Edit `rules.json` for your project:
       { "direction": "up", "metrics": ["coverage.unit.branches"] },
       { "direction": "down", "metrics": ["sonarqube.bugs"] }
     ],
-    "requiredScripts": ["test", "lint"]
+    "requiredScripts": ["test:coverage", "lint"]
   }
 }
 ```
+
+`test:coverage` here stands for whatever your coverage-writing script is called;
+`test` is deliberately **not** used, because for vitest and jest the default
+`test` script writes no coverage report.
 
 ### 2. Run the Quality Gate
 
@@ -109,8 +127,30 @@ Metrics that must not regress:
 ### Required Scripts
 npm scripts that must pass:
 ```json
-"requiredScripts": ["test", "lint", "build"]
+"requiredScripts": ["test:coverage", "lint", "build"]
 ```
+
+#### Pairing coverage floors with a coverage-writing script
+
+The gate runs `requiredScripts` and *then* reads the coverage report, so if you
+have any `coverage.*` floor, ceiling or monotonic rule, one of your
+`requiredScripts` must be the script that writes that report.
+
+For vitest and jest, the default `test` script does not. Measured with vitest 4
+and `@vitest/coverage-v8`: `npm run test` on `"test": "vitest run"` created no
+`coverage/` directory at all, while `"vitest run --coverage"` wrote
+`coverage/coverage-summary.json`. Pairing coverage floors with a `test` script
+like that means the floors are graded against whatever generation of the code
+last wrote a report.
+
+**The gate does not detect that.** It reads the report on disk and grades it,
+whether the report was written by this run, by a CI step five minutes ago, or by
+a checkout last week. There is no age check: one was built (compare the report's
+mtime against the newest source file) and removed, because it was inert on any
+project whose sources are not under a literal top-level `src/` and it false-failed
+mtime-preserving archive restores, branch switches and clock skew. Getting the
+pairing right is therefore on you, and it is the reason `init` picks a
+coverage-writing script.
 
 ## Available Metrics
 
@@ -185,9 +225,11 @@ import {
   prioritizeFiles,
 } from 'quality-gate-sgd';
 
-// Run quality gate
+// Run quality gate. The scripts run BEFORE the reports are read, so the one
+// that writes coverage has to be in this list for the coverage numbers to
+// describe the current code.
 const rules = loadRules();
-const metrics = extractAllMetrics(['test', 'lint']);
+const metrics = extractAllMetrics(['test:coverage', 'lint']);
 const result = evaluateRules(rules, metrics);
 
 console.log(result.status); // 'pass' or 'fail'
@@ -244,6 +286,30 @@ The quality gate uses intelligent caching:
 - **Rules change**: Cache invalidated when rules.json changes
 
 Cache stores metrics and evaluation results to avoid redundant runs.
+
+**A reading that reported a failed measurement is never cached.** If any dimension
+could not be measured — a crashed linter, a type-check script that does not exist,
+an unreadable coverage report — this run is not stored, whether or not a rule grades
+that dimension, and the next run measures again. A cached pass exits 0 without
+measuring anything and without re-reading the stored metrics, so an entry recording
+a failed measurement would report that failure exactly once and never again. The
+cost is that a project with, say, a stray `coverage-lambda/` directory re-measures
+every run; the gate prints what could not be measured on every one of those runs,
+and says how to make it stop.
+
+Three known gaps in that guarantee, all pre-existing and tracked rather than fixed:
+`sonarqube` has no failure channel, so losing that dimension entirely still caches
+as clean; the cache key covers tracked content only, so a coverage report corrupted
+*after* a clean entry was written is not re-read; and if your code lives outside
+`QUALITY_CODE_PATHSPECS` (default `src/,tests/,scripts/`) the uncommitted-changes
+key is a constant, so an entry is served for arbitrarily different code until the
+commit changes. If your layout is not `src/`-based, set `QUALITY_CODE_PATHSPECS`.
+
+A measurement failure **fails the gate** only when some rule reads that dimension —
+including through a dimension derived from it, so a floor on `coverage.union.*` is
+gated by the `coverage.unit` and `coverage.lambda` measurements the union is summed
+from. Anything else is reported without failing the build, since a number nothing
+compares against cannot change a verdict.
 
 ## For LLM Agent Authors
 

@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "description": "Quality gates for quality-sgd - 90% coverage requirement",
+  "description": "Quality gates for quality-sgd - 90% coverage requirement. requiredScripts is test:coverage rather than test because `test` is `vitest run` with no --coverage: it writes no report, so the coverage floors above would be graded against whatever generation of the code last wrote coverage/.",
   "rules": {
     "floors": {
       "coverage.unit.branches": 90,
@@ -32,7 +32,7 @@
       }
     ],
     "requiredScripts": [
-      "test"
+      "test:coverage"
     ]
   }
 }

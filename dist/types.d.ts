@@ -70,6 +70,30 @@ export interface CacheEntry {
         failedRules: string[];
     };
     metrics: Metrics;
+    /**
+     * False when this run had monotonic rules configured and no baseline to compare
+     * them against, so they did not execute.
+     *
+     * The entry is then a usable BASELINE and not a usable VERDICT, and that
+     * distinction is the whole reason the field exists. Refusing to write it at all --
+     * which is what happened before -- deadlocked the cache permanently for any
+     * project with a ratchet:
+     *
+     *     a clean run needs a baseline at HEAD's parent
+     *       -> that run needed one at ITS parent
+     *         -> ... -> the root commit, which has none.
+     *
+     * So no entry was ever written, on any commit, ever; `PASSED (cached)` was
+     * unreachable and -- far worse -- every monotonic rule was silently unevaluated on
+     * every run while the gate printed PASS. Reproduced on a committed tree with one
+     * ratchet: two consecutive clean runs, `{"schemaVersion":4,"entries":{}}` both
+     * times. `init` generates ratchets by default, so that was the default experience.
+     *
+     * Optional rather than required because entries written before this field existed
+     * are still honest readings; `isCacheValid` treats a missing value as "evaluated",
+     * which is what it meant when they were written.
+     */
+    monotonicEvaluated?: boolean;
 }
 export interface Metrics {
     coverage?: AllCoverageMetrics;

@@ -500,29 +500,42 @@ async function runQualityGate(options: RunOptions = { skipSonarQube: false }): P
     );
   }
 
-  // The same argument covers a pass whose monotonic rules never ran. It is a
-  // narrower reading than a complete one -- some configured rules were not
-  // applied -- so caching it would let a later run short-circuit to a PASS that
-  // no run ever fully earned: `isCacheValid` accepts any cached pass whose metrics
-  // carry no measurement failure, and an unevaluated monotonic rule leaves no
-  // trace in the metrics for it to catch. Recording nothing means the next run,
-  // which may well have a baseline by then, evaluates them for real.
+  // A pass whose monotonic rules never ran is a NARROWER reading than a complete
+  // one, and it is recorded as such rather than withheld.
   //
-  // NOT the same as failing the gate on it, which is a live question -- see the
-  // note above `describeMissingBaseline` and the monotonic gap it links to.
+  // Withholding it was the previous answer and it was wrong in a way that took a
+  // reproduction to see. The suppression was there for a good reason -- `isCacheValid`
+  // accepts any cached pass whose metrics carry no measurement failure, and an
+  // unevaluated ratchet leaves no trace in the metrics for it to catch, so a later
+  // run could short-circuit to a PASS nobody earned. But refusing the WRITE
+  // deadlocked the chain: a clean run needs a baseline at HEAD's parent, which needed
+  // one at ITS parent, inductively back to the root commit, which has none. So no
+  // entry was ever written on any commit, `PASSED (cached)` was unreachable, and --
+  // the part that matters -- every monotonic rule stayed silently unevaluated on
+  // every run while the gate printed PASS. MEASURED on a committed tree with one
+  // ratchet: two consecutive clean runs, `{"schemaVersion":4,"entries":{}}` both
+  // times. `init` generates ratchets by default, so that was the default experience
+  // of adopting this tool.
+  //
+  // `monotonicEvaluated: false` on the entry gets both: `isCacheValid` refuses to
+  // serve it as a VERDICT, and `findBaselineEntry` still accepts it as a BASELINE,
+  // which is a different question with an honest yes -- these numbers really are a
+  // reading of that commit. So the next commit's run has something to ratchet
+  // against, and no run ever exits 0 on a rule that did not execute.
+  //
+  // Still NOT the same as failing the gate on a missing baseline, which is a live
+  // question -- see the note above `describeMissingBaseline`.
   const monotonicSkipped =
     (rules.rules.monotonic?.length ?? 0) > 0 && baselineEntry === undefined;
 
-  const cachedThisRun = !(measurementFailures.length > 0 || monotonicSkipped);
+  // A measurement failure is different in kind and still blocks the write: those
+  // numbers are not a reading of anything, so they are no use as a baseline either.
+  const cachedThisRun = measurementFailures.length === 0;
 
   if (!cachedThisRun) {
-    const reasons = [
-      ...measurementFailures.map((f) => `${f.dimension}: ${f.kind}`),
-      ...(monotonicSkipped ? ['monotonic rules were not evaluated (no baseline)'] : []),
-    ];
     log(`\nNot caching this run -- it is not a complete reading:`);
-    for (const reason of reasons) {
-      log(`  ${reason}`);
+    for (const failure of measurementFailures) {
+      log(`  ${failure.dimension}: ${failure.kind}`);
     }
   } else {
     const failedRuleNames = result.failedRules.map((f) => f.rule);
@@ -530,9 +543,18 @@ async function runQualityGate(options: RunOptions = { skipSonarQube: false }): P
       metrics,
       rules,
       result.status,
-      failedRuleNames
+      failedRuleNames,
+      !monotonicSkipped
     );
     setCacheEntry(cache, cacheKey, entry);
+
+    if (monotonicSkipped) {
+      log(
+        '\nCaching this run as a BASELINE only -- its monotonic rules had nothing to ' +
+          'compare against, so it is not servable as a verdict and the next run on this ' +
+          'commit will re-measure. The commit after this one can ratchet against it.'
+      );
+    }
   }
 
   // Prune old entries (keep last 90 days)

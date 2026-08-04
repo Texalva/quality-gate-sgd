@@ -477,6 +477,29 @@ export function isCacheValid(entry, rules) {
     if ((entry.metrics.measurementFailures ?? []).length > 0) {
         return false;
     }
+    // An entry whose monotonic rules never ran is a NARROWER reading than a complete
+    // one -- some configured rules were not applied -- so it cannot be served as a
+    // verdict. Serving it would let a later run short-circuit to a PASS that no run
+    // ever fully earned.
+    //
+    // This is the read half of a deliberate two-tier arrangement, and the write half
+    // is what makes it necessary: such a run now DOES write its entry, where before it
+    // wrote nothing. That refusal deadlocked the cache permanently for any project
+    // with a ratchet -- a clean run needs a baseline at HEAD's parent, which needs one
+    // at its parent, inductively back to the root commit, which has none -- so no
+    // entry was ever written on any commit and every monotonic rule was silently
+    // unevaluated on every run while the gate printed PASS. See CacheEntry.
+    //
+    // The entry is still a usable BASELINE: `findBaselineEntry` and `usableBaseline`
+    // ask a different question (are these numbers a reading of that commit?) and the
+    // answer is yes. That is what breaks the deadlock without reintroducing the
+    // unearned cached pass.
+    //
+    // `!== false` rather than `=== true`: entries written before the field existed
+    // carry no value, and for them "evaluated" is what the absence meant.
+    if (entry.monotonicEvaluated === false) {
+        return false;
+    }
     // If evaluation passed, cache is valid - no need to re-check metrics
     if (entry.evaluation.status === 'pass') {
         return true;

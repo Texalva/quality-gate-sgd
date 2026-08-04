@@ -294,7 +294,12 @@ export function getCacheEntry(cache, commitHash) {
 export function setCacheEntry(cache, commitHash, entry) {
     cache.entries[commitHash] = entry;
 }
-export function createCacheEntry(metrics, rules, status, failedRules) {
+export function createCacheEntry(metrics, rules, status, failedRules, 
+// REQUIRED, though the field it sets is optional. A writer that forgets it would
+// record an unevaluated ratchet as an evaluated one, which is the shape
+// `isCacheValid` exists to refuse; tolerating history is a reason to accept a
+// missing value when READING, not a reason to let a new entry omit it.
+monotonicEvaluated) {
     return {
         timestamp: Date.now(),
         rulesVersion: rules.version,
@@ -304,6 +309,7 @@ export function createCacheEntry(metrics, rules, status, failedRules) {
             failedRules,
         },
         metrics,
+        monotonicEvaluated,
     };
 }
 // =============================================================================

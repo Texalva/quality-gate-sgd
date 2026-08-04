@@ -66,7 +66,7 @@ export declare function loadCache(): QualityGateCache;
 export declare function saveCache(cache: QualityGateCache): void;
 export declare function getCacheEntry(cache: QualityGateCache, commitHash: string): CacheEntry | undefined;
 export declare function setCacheEntry(cache: QualityGateCache, commitHash: string, entry: CacheEntry): void;
-export declare function createCacheEntry(metrics: Metrics, rules: QualityRules, status: 'pass' | 'fail', failedRules: string[]): CacheEntry;
+export declare function createCacheEntry(metrics: Metrics, rules: QualityRules, status: 'pass' | 'fail', failedRules: string[], monotonicEvaluated: boolean): CacheEntry;
 /**
  * Find the best baseline entry for comparison
  *

@@ -371,7 +371,12 @@ export function createCacheEntry(
   metrics: Metrics,
   rules: QualityRules,
   status: 'pass' | 'fail',
-  failedRules: string[]
+  failedRules: string[],
+  // REQUIRED, though the field it sets is optional. A writer that forgets it would
+  // record an unevaluated ratchet as an evaluated one, which is the shape
+  // `isCacheValid` exists to refuse; tolerating history is a reason to accept a
+  // missing value when READING, not a reason to let a new entry omit it.
+  monotonicEvaluated: boolean
 ): CacheEntry {
   return {
     timestamp: Date.now(),
@@ -382,6 +387,7 @@ export function createCacheEntry(
       failedRules,
     },
     metrics,
+    monotonicEvaluated,
   };
 }
 

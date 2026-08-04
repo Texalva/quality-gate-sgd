@@ -1309,6 +1309,44 @@ describe('evaluateRules', () => {
 })
 
 describe('isCacheValid', () => {
+  // The read half of the monotonic bootstrap fix, and the pair below is the whole
+  // point. Such an entry is written now (it used to be withheld, which deadlocked
+  // the cache chain permanently for any project with a ratchet), so something has to
+  // stop it being served as a verdict -- an unevaluated ratchet leaves no trace in
+  // `metrics` for the failure check above to catch, so a later run would exit 0 on a
+  // rule that never executed. It stays usable as a BASELINE, which is a different
+  // question with an honest yes; see findBaselineEntry.
+  describe('an entry whose monotonic rules never ran', () => {
+    const rules: QualityRules = {
+      version: '1.0.0',
+      rules: { monotonic: [{ direction: 'up', metrics: ['coverage.unit.branches'] }] },
+    }
+    const entryWith = (monotonicEvaluated: boolean | undefined): CacheEntry => ({
+      timestamp: Date.now(),
+      rulesHash: computeRulesHash(rules),
+      rulesVersion: '1.0.0',
+      metrics: { scripts: {}, coverage: { unit: { branches: 80 } } } as CacheEntry['metrics'],
+      evaluation: { status: 'pass', failedRules: [] },
+      ...(monotonicEvaluated === undefined ? {} : { monotonicEvaluated }),
+    })
+
+    it('is refused as a verdict', () => {
+      expect(isCacheValid(entryWith(false), rules)).toBe(false)
+    })
+
+    it('is accepted when the rules DID run', () => {
+      expect(isCacheValid(entryWith(true), rules)).toBe(true)
+    })
+
+    // History is tolerated on READ: entries written before the field existed carry no
+    // value, and "evaluated" is what that absence meant when they were written.
+    // Refusing them instead would discard every pre-existing entry on upgrade -- the
+    // same cost as a schema bump, without the bump.
+    it('is accepted when the field is absent, as older entries have it', () => {
+      expect(isCacheValid(entryWith(undefined), rules)).toBe(true)
+    })
+  })
+
   it('returns true when hashes match', () => {
     const rules: QualityRules = {
       version: '1.0.0',

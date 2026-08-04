@@ -564,7 +564,7 @@ describe('cache module', () => {
         rules: {},
       }
 
-      const result = createCacheEntry(metrics, rules, 'pass', [])
+      const result = createCacheEntry(metrics, rules, 'pass', [], true)
 
       expect(result.rulesVersion).toBe('1.0.0')
       expect(result.rulesHash).toBe('test-rules-hash')
@@ -572,16 +572,29 @@ describe('cache module', () => {
       expect(result.evaluation.failedRules).toEqual([])
       expect(result.metrics).toBe(metrics)
       expect(typeof result.timestamp).toBe('number')
+      expect(result.monotonicEvaluated).toBe(true)
     })
 
     it('creates entry with failed rules', () => {
       const metrics = {} as Metrics
       const rules: QualityRules = { version: '1.0.0', rules: {} }
 
-      const result = createCacheEntry(metrics, rules, 'fail', ['rule1', 'rule2'])
+      const result = createCacheEntry(metrics, rules, 'fail', ['rule1', 'rule2'], true)
 
       expect(result.evaluation.status).toBe('fail')
       expect(result.evaluation.failedRules).toEqual(['rule1', 'rule2'])
+    })
+
+    // The write half of the bootstrap fix. A run whose ratchets had no baseline used
+    // to be withheld entirely, which deadlocked the chain: every clean run needed an
+    // entry at HEAD's parent, back to the root commit, which has none -- so no entry
+    // was ever written and every ratchet stayed unevaluated while the gate printed
+    // PASS. It is now recorded and MARKED, so it can seed a baseline without ever
+    // being served as a verdict.
+    it('records that the monotonic rules did not run', () => {
+      const result = createCacheEntry({} as Metrics, { version: '1.0.0', rules: {} }, 'pass', [], false)
+
+      expect(result.monotonicEvaluated).toBe(false)
     })
   })
 
@@ -635,6 +648,33 @@ describe('cache module', () => {
     // silently disables the ratchet -- and because an entry WAS returned, cli.ts
     // does not count the rule as unevaluated and caches the pass as fully earned.
     // Floors fail loudly on a missing metric; monotonic rules do not.
+    // The counterpart to the refusal below, and the reason the bootstrap fix works:
+    // an entry whose monotonic rules never ran is not servable as a VERDICT
+    // (isCacheValid refuses it) but IS servable as a baseline, because "are these
+    // numbers a reading of that commit?" is a different question with an honest yes.
+    // Without this, marking the entry would have been pointless -- the chain would
+    // still never bootstrap.
+    it('accepts a baseline whose monotonic rules did not run', () => {
+      const seedEntry: CacheEntry = {
+        timestamp: 12345,
+        rulesVersion: '1.0.0',
+        rulesHash: 'hash',
+        evaluation: { status: 'pass', failedRules: [] },
+        metrics: { scripts: {}, coverage: { unit: { branches: 80 } } } as unknown as Metrics,
+        monotonicEvaluated: false,
+      }
+
+      mockExecSync.mockReturnValue(commitObject(['parentcommit']))
+
+      const cache: QualityGateCache = {
+        schemaVersion: 4,
+        entries: { parentcommit: seedEntry },
+      }
+      const rules: QualityRules = { version: '1.0.0', rules: {} }
+
+      expect(findBaselineEntry(cache, rules, false)).toBe(seedEntry)
+    })
+
     it('refuses a baseline whose own reading recorded a measurement failure', () => {
       const incompleteBaseline: CacheEntry = {
         timestamp: 12345,

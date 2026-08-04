@@ -173,17 +173,67 @@ describe('cache module', () => {
       expect(result.key).toMatch(/^wip:/)
     })
 
+    // The WIP key must name the commit the diff is a diff FROM. A content hash on
+    // its own is a diff-shaped answer with no anchor, so the same uncommitted edit
+    // on two different commits keyed identically -- rebase, amend, switch branch,
+    // or check out an older revision with the same one-line patch, and the stored
+    // verdict for a completely different tree was served. It also bounded the
+    // pathspec blind spot (#40): a project whose code lies outside
+    // `codePathspecs` diffs to nothing, so the hash was sha256("") for every
+    // working-tree state and the key NEVER moved -- reproduced serving
+    // `PASSED (cached)` for a tree with 53 tsc errors against a ceiling of 3.
+    //
+    // Asserted as three parts rather than `/^wip:/`, which is what the case above
+    // does and what let this ship: that pattern holds just as well for the broken
+    // format.
+    it('anchors the wip key to HEAD, not to the diff alone', () => {
+      mockExecSync
+        .mockReturnValueOnce('M src/file.ts\n') // git status --porcelain
+        .mockReturnValueOnce('abc1234567890abc1234567890abc1234567890a\n') // git rev-parse HEAD
+        .mockReturnValueOnce('diff content') // git diff HEAD
+        .mockReturnValueOnce('') // git ls-files --others
+
+      const [prefix, head, content] = getCacheKey().key.split(':')
+
+      expect(prefix).toBe('wip')
+      expect(head).toBe('abc1234567890abc1234567890abc1234567890a')
+      expect(content).toMatch(/^[0-9a-f]{64}$/)
+    })
+
+    // Two commits, the same uncommitted diff: the keys must differ. Without this the
+    // assertion above is satisfiable by a key that merely CONTAINS a commit hash
+    // without it varying.
+    it('gives two commits with the same diff different keys', () => {
+      const keyFor = (head: string) => {
+        mockExecSync
+          .mockReturnValueOnce('M src/file.ts\n')
+          .mockReturnValueOnce(`${head}\n`)
+          .mockReturnValueOnce('the identical diff')
+          .mockReturnValueOnce('')
+        return getCacheKey().key
+      }
+
+      expect(keyFor('1111111111111111111111111111111111111111')).not.toBe(
+        keyFor('2222222222222222222222222222222222222222')
+      )
+    })
+
     // This previously asserted the OPPOSITE -- that a failed `git status`
     // yields the commit hash with isWIP: false. That is not a lenient default,
     // it is a cache poisoning: cli.ts looks the commit up, finds the verdict it
     // earned when it was clean, and exits 0 announcing PASSED without running a
     // single measurement over the uncommitted code.
+    // Only ONE queued value, deliberately. `getCacheKey` throws on the first call, so
+    // a second `mockReturnValueOnce` here is never consumed -- and `clearAllMocks`
+    // does not drain the once-queue, so it leaks into the NEXT test and shifts every
+    // call it makes by one. That is exactly what happened: the ENOBUFS case below
+    // inherited a leftover value, so its "git status" call returned instead of
+    // throwing and the error it asserted on came from a later git invocation. It
+    // passed while testing something else.
     it('refuses to guess the tree state when git status fails', () => {
-      mockExecSync
-        .mockImplementationOnce(() => {
-          throw new Error('git status failed')
-        }) // git status --porcelain fails
-        .mockReturnValueOnce('abc123\n') // git rev-parse HEAD
+      mockExecSync.mockImplementationOnce(() => {
+        throw new Error('git status failed')
+      })
 
       expect(() => getCacheKey()).toThrow(/whether the working tree is clean/)
     })
@@ -194,14 +244,21 @@ describe('cache module', () => {
     // failure was therefore likeliest on the dirtiest trees -- the ones where
     // reusing a clean commit's verdict does the most damage.
     it('does not report a clean tree when git status output overflows the buffer', () => {
-      mockExecSync
-        .mockImplementationOnce(() => {
-          throw Object.assign(new Error('spawnSync /bin/sh ENOBUFS'), {
-            code: 'ENOBUFS',
-          })
+      mockExecSync.mockImplementationOnce(() => {
+        throw Object.assign(new Error('spawnSync /bin/sh ENOBUFS'), {
+          code: 'ENOBUFS',
         })
-        .mockReturnValueOnce('abc123\n')
+      })
 
+      // Both halves: the ENOBUFS reason survives into the message, AND it is the
+      // tree-state check that refused rather than some later git call. Asserting the
+      // reason alone is what let the leaked-queue problem above hide here.
+      expect(() => getCacheKey()).toThrow(/whether the working tree is clean/)
+      mockExecSync.mockImplementationOnce(() => {
+        throw Object.assign(new Error('spawnSync /bin/sh ENOBUFS'), {
+          code: 'ENOBUFS',
+        })
+      })
       expect(() => getCacheKey()).toThrow(/ENOBUFS/)
     })
 

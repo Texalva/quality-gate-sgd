@@ -18,7 +18,7 @@ import {
 // dimensions, so any surface in here that used it silently omitted them.
 extractAllMetricsAsync, describeUnmeasured, isSonarqubeAvailable, runSonarqubeScan, getTopSonarIssues, } from './metrics.js';
 import { loadRules, evaluateRules, isCacheValid, isMeasurementUnderRule, coverageAbsenceIsFailure, } from './rules.js';
-import { loadCache, saveCache, getCurrentCommitHash, getCacheKey, getCacheEntry, setCacheEntry, createCacheEntry, findBaselineEntry, resolveBaselineCommit, pruneOldEntries, } from './cache.js';
+import { loadCache, saveCache, getCacheKey, getCacheEntry, setCacheEntry, createCacheEntry, findBaselineEntry, resolveBaselineCommit, pruneOldEntries, } from './cache.js';
 import { getConfig } from './config.js';
 import { listIssues } from './list-issues.js';
 import { buildTrajectory, formatTrajectorySummary, trajectorySparkline, } from './trajectory.js';
@@ -126,12 +126,17 @@ async function runQualityGate(options = { skipSonarQube: false }) {
     // Load rules (zero-config mode will use embedded defaults if no rules.json)
     const rules = loadRules({ coverageOnly: options.skipSonarQube });
     log(`Rules: ${rules.version} - ${rules.description}`);
-    // Get cache key (commit hash for clean tree, wip:contentHash for uncommitted changes)
+    // Commit hash for a clean tree, `wip:<HEAD>:<contentHash>` for a dirty one.
     const { key: cacheKey, isWIP } = getCacheKey();
     if (isWIP) {
-        const commitHash = getCurrentCommitHash();
-        const contentHashShort = cacheKey.slice(4, 11); // Skip 'wip:' prefix
-        log(`\nWIP changes on ${commitHash.slice(0, 7)} (content: ${contentHashShort})`);
+        // Split on ':' rather than slicing at a fixed offset. The old form was
+        // `wip:<contentHash>` and this read `cacheKey.slice(4, 11)`, so adding HEAD to
+        // the key would have printed seven characters of the COMMIT while labelling
+        // them `content:` -- and `requireBothRunsOnOneCacheKey` in the harness parses
+        // this exact line to prove two runs asked the same question, so a
+        // silently-wrong field there would have made that probe agree with itself.
+        const [, headHash = '', contentHash = ''] = cacheKey.split(':');
+        log(`\nWIP changes on ${headHash.slice(0, 7)} (content: ${contentHash.slice(0, 7)})`);
     }
     else {
         log(`\nCommit: ${cacheKey.slice(0, 7)}`);

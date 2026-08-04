@@ -51,8 +51,37 @@ export type BaselineCommit =
  */
 export declare function resolveBaselineCommit(): BaselineCommit;
 /**
- * Get the cache key for the current state
- * Returns commit hash for clean working tree, or wip:contentHash for uncommitted changes
+ * Get the cache key for the current state.
+ *
+ * A clean tree keys on the bare commit hash, and that must not change:
+ * `findBaselineEntry` resolves a baseline by looking up a commit hash directly.
+ *
+ * A dirty tree keys on `wip:<HEAD>:<contentHash>`. HEAD is in there because the
+ * content hash alone is a diff-shaped answer, and a diff is meaningless without
+ * the thing it is a diff FROM. `computeContentHash` hashes
+ * `git diff HEAD -- <codePathspecs>` plus untracked code, so:
+ *
+ *   - Two different commits with the same uncommitted edit hash the same. Rebase,
+ *     switch branch, `git commit --amend`, or check out an older revision with the
+ *     same one-line patch applied, and the stored verdict for a completely
+ *     different tree is served.
+ *   - A project whose code lies outside `codePathspecs` (`app/`, `lib/`, a
+ *     monorepo's per-package `src`) diffs to nothing, so the hash is sha256("") =
+ *     e3b0c442... for EVERY working-tree state. REPRODUCED: 53 tsc errors against
+ *     a ceiling of 3, served as `PASSED (cached)`, exit 0, content hash e3b0c44 on
+ *     both runs.
+ *
+ * Prefixing HEAD closes the first outright and reduces the second from "permanent"
+ * to "until you commit", which is the difference between a gate that never looks at
+ * your code again and one that goes stale within a commit. It is not the whole fix
+ * for the pathspec blind spot -- that is #40's remaining half, which has to
+ * classify what git reports rather than diffing a fixed set of paths -- but it is
+ * the layout-independent part, and it costs nothing.
+ *
+ * Old `wip:<64 hex>` keys cannot collide with new `wip:<40 hex>:<64 hex>` ones, so
+ * no stale entry is reachable under the new scheme and no schema bump is needed.
+ * That matters: a bump discards every entry, and see CacheEntry.monotonicEvaluated
+ * for what an empty cache used to do to a ratcheted project.
  */
 export declare function getCacheKey(): {
     key: string;

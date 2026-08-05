@@ -32,6 +32,32 @@ When these properties hold, an LLM agent iterating against quality gates exhibit
 npm install quality-gate-sgd
 ```
 
+### What it shells out to
+
+The gate measures by running other programs, so these have to be present. They are
+listed because a missing one is a *failed measurement*, not a silent zero — the gate
+will tell you, but it is cheaper to know first.
+
+| Needed | For | If absent |
+|-----|-----|-----|
+| `git` | the cache key and baseline resolution | the run refuses rather than guessing the tree state |
+| `npm` | `requiredScripts`, and the `type-check` script | that script reports `tool-missing` |
+| `npx eslint`, `tsc` | the eslint and typescript dimensions | those dimensions report a failure |
+| **`bash`** | **every custom dimension extractor** | **each one reports `tool-missing`** |
+| `curl` | SonarQube, and `init`'s LLM call | that dimension / that step fails |
+| `claude` CLI **or** `ANTHROPIC_API_KEY` | `init`'s threshold suggestion only | `init` falls back to built-in defaults |
+
+**`bash` specifically, not `sh`.** Custom extractors run as
+`bash -c 'set -o pipefail; <your command>'`, and `pipefail` is not optional: without
+it, `broken-tool | wc -l` exits **0** and prints `0`, so a `lower-better` dimension
+gated by a ceiling reports a perfect score for a tool that never ran. That is the
+exact failure this gate exists to prevent, so a POSIX `sh` fallback would be trading
+the tool's whole purpose for portability. On a machine without bash the dimension
+fails loudly instead.
+
+Every extractor failure reports a command you can paste into your own shell to get
+the same run, including the working directory and the pipefail prefix.
+
 ## Quick Start
 
 ### 1. Create Rules Configuration

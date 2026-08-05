@@ -394,6 +394,34 @@ const EXTRACTOR_SHELL = 'bash';
 const PIPEFAIL_PREFIX = 'set -o pipefail; ';
 
 /**
+ * A string a human can paste into their own shell to get the same run.
+ *
+ * `MeasurementEvidenceBase.command` promises "the measurement as invoked, for
+ * reproduction", and for this dimension it was neither: it carried
+ * `extractor.command` verbatim, without the `set -o pipefail;` prefix and without the
+ * directory. Both change the answer. Pipefail is why a broken pipeline stage is a
+ * failure at all, and the working directory became load-bearing when extractors
+ * stopped inheriting the caller's cwd (#26) -- so an adopter running the reported
+ * command from their own shell could get a DIFFERENT result from the one the gate
+ * reported, which is worse than no reproduction line, because it looks like the gate
+ * was wrong.
+ *
+ * Single-quoted with `'` closed, escaped and reopened (`'\''`), which is the one
+ * quoting that survives arbitrary content in `sh` and `bash` -- no expansion happens
+ * inside single quotes, so nothing in a user's command can escape it. Verified to
+ * round-trip through `bash -c`.
+ */
+function shellQuote(value: string): string {
+  return `'${value.split("'").join(`'\\''`)}'`;
+}
+
+function reproductionCommand(command: string, projectRoot: string): string {
+  return `cd ${shellQuote(projectRoot)} && ${EXTRACTOR_SHELL} -c ${shellQuote(
+    `${PIPEFAIL_PREFIX}${command}`
+  )}`;
+}
+
+/**
  * A custom extractor is an arbitrary user command, so only a clean exit can be
  * assumed to mean it worked. Overridable per extractor -- see
  * `ScriptExtractor.successExitCodes`.
@@ -453,6 +481,11 @@ export function extractCustomMetric(
   const maxBufferBytes = DEFAULT_MEASUREMENT_LIMITS.maxBufferBytes;
   const dimension = dimensionOf(config);
 
+  // Built once, and used for EVERY failure this function can return: the evidence
+  // `command` is a reproduction instruction, so all of them have to be the same
+  // instruction. See reproductionCommand.
+  const reproduce = reproductionCommand(extractor.command, projectRoot);
+
   const startedAt = Date.now();
   // `shell: true` reproduces execSync's semantics, which the documented
   // examples depend on -- `grep -r ... | wc -l` is a pipeline, not a program.
@@ -508,7 +541,7 @@ export function extractCustomMetric(
           `${projectRoot}. Custom extractors run in the project root, so that they ` +
           'measure the same tree every other dimension does' +
           `${process.env.QUALITY_PROJECT_ROOT ? ' (QUALITY_PROJECT_ROOT is set -- check it)' : ''}.`,
-        buildEvidence(spawn, extractor.command, elapsedMs)
+        buildEvidence(spawn, reproduce, elapsedMs)
       )
     );
   }
@@ -532,13 +565,13 @@ export function extractCustomMetric(
           `${EXTRACTOR_SHELL} is required because a plain POSIX shell cannot report a failing ` +
           'stage of a pipeline, and reading that as a successful measurement is the defect this ' +
           'whole path exists to prevent.',
-        buildEvidence(spawn, extractor.command, elapsedMs)
+        buildEvidence(spawn, reproduce, elapsedMs)
       )
     );
   }
 
   const classified = classifyProcessOutput(spawn, {
-    command: extractor.command,
+    command: reproduce,
     dimension,
     elapsedMs,
     timeoutMs,
@@ -555,9 +588,9 @@ export function extractCustomMetric(
     measurementFailure(
       'unparseable-output',
       dimension,
-      `\`${extractor.command}\` ran, but its output could not be read as a value for ` +
-        `${config.path}: ${parsed.error}`,
-      buildEvidence(spawn, extractor.command, elapsedMs)
+      `the extractor ran, but its output could not be read as a value for ` +
+        `${config.path}: ${parsed.error}. Re-run it with: ${reproduce}`,
+      buildEvidence(spawn, reproduce, elapsedMs)
     )
   );
 }

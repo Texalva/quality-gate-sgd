@@ -262,9 +262,29 @@ export const customDimensions = [
   // path is tested via the readFileSync fallback which covers the main logic.
 })
 
+/**
+ * A directory that really exists, passed as the extractor's working root.
+ *
+ * `extractCustomMetric` takes the root as a REQUIRED parameter (#26) -- custom
+ * extractors used to inherit the CLI's cwd while every other dimension was measured
+ * against `config.projectRoot`, so one reading could describe two different trees.
+ * It has to exist here because a non-existent root is now its own reported failure,
+ * which would otherwise mask every case below. These tests stub `spawnSync`, so
+ * nothing is actually executed in it.
+ */
+const EXTRACTOR_ROOT = process.cwd()
+
 describe('extractCustomMetric', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    // `fs` is mocked in this file, so `existsSync` answers false for everything
+    // unless told otherwise -- including for EXTRACTOR_ROOT. That matters: a spawn
+    // ENOENT is reported as a missing WORKING DIRECTORY rather than a missing
+    // command when the root does not exist, and those two need different advice
+    // (Node gives the same `code: 'ENOENT'` for both, so the stat is the only thing
+    // that tells them apart). Without this the tool-missing case below is reported
+    // as a bad cwd.
+    vi.mocked(fs.existsSync).mockReturnValue(true)
   })
 
   const baseConfig: CustomDimensionConfig = {
@@ -282,25 +302,25 @@ describe('extractCustomMetric', () => {
     it('extracts number from simple output', async () => {
       await mockExtractor({ stdout: '42\n' })
 
-      expect(readingOf(extractCustomMetric(baseConfig))).toBe(42)
+      expect(readingOf(extractCustomMetric(baseConfig, EXTRACTOR_ROOT))).toBe(42)
     })
 
     it('extracts first number from text output', async () => {
       await mockExtractor({ stdout: 'Found 15 issues in 3 files\n' })
 
-      expect(readingOf(extractCustomMetric(baseConfig))).toBe(15)
+      expect(readingOf(extractCustomMetric(baseConfig, EXTRACTOR_ROOT))).toBe(15)
     })
 
     it('handles decimal numbers', async () => {
       await mockExtractor({ stdout: 'Average: 3.14159\n' })
 
-      expect(readingOf(extractCustomMetric(baseConfig))).toBe(3.14159)
+      expect(readingOf(extractCustomMetric(baseConfig, EXTRACTOR_ROOT))).toBe(3.14159)
     })
 
     it('handles negative numbers', async () => {
       await mockExtractor({ stdout: 'Delta: -5.5\n' })
 
-      expect(readingOf(extractCustomMetric(baseConfig))).toBe(-5.5)
+      expect(readingOf(extractCustomMetric(baseConfig, EXTRACTOR_ROOT))).toBe(-5.5)
     })
 
     it('reads a genuine zero as a zero', async () => {
@@ -308,7 +328,7 @@ describe('extractCustomMetric', () => {
       // every broken run below, all of which used to produce exactly this.
       await mockExtractor({ stdout: '0\n' })
 
-      expect(readingOf(extractCustomMetric(baseConfig))).toBe(0)
+      expect(readingOf(extractCustomMetric(baseConfig, EXTRACTOR_ROOT))).toBe(0)
     })
 
     it('extracts value from JSON output with jsonPath', async () => {
@@ -324,7 +344,7 @@ describe('extractCustomMetric', () => {
         },
       }
 
-      expect(readingOf(extractCustomMetric(config))).toBe(25)
+      expect(readingOf(extractCustomMetric(config, EXTRACTOR_ROOT))).toBe(25)
     })
 
     it('extracts value using jsonPath without $ prefix', async () => {
@@ -340,7 +360,7 @@ describe('extractCustomMetric', () => {
         },
       }
 
-      expect(readingOf(extractCustomMetric(config))).toBe(100)
+      expect(readingOf(extractCustomMetric(config, EXTRACTOR_ROOT))).toBe(100)
     })
 
     it('extracts value from JSON array using index', async () => {
@@ -356,7 +376,7 @@ describe('extractCustomMetric', () => {
         },
       }
 
-      expect(readingOf(extractCustomMetric(config))).toBe(20)
+      expect(readingOf(extractCustomMetric(config, EXTRACTOR_ROOT))).toBe(20)
     })
 
     it('returns numeric JSON value when no jsonPath', async () => {
@@ -367,7 +387,7 @@ describe('extractCustomMetric', () => {
         extractor: { type: 'script', command: 'echo 42', parseOutput: 'json' },
       }
 
-      expect(readingOf(extractCustomMetric(config))).toBe(42)
+      expect(readingOf(extractCustomMetric(config, EXTRACTOR_ROOT))).toBe(42)
     })
 
     it('parses a fully-numeric string value from jsonPath', async () => {
@@ -383,7 +403,7 @@ describe('extractCustomMetric', () => {
         },
       }
 
-      expect(readingOf(extractCustomMetric(config))).toBe(123.5)
+      expect(readingOf(extractCustomMetric(config, EXTRACTOR_ROOT))).toBe(123.5)
     })
 
     it('extracts value using regex with capture group', async () => {
@@ -399,7 +419,60 @@ describe('extractCustomMetric', () => {
         },
       }
 
-      expect(readingOf(extractCustomMetric(config))).toBe(7.5)
+      expect(readingOf(extractCustomMetric(config, EXTRACTOR_ROOT))).toBe(7.5)
+    })
+  })
+
+  // #26. Every other dimension is measured against `config.projectRoot`; custom
+  // extractors inherited whatever directory the CLI was invoked from, so two
+  // dimensions in one reading could describe two different trees.
+  describe('the working directory', () => {
+    it('runs the extractor in the root it was given', async () => {
+      await mockExtractor({ stdout: '42\n' })
+
+      extractCustomMetric(baseConfig, '/some/project')
+
+      const { spawnSync } = await import('child_process')
+      expect(vi.mocked(spawnSync).mock.calls[0][1]).toMatchObject({ cwd: '/some/project' })
+    })
+
+    // The dangerous case is NOT the crash. An extractor whose paths are missing in
+    // the wrong tree fails loudly, and a failed extractor is already a
+    // MeasurementFailure. The silent one is an extractor whose paths exist in BOTH
+    // trees -- `find . -name "*.ts" | wc -l` returns a bigger number from a
+    // repository root than from a package root, and a ceiling calibrated against the
+    // package then fails with nothing anywhere saying why. That is what pinning the
+    // cwd prevents, and it is only observable as the argument above.
+    it('reports a root that does not exist as a working-directory problem', async () => {
+      const enoent = Object.assign(new Error('spawnSync ENOENT'), { code: 'ENOENT' })
+      await mockExtractor({ status: null, error: enoent })
+      vi.mocked(fs.existsSync).mockReturnValue(false)
+
+      const result = extractCustomMetric(baseConfig, '/nope')
+
+      expect(result.ok).toBe(false)
+      if (result.ok) return
+      expect(result.error.kind).toBe('crashed')
+      expect(result.error.message).toContain('working directory does not exist')
+      expect(result.error.message).toContain('/nope')
+      // NOT the tool-missing message: Node reports the same `code: 'ENOENT'` for a
+      // missing shell and a missing cwd, so without the stat this would blame a
+      // command that is perfectly fine.
+      expect(result.error.message).not.toContain('could not be found')
+    })
+
+    // The discriminator has to work in both directions, or the case above is
+    // satisfiable by reporting every ENOENT as a bad cwd.
+    it('still reports a missing command when the root does exist', async () => {
+      const enoent = Object.assign(new Error('spawnSync ENOENT'), { code: 'ENOENT' })
+      await mockExtractor({ status: null, error: enoent })
+      vi.mocked(fs.existsSync).mockReturnValue(true)
+
+      const result = extractCustomMetric(baseConfig, EXTRACTOR_ROOT)
+
+      expect(result.ok).toBe(false)
+      if (result.ok) return
+      expect(result.error.message).not.toContain('working directory does not exist')
     })
   })
 
@@ -408,7 +481,7 @@ describe('extractCustomMetric', () => {
       const enoent = Object.assign(new Error('spawnSync ENOENT'), { code: 'ENOENT' })
       await mockExtractor({ status: null, error: enoent })
 
-      const result = extractCustomMetric(baseConfig)
+      const result = extractCustomMetric(baseConfig, EXTRACTOR_ROOT)
 
       expect(result.ok).toBe(false)
       if (result.ok) return
@@ -420,7 +493,7 @@ describe('extractCustomMetric', () => {
       // ceilings, so the harder the extractor failed the better the score.
       await mockExtractor({ status: 1, stderr: 'command not found: complexity-tool\n' })
 
-      const result = extractCustomMetric(baseConfig)
+      const result = extractCustomMetric(baseConfig, EXTRACTOR_ROOT)
 
       expect(result.ok).toBe(false)
       if (result.ok) return
@@ -442,7 +515,7 @@ describe('extractCustomMetric', () => {
         },
       }
 
-      expect(readingOf(extractCustomMetric(config))).toBe(0)
+      expect(readingOf(extractCustomMetric(config, EXTRACTOR_ROOT))).toBe(0)
     })
 
     it('still rejects an exit code outside the declared set', async () => {
@@ -457,7 +530,7 @@ describe('extractCustomMetric', () => {
         },
       }
 
-      const result = extractCustomMetric(config)
+      const result = extractCustomMetric(config, EXTRACTOR_ROOT)
 
       expect(result.ok).toBe(false)
       if (result.ok) return
@@ -472,7 +545,7 @@ describe('extractCustomMetric', () => {
       // killed extractor cannot come back as a reading.
       await mockExtractor({ status: null, signal: 'SIGTERM' })
 
-      const result = extractCustomMetric(baseConfig)
+      const result = extractCustomMetric(baseConfig, EXTRACTOR_ROOT)
 
       expect(result.ok).toBe(false)
       if (result.ok) return
@@ -483,7 +556,7 @@ describe('extractCustomMetric', () => {
       const enobufs = Object.assign(new Error('spawnSync ENOBUFS'), { code: 'ENOBUFS' })
       await mockExtractor({ status: null, stdout: '123', error: enobufs })
 
-      const result = extractCustomMetric(baseConfig)
+      const result = extractCustomMetric(baseConfig, EXTRACTOR_ROOT)
 
       expect(result.ok).toBe(false)
       if (result.ok) return
@@ -494,7 +567,7 @@ describe('extractCustomMetric', () => {
       await mockExtractor({ status: 1 })
 
       const config: CustomDimensionConfig = { ...baseConfig, path: 'custom.anyCount' }
-      const result = extractCustomMetric(config)
+      const result = extractCustomMetric(config, EXTRACTOR_ROOT)
 
       expect(result.ok).toBe(false)
       if (result.ok) return
@@ -504,7 +577,7 @@ describe('extractCustomMetric', () => {
 
   describe('the run succeeded but its output cannot be read', () => {
     async function expectUnparseable(config: CustomDimensionConfig) {
-      const result = extractCustomMetric(config)
+      const result = extractCustomMetric(config, EXTRACTOR_ROOT)
 
       expect(result.ok).toBe(false)
       if (result.ok) return undefined
@@ -754,7 +827,7 @@ describe('extractCustomMetric', () => {
         extractor: { type: 'script', command: 'slow-command', timeout: 60000 },
       }
 
-      extractCustomMetric(config)
+      extractCustomMetric(config, EXTRACTOR_ROOT)
 
       expect(spawnSync).toHaveBeenCalledWith(
         expect.stringContaining('slow-command'),
@@ -768,7 +841,7 @@ describe('extractCustomMetric', () => {
       await mockExtractor({ stdout: '42\n' })
       const { spawnSync } = await import('child_process')
 
-      extractCustomMetric(baseConfig)
+      extractCustomMetric(baseConfig, EXTRACTOR_ROOT)
 
       expect(spawnSync).toHaveBeenCalledWith(
         expect.any(String),
@@ -784,7 +857,7 @@ describe('extractCustomMetric', () => {
       await mockExtractor({ stdout: '42\n' })
       const { spawnSync } = await import('child_process')
 
-      extractCustomMetric(baseConfig)
+      extractCustomMetric(baseConfig, EXTRACTOR_ROOT)
 
       expect(spawnSync).toHaveBeenCalledWith(
         'set -o pipefail; echo 42',
@@ -952,7 +1025,7 @@ describe('extractAllCustomMetrics', () => {
       .mockReturnValueOnce(finished('10\n'))
       .mockReturnValueOnce(finished('20\n'))
 
-    const result = extractAllCustomMetrics(CONFIGS)
+    const result = extractAllCustomMetrics(CONFIGS, EXTRACTOR_ROOT)
 
     expect(result.metrics).toEqual({ metricA: 10, metricB: 20 })
     expect(result.failures).toEqual([])
@@ -968,7 +1041,7 @@ describe('extractAllCustomMetrics', () => {
         pid: 2, output: [], stdout: '20\n', stderr: '', status: 0, signal: null,
       } as SpawnSyncReturns<string>)
 
-    const result = extractAllCustomMetrics(CONFIGS)
+    const result = extractAllCustomMetrics(CONFIGS, EXTRACTOR_ROOT)
 
     // Absent, NOT zero. Zero would satisfy a `custom.metricA` ceiling.
     expect(result.metrics).toEqual({ metricB: 20 })
@@ -978,7 +1051,7 @@ describe('extractAllCustomMetrics', () => {
   })
 
   it('returns empty object for empty configs', () => {
-    const result = extractAllCustomMetrics([])
+    const result = extractAllCustomMetrics([], EXTRACTOR_ROOT)
 
     expect(result.metrics).toEqual({})
     expect(result.failures).toEqual([])

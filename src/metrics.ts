@@ -699,7 +699,13 @@ export function extractAllMetrics(
   let custom: Record<string, number> | undefined;
   const customFailures: MeasurementFailure[] = [];
   if (!skipCustomDimensions && options.customDimensions && options.customDimensions.length > 0) {
-    const reading = extractAllCustomMetrics(options.customDimensions);
+    // `getConfig().projectRoot`, the same root every other dimension is measured
+    // against. Custom extractors used to inherit the CLI's cwd, so one reading could
+    // describe two different trees -- see extractCustomMetric.
+    const reading = extractAllCustomMetrics(
+      options.customDimensions,
+      getConfig().projectRoot
+    );
     custom = reading.metrics;
     customFailures.push(...reading.failures);
   }

@@ -25,6 +25,19 @@
  *   }
  * ];
  * ```
+ *
+ * WHERE THEY RUN. In the project root -- `config.projectRoot`, the same directory
+ * every other dimension is measured against -- and not in whatever directory the CLI
+ * was invoked from. So a relative path in a command (`src/`, `./marker.txt`) resolves
+ * against the project, and the reading does not change with the caller's shell.
+ *
+ * If an extractor was written against the old behaviour, the failure to look for is
+ * not a crash. A command whose paths are missing in the project root fails loudly, and
+ * a failed extractor is a reported measurement failure. The quiet one is a command
+ * whose paths exist in BOTH trees: `find . -name "*.ts" | wc -l` counts more files
+ * from a repository root than from a package root, so a ceiling calibrated against one
+ * number is now graded against another with nothing to say why. Prefer paths anchored
+ * inside the project to `..` or to absolute paths outside it.
  */
 import type { MeasurementFailure, Result } from '../providers/types.js';
 import { type DimensionDirection, type DimensionContinuity } from './registry.js';
@@ -107,7 +120,7 @@ export declare function loadCustomDimensions(basePath?: string): Promise<CustomD
  *
  * @param config - Custom dimension config
  */
-export declare function extractCustomMetric(config: CustomDimensionConfig): Result<number, MeasurementFailure>;
+export declare function extractCustomMetric(config: CustomDimensionConfig, projectRoot: string): Result<number, MeasurementFailure>;
 /**
  * Register all custom dimensions from config.
  * Should be called early in the CLI lifecycle.
@@ -135,6 +148,7 @@ export interface CustomMetricsReading {
  * useful than one that stops at the first failure.
  *
  * @param configs - Custom dimension configs (from loadCustomDimensions)
+ * @param projectRoot - The directory the extractors run in. See extractCustomMetric.
  */
-export declare function extractAllCustomMetrics(configs: readonly CustomDimensionConfig[]): CustomMetricsReading;
+export declare function extractAllCustomMetrics(configs: readonly CustomDimensionConfig[], projectRoot: string): CustomMetricsReading;
 //# sourceMappingURL=custom.d.ts.map

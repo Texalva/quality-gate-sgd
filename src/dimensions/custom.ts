@@ -25,6 +25,19 @@
  *   }
  * ];
  * ```
+ *
+ * WHERE THEY RUN. In the project root -- `config.projectRoot`, the same directory
+ * every other dimension is measured against -- and not in whatever directory the CLI
+ * was invoked from. So a relative path in a command (`src/`, `./marker.txt`) resolves
+ * against the project, and the reading does not change with the caller's shell.
+ *
+ * If an extractor was written against the old behaviour, the failure to look for is
+ * not a crash. A command whose paths are missing in the project root fails loudly, and
+ * a failed extractor is a reported measurement failure. The quiet one is a command
+ * whose paths exist in BOTH trees: `find . -name "*.ts" | wc -l` counts more files
+ * from a repository root than from a package root, so a ceiling calibrated against one
+ * number is now graded against another with nothing to say why. Prefer paths anchored
+ * inside the project to `..` or to absolute paths outside it.
  */
 
 import { spawnSync } from 'child_process';
@@ -422,7 +435,18 @@ function dimensionOf(config: CustomDimensionConfig): MeasurementDimension {
  * @param config - Custom dimension config
  */
 export function extractCustomMetric(
-  config: CustomDimensionConfig
+  config: CustomDimensionConfig,
+  // The directory to run the extractor IN. Required rather than defaulted, because a
+  // default is what the defect was: the command inherited whatever directory the CLI
+  // was invoked from, so `wc -l < marker.txt` measured a different tree depending on
+  // where the adopter happened to be standing. Every other dimension is measured
+  // against `config.projectRoot`, and a reading that silently depends on the caller's
+  // shell is not comparable with the ones that do not.
+  //
+  // A parameter rather than a `getConfig()` call inside, matching how the other
+  // providers take a MeasurementContext: this is a public export and a library caller
+  // may be measuring a directory that is not the singleton's project root.
+  projectRoot: string
 ): Result<number, MeasurementFailure> {
   const extractor = config.extractor;
   const timeoutMs = extractor.timeout ?? DEFAULT_EXTRACTOR_TIMEOUT_MS;
@@ -438,14 +462,20 @@ export function extractCustomMetric(
   // timeout kill, buffer overflow -- as one indistinguishable throw, and the
   // catch that used to receive it could do nothing better than guess.
   //
-  // No `cwd`, which is preserved from execSync rather than endorsed: eslint and
-  // tsc are measured against `config.projectRoot` and custom extractors are
-  // measured against whatever directory the CLI happened to be invoked from, so
-  // the two can describe different trees. Left alone here because correcting it
-  // changes readings rather than failure handling, and it wants its own change.
-  // It is at least no longer silent: an extractor run in the wrong directory
-  // usually cannot find its inputs, which is now a reported failure.
+  // `cwd`, which used to be absent -- preserved from execSync rather than endorsed.
+  // eslint and tsc are measured against `config.projectRoot` while custom extractors
+  // were measured against whatever directory the CLI was invoked from, so two
+  // dimensions in one reading could describe different trees.
+  //
+  // The failure mode that made this worth fixing is not the crash. An extractor whose
+  // paths do not exist in the CLI's directory fails loudly now (a failed extractor is
+  // a MeasurementFailure), and that is the easy case. The dangerous one is an
+  // extractor whose paths exist in BOTH trees: `find . -name "*.ts" | wc -l` run from
+  // a repository root instead of a package root returns a larger number, silently,
+  // and a ceiling calibrated against the package then fails for a reason nothing
+  // reports. Renumbering, not crashing, is the cost.
   const spawn = spawnSync(`${PIPEFAIL_PREFIX}${extractor.command}`, {
+    cwd: projectRoot,
     encoding: 'utf-8',
     timeout: timeoutMs,
     // execSync's default was 1 MiB, and overflow THROWS rather than truncating,
@@ -454,7 +484,34 @@ export function extractCustomMetric(
     shell: EXTRACTOR_SHELL,
     stdio: ['pipe', 'pipe', 'pipe'],
   });
+
   const elapsedMs = Date.now() - startedAt;
+
+  // A cwd that does not exist is an ENOENT from spawn with nothing to do with the
+  // command, and the generic classifier below reads ENOENT as "`<command>` could not
+  // be found" -- blaming a command that is fine and sending the reader off to debug
+  // the wrong thing. Same reasoning as the missing-shell case below it, and checked
+  // FIRST because it is the more specific claim.
+  //
+  // `QUALITY_PROJECT_ROOT` is named only when it is actually set: this function is a
+  // public export whose root is a parameter, so pointing a library caller at an
+  // environment variable they never used would be a false lead.
+  if (
+    (spawn.error as { code?: string } | undefined)?.code === 'ENOENT' &&
+    !existsSync(projectRoot)
+  ) {
+    return err(
+      measurementFailure(
+        'crashed',
+        dimension,
+        'the extractor could not be run because its working directory does not exist: ' +
+          `${projectRoot}. Custom extractors run in the project root, so that they ` +
+          'measure the same tree every other dimension does' +
+          `${process.env.QUALITY_PROJECT_ROOT ? ' (QUALITY_PROJECT_ROOT is set -- check it)' : ''}.`,
+        buildEvidence(spawn, extractor.command, elapsedMs)
+      )
+    );
+  }
 
   // A missing SHELL and a missing COMMAND both end the run, need different
   // advice, and are cleanly distinguishable -- measured:
@@ -707,15 +764,17 @@ export interface CustomMetricsReading {
  * useful than one that stops at the first failure.
  *
  * @param configs - Custom dimension configs (from loadCustomDimensions)
+ * @param projectRoot - The directory the extractors run in. See extractCustomMetric.
  */
 export function extractAllCustomMetrics(
-  configs: readonly CustomDimensionConfig[]
+  configs: readonly CustomDimensionConfig[],
+  projectRoot: string
 ): CustomMetricsReading {
   const metrics: Record<string, number> = {};
   const failures: MeasurementFailure[] = [];
 
   for (const config of configs) {
-    const reading = extractCustomMetric(config);
+    const reading = extractCustomMetric(config, projectRoot);
     if (reading.ok) {
       metrics[config.path.replace('custom.', '')] = reading.value;
     } else {

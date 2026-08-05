@@ -1241,8 +1241,17 @@ ${caseEnv}
     }));
   `;
 
-  // cwd matters for the custom extractors: their commands are relative to the
-  // project being measured, not to wherever this harness was invoked from.
+  // cwd was set here BECAUSE custom extractors inherited it, and their commands are
+  // relative to the project being measured. That is no longer why (#26): the
+  // extractors now run in `config.projectRoot`, which the script sets explicitly, so
+  // this no longer decides where they look. It stays because the child is still a
+  // node process resolving `quality-gate.config.*` and running npm scripts for the
+  // subject, and pointing it at the tool's own directory would make those wrong.
+  //
+  // Worth stating because it removes a proof this file does NOT have: no case here
+  // runs the child from a directory other than the subject, so nothing in the harness
+  // would notice the cwd fix regressing. It is covered by
+  // tests/dimensions/custom.test.ts and by a direct probe recorded in the commit.
   const proc = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
     cwd: subjectDir,
     env: hermeticEnv(),

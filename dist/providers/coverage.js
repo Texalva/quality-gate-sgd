@@ -22,9 +22,12 @@
  *     `union` is recomputed from the per-file entries at full precision. They
  *     are genuinely different numbers (23.86 vs 23.869346733668344) and
  *     collapsing one into the other moves the baseline.
- *   - the coverage-final walk labels every issue `coverage.unit.*` even when the
- *     file it is reading is the LAMBDA report. That is pre-existing and
- *     preserved; changing it is a separate, reviewable step.
+ *   - the coverage-final walk used to label every issue `coverage.unit.*` even when
+ *     the file it was reading was the LAMBDA report. That was preserved through the
+ *     extraction as pre-existing and is now FIXED (#36): the walk takes the suite.
+ *     The apollo baseline cannot see the difference, and that is not luck -- apollo
+ *     ships no coverage-final.json, so all 279 of its findings come from the summary
+ *     path, which has always been suite-aware.
  *   - `mergeCoverageReports` does not apply `shouldSkipCoverageFile`, so it
  *     counts node_modules and test files that the issue extractor drops. Also
  *     pre-existing.
@@ -642,7 +645,15 @@ function extractCoverageIssuesFromSummary(data, dimensionPrefix) {
  * in `Object.entries` order, branches before functions -- which the frozen
  * baseline compares as a raw array.
  */
-function extractCoverageIssuesFromFinal(data) {
+function extractCoverageIssuesFromFinal(data, 
+// The suite this report belongs to. Was not a parameter, and every finding was
+// labelled `coverage.unit.*` no matter which report it came from -- so fix advice
+// for a lambda-suite finding claimed that covering it would move the UNIT
+// dimension. `extractCoverageIssuesFromSummary` has always taken this; only the
+// detail walk hardcoded it, which is why the frozen apollo baseline cannot see the
+// difference (apollo has no coverage-final.json, so all 279 of its findings come
+// from the summary path).
+suite) {
     const issues = [];
     const rejected = [];
     for (const [filePath, value] of Object.entries(data)) {
@@ -674,10 +685,10 @@ function extractCoverageIssuesFromFinal(data) {
                         endLine: loc.end.line,
                         endColumn: loc.end.column,
                         source: 'coverage',
-                        dimension: 'coverage.unit.branches',
+                        dimension: `${suite}.branches`,
                         code: `branch-${branch.type}`,
                         impact: {
-                            dimension: 'coverage.unit.branches',
+                            dimension: `${suite}.branches`,
                             delta: estimatedImpact / 100, // Fractional coverage gain
                             direction: 'higher-better',
                         },
@@ -699,10 +710,10 @@ function extractCoverageIssuesFromFinal(data) {
                     endColumn: fn.loc.end.column,
                     symbol: fn.name || `anonymous_${fnId}`,
                     source: 'coverage',
-                    dimension: 'coverage.unit.functions',
+                    dimension: `${suite}.functions`,
                     code: 'uncovered-function',
                     impact: {
-                        dimension: 'coverage.unit.functions',
+                        dimension: `${suite}.functions`,
                         delta: 0.5, // Rough estimate: covering a function helps
                         direction: 'higher-better',
                     },
@@ -869,7 +880,7 @@ export function createIstanbulCoverageProvider(paths, options = {}) {
                 // Findings from the entries that ARE readable are kept even when some
                 // entry is not, and the report is flagged rather than discarded. See
                 // asIstanbulFileCoverage for what discarding cost.
-                const walked = extractCoverageIssuesFromFinal(final.data);
+                const walked = extractCoverageIssuesFromFinal(final.data, final.suite);
                 if (walked.rejected.length > 0)
                     unexpectedShapes.add(final.attempt.path);
                 // A loop rather than `issues.push(...walked.issues)`, and the difference

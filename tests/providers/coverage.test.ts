@@ -626,6 +626,47 @@ describe('istanbul coverage provider', () => {
       expect(functions[0].symbol).toBe('classify');
     });
 
+    // #36. Every finding from the DETAIL report was labelled `coverage.unit.*`
+    // regardless of which report it came from, so fix advice for a lambda-suite
+    // finding claimed that covering it would move the UNIT dimension -- and
+    // `impact.dimension` is what the optimizer and `prioritize` read to decide what
+    // to work on. Untested until now, which is why the mislabelling survived the
+    // extraction: the frozen apollo baseline cannot see it either, because apollo
+    // ships no coverage-final.json and all of its findings come from the summary
+    // path, which has always been suite-aware.
+    //
+    // Both fields are asserted. `dimension` is the label a human reads and
+    // `impact.dimension` is the one the machinery reads; they were hardcoded
+    // separately, so fixing one and not the other is a live possibility.
+    it('labels detail-report findings with the suite the report came from', () => {
+      mockFiles({ [LAMBDA_FINAL]: FINAL_WITH_REAL_ISTANBUL_LOCATIONS });
+
+      const { issues } = measure();
+
+      expect(issues.length).toBeGreaterThan(0);
+      expect(issues.every((i) => i.dimension.startsWith('coverage.lambda.'))).toBe(true);
+      expect(issues.every((i) => i.impact.dimension.startsWith('coverage.lambda.'))).toBe(true);
+      // The suffix still identifies WHAT was uncovered.
+      expect(issues.filter((i) => i.code === 'branch-if')[0].dimension).toBe(
+        'coverage.lambda.branches'
+      );
+      expect(issues.filter((i) => i.code === 'uncovered-function')[0].dimension).toBe(
+        'coverage.lambda.functions'
+      );
+    });
+
+    // The control: the unit suite must be unchanged, or the case above is satisfiable
+    // by labelling everything `coverage.lambda.*`.
+    it('still labels unit-report findings with the unit suite', () => {
+      mockFiles({ [UNIT_FINAL]: FINAL_WITH_REAL_ISTANBUL_LOCATIONS });
+
+      const { issues } = measure();
+
+      expect(issues.length).toBeGreaterThan(0);
+      expect(issues.every((i) => i.dimension.startsWith('coverage.unit.'))).toBe(true);
+      expect(issues.every((i) => i.impact.dimension.startsWith('coverage.unit.'))).toBe(true);
+    });
+
     // The regression guard for the mistake above.
     it('tolerates istanbul\'s null columns and empty implicit-else locations', () => {
       mockFiles({ [UNIT_FINAL]: FINAL_WITH_REAL_ISTANBUL_LOCATIONS });

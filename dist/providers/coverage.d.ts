@@ -22,9 +22,12 @@
  *     `union` is recomputed from the per-file entries at full precision. They
  *     are genuinely different numbers (23.86 vs 23.869346733668344) and
  *     collapsing one into the other moves the baseline.
- *   - the coverage-final walk labels every issue `coverage.unit.*` even when the
- *     file it is reading is the LAMBDA report. That is pre-existing and
- *     preserved; changing it is a separate, reviewable step.
+ *   - the coverage-final walk used to label every issue `coverage.unit.*` even when
+ *     the file it was reading was the LAMBDA report. That was preserved through the
+ *     extraction as pre-existing and is now FIXED (#36): the walk takes the suite.
+ *     The apollo baseline cannot see the difference, and that is not luck -- apollo
+ *     ships no coverage-final.json, so all 279 of its findings come from the summary
+ *     path, which has always been suite-aware.
  *   - `mergeCoverageReports` does not apply `shouldSkipCoverageFile`, so it
  *     counts node_modules and test files that the issue extractor drops. Also
  *     pre-existing.

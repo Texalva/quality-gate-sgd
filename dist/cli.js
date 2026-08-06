@@ -20,6 +20,7 @@ extractAllMetricsAsync, describeUnmeasured, isSonarqubeAvailable, runSonarqubeSc
 import { loadRules, evaluateRules, isCacheValid, isMeasurementUnderRule, coverageAbsenceIsFailure, } from './rules.js';
 import { loadCache, saveCache, getCacheKey, getCacheEntry, setCacheEntry, createCacheEntry, findBaselineEntry, resolveBaselineCommit, pruneOldEntries, } from './cache.js';
 import { getConfig } from './config.js';
+import { assertSupportedLayout } from './layout.js';
 import { listIssues } from './list-issues.js';
 import { buildTrajectory, formatTrajectorySummary, trajectorySparkline, } from './trajectory.js';
 import { runInit } from './init.js';
@@ -126,6 +127,11 @@ async function runQualityGate(options = { skipSonarQube: false }) {
     // Load rules (zero-config mode will use embedded defaults if no rules.json)
     const rules = loadRules({ coverageOnly: options.skipSonarQube });
     log(`Rules: ${rules.version} - ${rules.description}`);
+    // Before anything is measured. An unsupported layout does not fail loudly on its
+    // own -- it measures a subset and reports it as the whole -- so the refusal has to
+    // come first, not after a run that produced numbers. See src/layout.ts.
+    const layoutConfig = getConfig();
+    assertSupportedLayout(layoutConfig.projectRoot, layoutConfig.codePathspecs);
     // Commit hash for a clean tree, `wip:<HEAD>:<contentHash>` for a dirty one.
     const { key: cacheKey, isWIP } = getCacheKey();
     if (isWIP) {
@@ -1596,7 +1602,10 @@ async function main() {
     }
 }
 main().catch((err) => {
-    console.error(`\nError: ${err}`);
+    // `${err}` on an Error already renders as "Error: <message>", so the old template
+    // printed "Error: Error: ..." for every thrown Error -- which is most of them, and
+    // all of the refusals that exist to be read carefully.
+    console.error(`\nError: ${err instanceof Error ? err.message : String(err)}`);
     process.exit(1);
 });
 //# sourceMappingURL=cli.js.map

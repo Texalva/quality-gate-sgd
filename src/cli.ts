@@ -43,6 +43,7 @@ import {
   pruneOldEntries,
 } from './cache.js';
 import { getConfig } from './config.js';
+import { assertSupportedLayout } from './layout.js';
 import { listIssues } from './list-issues.js';
 import {
   buildTrajectory,
@@ -232,6 +233,12 @@ async function runQualityGate(options: RunOptions = { skipSonarQube: false }): P
   // Load rules (zero-config mode will use embedded defaults if no rules.json)
   const rules = loadRules({ coverageOnly: options.skipSonarQube });
   log(`Rules: ${rules.version} - ${rules.description}`);
+
+  // Before anything is measured. An unsupported layout does not fail loudly on its
+  // own -- it measures a subset and reports it as the whole -- so the refusal has to
+  // come first, not after a run that produced numbers. See src/layout.ts.
+  const layoutConfig = getConfig();
+  assertSupportedLayout(layoutConfig.projectRoot, layoutConfig.codePathspecs);
 
   // Commit hash for a clean tree, `wip:<HEAD>:<contentHash>` for a dirty one.
   const { key: cacheKey, isWIP } = getCacheKey();
@@ -1931,7 +1938,10 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((err) => {
-  console.error(`\nError: ${err}`);
+main().catch((err: unknown) => {
+  // `${err}` on an Error already renders as "Error: <message>", so the old template
+  // printed "Error: Error: ..." for every thrown Error -- which is most of them, and
+  // all of the refusals that exist to be read carefully.
+  console.error(`\nError: ${err instanceof Error ? err.message : String(err)}`);
   process.exit(1);
 });

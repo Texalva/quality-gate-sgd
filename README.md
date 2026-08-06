@@ -32,6 +32,28 @@ When these properties hold, an LLM agent iterating against quality gates exhibit
 npm install quality-gate-sgd
 ```
 
+### Your code must live under `src/`
+
+This is a **hard requirement**, checked before anything is measured. If `src/` tracks
+no files, the gate refuses to run and exits 1 rather than grading a fraction of your
+project.
+
+It is a requirement because the assumption is load-bearing in several places at once:
+eslint lints `src/`, the SLOC counter walks `src/`, and the cache key is derived from
+`QUALITY_CODE_PATHSPECS` (default `src/,tests/,scripts/`). A project laid out
+differently did not fail — it measured a subset, or nothing, and the result still
+looked like a measurement. In the worst case the cache key stopped responding to edits
+entirely and a stored verdict was served for code the gate never looked at.
+
+Naming one directory is also how a project **declares what is subject to the ratchet**.
+A gate pointed at a whole repository grades vendored code, generated clients and build
+output, and the ratchet then moves for reasons nobody intended.
+
+What is deliberately *not* checked: that `src/` holds all of your code. Keep half your
+sources in `app/` and you get an honest reading of the half under `src/`. Detecting
+that means guessing what you meant, and a wrong guess is the same silent mis-scope in a
+different coat.
+
 ### What it shells out to
 
 The gate measures by running other programs, so these have to be present. They are

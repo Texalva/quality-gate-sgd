@@ -148,10 +148,36 @@ describe('cache module', () => {
   })
 
   describe('getCacheKey', () => {
+  /**
+   * Answers each git invocation by WHAT IT ASKS, not by call order.
+   *
+   * The order-based `mockReturnValueOnce` chains these replaced were brittle in two
+   * ways that both bit. Inserting one git call into `getCacheKey` silently shifted
+   * every subsequent answer -- so a test could keep passing while asserting on the
+   * wrong command's output. And an unconsumed queued value leaks into the next test,
+   * because `clearAllMocks` does not drain the once-queue; that is exactly how the
+   * ENOBUFS case below ended up asserting on an error from a different git call.
+   */
+  const mockGit = (answers: {
+    status?: string
+    head?: string
+    lsFiles?: string
+    diff?: string
+    others?: string
+  }) => {
+    mockExecSync.mockImplementation((cmd: unknown) => {
+      const command = String(cmd)
+      if (command.startsWith('git status')) return answers.status ?? ''
+      if (command.startsWith('git rev-parse')) return answers.head ?? 'abc123\n'
+      if (command.startsWith('git ls-files --others')) return answers.others ?? ''
+      if (command.startsWith('git ls-files')) return answers.lsFiles ?? 'src/file.ts\n'
+      if (command.startsWith('git diff')) return answers.diff ?? ''
+      throw new Error(`unstubbed git command: ${command}`)
+    })
+  }
+
     it('returns commit hash when no uncommitted changes', () => {
-      mockExecSync
-        .mockReturnValueOnce('') // git status --porcelain
-        .mockReturnValueOnce('abc123\n') // git rev-parse HEAD
+      mockGit({ status: '', head: 'abc123\n' })
 
       const result = getCacheKey()
 
@@ -161,11 +187,34 @@ describe('cache module', () => {
       })
     })
 
+    // #40's remaining form, and the reason this is a refusal rather than a fallback.
+    // `git diff HEAD -- <pathspecs>` over paths holding no tracked files is the empty
+    // string for EVERY working-tree state, so the key was sha256("") permanently and
+    // the stored verdict was served for arbitrarily different code. Reproduced end to
+    // end before the fix: 53 tsc errors against a ceiling of 3, `PASSED (cached)`,
+    // exit 0, content hash e3b0c44 on both runs.
+    //
+    // Checked with `git ls-files` rather than by looking for a directory: a `src/`
+    // holding only gitignored build output is the same blind spot with a directory in
+    // front of it.
+    it('refuses to key on a hash of nothing when the pathspecs track no files', () => {
+      mockGit({ status: 'M app/file.ts\n', lsFiles: '' })
+
+      expect(() => getCacheKey()).toThrow(/No tracked files match/)
+      // Names the knob, since the fix is either moving the code or setting this.
+      expect(() => getCacheKey()).toThrow(/QUALITY_CODE_PATHSPECS/)
+    })
+
+    // The control: a pathspec that DOES track files must still key normally, or the
+    // refusal above is satisfiable by refusing everything.
+    it('keys normally when the pathspecs track files', () => {
+      mockGit({ status: 'M src/file.ts\n', lsFiles: 'src/file.ts\n', diff: 'a diff' })
+
+      expect(getCacheKey().key).toMatch(/^wip:[0-9a-f]+:[0-9a-f]{64}$/)
+    })
+
     it('returns wip key when uncommitted changes exist', () => {
-      mockExecSync
-        .mockReturnValueOnce('M src/file.ts\n') // git status --porcelain
-        .mockReturnValueOnce('diff content') // git diff HEAD
-        .mockReturnValueOnce('') // git ls-files --others
+      mockGit({ status: 'M src/file.ts\n', diff: 'diff content' })
 
       const result = getCacheKey()
 
@@ -187,11 +236,11 @@ describe('cache module', () => {
     // does and what let this ship: that pattern holds just as well for the broken
     // format.
     it('anchors the wip key to HEAD, not to the diff alone', () => {
-      mockExecSync
-        .mockReturnValueOnce('M src/file.ts\n') // git status --porcelain
-        .mockReturnValueOnce('abc1234567890abc1234567890abc1234567890a\n') // git rev-parse HEAD
-        .mockReturnValueOnce('diff content') // git diff HEAD
-        .mockReturnValueOnce('') // git ls-files --others
+      mockGit({
+        status: 'M src/file.ts\n',
+        head: 'abc1234567890abc1234567890abc1234567890a\n',
+        diff: 'diff content',
+      })
 
       const [prefix, head, content] = getCacheKey().key.split(':')
 
@@ -205,11 +254,7 @@ describe('cache module', () => {
     // without it varying.
     it('gives two commits with the same diff different keys', () => {
       const keyFor = (head: string) => {
-        mockExecSync
-          .mockReturnValueOnce('M src/file.ts\n')
-          .mockReturnValueOnce(`${head}\n`)
-          .mockReturnValueOnce('the identical diff')
-          .mockReturnValueOnce('')
+        mockGit({ status: 'M src/file.ts\n', head: `${head}\n`, diff: 'the identical diff' })
         return getCacheKey().key
       }
 
@@ -263,9 +308,7 @@ describe('cache module', () => {
     })
 
     it('reads git status with a buffer far above the default', () => {
-      mockExecSync
-        .mockReturnValueOnce('') // git status --porcelain
-        .mockReturnValueOnce('abc123\n') // git rev-parse HEAD
+      mockGit({ status: '' })
 
       getCacheKey()
 
@@ -276,10 +319,7 @@ describe('cache module', () => {
     })
 
     it('includes untracked code files in content hash', () => {
-      mockExecSync
-        .mockReturnValueOnce('?? src/new.ts\n') // git status --porcelain
-        .mockReturnValueOnce('') // git diff HEAD
-        .mockReturnValueOnce('src/new.ts\n') // git ls-files --others
+      mockGit({ status: '?? src/new.ts\n', others: 'src/new.ts\n' })
 
       mockFs.existsSync.mockReturnValue(true)
       mockFs.statSync.mockReturnValue({ isFile: () => true } as fs.Stats)
@@ -292,10 +332,7 @@ describe('cache module', () => {
     })
 
     it('skips non-code untracked files', () => {
-      mockExecSync
-        .mockReturnValueOnce('?? docs/readme.md\n') // git status --porcelain
-        .mockReturnValueOnce('') // git diff HEAD
-        .mockReturnValueOnce('docs/readme.md\n') // git ls-files --others
+      mockGit({ status: '?? docs/readme.md\n', others: 'docs/readme.md\n' })
 
       const result = getCacheKey()
 

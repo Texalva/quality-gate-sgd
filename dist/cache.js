@@ -172,6 +172,38 @@ function isCodeFile(filePath) {
 function computeContentHash() {
     const config = getConfig();
     const codePathspec = getCodePathspec();
+    // A hash of nothing is not a cache key.
+    //
+    // `git diff HEAD -- <pathspecs>` over paths that hold no tracked files is the
+    // empty string for EVERY working-tree state, so the WIP key was
+    // sha256("") = e3b0c442... permanently and the stored verdict was served for
+    // arbitrarily different code until the commit changed. REPRODUCED before this:
+    // a tree with 53 tsc errors against a ceiling of 3 printed
+    // `✓ Quality gate PASSED (cached)` and exited 0, content hash e3b0c44 on both runs.
+    // Anchoring the key to HEAD bounded that to "until you commit"; this ends it.
+    //
+    // Checked against `git ls-files`, which asks the question that actually matters --
+    // does git TRACK anything under these paths -- rather than whether a directory
+    // exists. A `src/` holding only gitignored build output is the same blind spot
+    // with a directory in front of it.
+    //
+    // This is a refusal rather than a fallback because there is no honest fallback:
+    // hashing the whole tree would change what the cache means, and guessing the real
+    // layout is the same class of silent mis-scope. The project says where its code is
+    // (QUALITY_CODE_PATHSPECS, default `src/,tests/,scripts/`); if that is wrong, the
+    // answer is to say so, not to grade something else.
+    const tracked = execSync(`git ls-files ${codePathspec}`, {
+        cwd: config.projectRoot,
+        encoding: 'utf-8',
+        maxBuffer: GIT_MAX_BUFFER,
+    }).trim();
+    if (tracked.length === 0) {
+        throw new Error(`No tracked files match ${config.codePathspecs.join(', ')}, so there is nothing to ` +
+            'hash and the cache key would be the same constant for every state of the working ' +
+            'tree -- which serves a stored verdict for code that was never measured. This tool ' +
+            'measures code under `src/`; if yours lives elsewhere, set QUALITY_CODE_PATHSPECS to ' +
+            'the paths that hold it. Refusing to run rather than caching against a hash of nothing.');
+    }
     // Get diff of code file changes only (staged + unstaged vs HEAD)
     const trackedDiff = execSync(`git diff HEAD ${codePathspec}`, {
         cwd: config.projectRoot,

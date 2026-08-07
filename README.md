@@ -63,8 +63,8 @@ will tell you, but it is cheaper to know first.
 | Needed | For | If absent |
 |-----|-----|-----|
 | `git` | the cache key and baseline resolution | the run refuses rather than guessing the tree state |
-| `npm` | `requiredScripts`, and the `type-check` script | that script reports `tool-missing` |
-| `npx eslint`, `tsc` | the eslint and typescript dimensions | those dimensions report a failure |
+| `npm` **or** `bun` | `requiredScripts`, and the `type-check` script | that script reports `tool-missing` |
+| `npx`/`bunx` `eslint`, `tsc` | the eslint and typescript dimensions | those dimensions report a failure |
 | **`bash`** | **every custom dimension extractor** | **each one reports `tool-missing`** |
 | `curl` | SonarQube, and `init`'s LLM call | that dimension / that step fails |
 | `claude` CLI **or** `ANTHROPIC_API_KEY` | `init`'s threshold suggestion only | `init` falls back to built-in defaults |
@@ -79,6 +79,53 @@ fails loudly instead.
 
 Every extractor failure reports a command you can paste into your own shell to get
 the same run, including the working directory and the pipefail prefix.
+
+### npm and bun
+
+The runner is detected, not configured, and the gate prints which one it chose and
+why on every run:
+
+```
+Runner: bun (bun.lock present)
+```
+
+Detection order, most explicit first — an override, then a declaration, then
+evidence on disk:
+
+| Signal | Result |
+|-----|-----|
+| `QUALITY_PACKAGE_MANAGER=npm\|bun` | that one; any other value is refused, not silently replaced with npm |
+| `"packageManager": "bun@1.3.14"` in package.json | that one (pnpm and yarn fall through to the npm path) |
+| `bun.lock` or `bun.lockb` | bun |
+| `package-lock.json` | npm |
+| `bunfig.toml` | bun |
+| none of the above | npm |
+
+bun beats npm when **both** lockfiles are present: a `package-lock.json` left behind
+by a migration to bun is common, while a `bun.lock` only appears if someone ran bun.
+A lockfile beats `bunfig.toml`, because config outlives the choice it configured.
+
+Getting this wrong is safe in the one way that matters here — a wrong runner means a
+missing script or a missing binary, which is a *reported measurement failure*, never a
+zero. The `tool-missing` diagnosis names the detection reason so the confusion is
+short-lived.
+
+**Coverage on bun: run vitest, not `bun test`.** The gate reads an istanbul
+`coverage-summary.json`, and `bun run` driving vitest with `@vitest/coverage-istanbul`
+produces exactly that, branch data included — measured against a subject whose
+hand-derived ground truth is 25% statements / 40% branches / 14.28% functions / 21.42%
+lines, read identically under npm and bun.
+
+`bun test --coverage` does **not** work for this, and the reason is worth stating
+because it is not a limitation the gate can paper over: as of bun 1.3.14 its only
+coverage reporters are `text` and `lcov` (every istanbul-style reporter is rejected
+outright), and its lcov contains **zero `BRDA`/`BRF`/`BRH` records**. There is no
+branch data to read, and lcov has no statement data either — only lines and functions.
+So `coverage.unit.branches` and `coverage.unit.statements` are not merely
+low-fidelity under bun's own runner, they are *absent*, and a ratchet on an absent
+metric is the vacuous pass this tool exists to prevent. Supporting `bun test` properly
+means teaching the rules layer that a dimension can be unmeasurable-by-toolchain,
+which is not built.
 
 ## Quick Start
 
@@ -209,6 +256,31 @@ coverage-writing script.
 
 Each suite has: `branches`, `statements`, `functions`, `lines`
 
+**What your project has to produce.** The gate does not run your tests to get these —
+it runs the script you named in `requiredScripts` and then reads a file. That file must
+be an **istanbul `coverage-summary.json`**, at `coverage/coverage-summary.json` unless
+`QUALITY_COVERAGE_UNIT_DIR` says otherwise. A reporter that writes only `lcov.info` or
+only a terminal table gives the gate nothing to read.
+
+| Test runner | Configuration that works |
+|-----|-----|
+| vitest | `@vitest/coverage-istanbul` or `@vitest/coverage-v8`, with `json-summary` in `coverage.reporter` |
+| jest | `--coverageReporters=json-summary` (jest bundles istanbul) |
+| `bun test` | **not supported for coverage** — see the bun section above |
+
+The `json-summary` reporter is the part people miss, and neither runner includes it by
+default. vitest 4.0.17's `coverageConfigDefaults.reporter` is
+`['text', 'html', 'clover', 'json']` — read out of the installed package, not inferred —
+and that `json` is `coverage-final.json`, a per-file detail report, **not** the summary.
+Jest documents a similarly summary-less default of `['clover', 'json', 'lcov', 'text']`.
+
+So `--coverage` alone leaves the gate with a `report-missing` failure. It will say so
+rather than reporting zero, but the run is not measured until you add the reporter. The
+coverage *provider* (`v8` or `istanbul`) does not matter for this; the reporter list does.
+
+Verify with `test -f coverage/coverage-summary.json` after your test script, not by
+looking at the terminal table — the table can be present while the file is not.
+
 ### SonarQube Metrics
 - `sonarqube.bugs`, `sonarqube.vulnerabilities`, `sonarqube.codeSmells`
 - `sonarqube.blocker`, `sonarqube.critical`, `sonarqube.major`, `sonarqube.minor`, `sonarqube.info`
@@ -305,6 +377,7 @@ console.log(prioritized[0].priority);  // Priority score
 | `QUALITY_COVERAGE_UNIT_DIR` | `coverage` | Directory holding the coverage summary |
 | `QUALITY_COVERAGE_SUMMARY_FILE` | `coverage-summary.json` | Summary filename within it |
 | `QUALITY_COVERAGE_REQUIRED` | `true` | Whether a missing coverage report is an error |
+| `QUALITY_PACKAGE_MANAGER` | Detected | Force `npm` or `bun`; any other value is refused |
 
 ### Projects with no coverage
 

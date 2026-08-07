@@ -1347,6 +1347,61 @@ describe('isCacheValid', () => {
     })
   })
 
+  // The cache key cannot catch a runner swap: it hashes tracked code under
+  // codePathspecs (src/, tests/, scripts/), and no lockfile is in it, so dropping a
+  // bun.lock into an npm project changes which toolchain measures and leaves the key
+  // untouched. Coverage is the concrete path -- a different test runner writes a
+  // different report, or none -- so the stored verdict would be served for numbers
+  // that toolchain never produced.
+  describe('an entry measured by a different package manager', () => {
+    const rules: QualityRules = {
+      version: '1.0.0',
+      rules: { floors: { 'coverage.unit.branches': 50 } },
+    }
+    const entryFrom = (packageManager: 'npm' | 'bun' | undefined): CacheEntry => ({
+      timestamp: Date.now(),
+      rulesHash: computeRulesHash(rules),
+      rulesVersion: '1.0.0',
+      metrics: { scripts: {}, coverage: { unit: { branches: 80 } } } as CacheEntry['metrics'],
+      evaluation: { status: 'pass', failedRules: [] },
+      ...(packageManager === undefined ? {} : { packageManager }),
+    })
+
+    afterEach(() => {
+      delete process.env.QUALITY_PACKAGE_MANAGER
+      resetConfig()
+    })
+
+    const runningUnder = (manager: 'npm' | 'bun') => {
+      process.env.QUALITY_PACKAGE_MANAGER = manager
+      resetConfig()
+    }
+
+    it('is refused', () => {
+      runningUnder('bun')
+      expect(isCacheValid(entryFrom('npm'), rules)).toBe(false)
+    })
+
+    it('is accepted when the manager matches', () => {
+      runningUnder('bun')
+      expect(isCacheValid(entryFrom('bun'), rules)).toBe(true)
+    })
+
+    // Absence means npm by INFERENCE, not by leniency: every entry written before
+    // this field existed came from a version with npm hardcoded at each spawn site,
+    // so npm is genuinely what measured it. That soundness is what lets the field be
+    // added without a schema bump.
+    it('treats an entry with no manager as npm, and refuses it under bun', () => {
+      runningUnder('bun')
+      expect(isCacheValid(entryFrom(undefined), rules)).toBe(false)
+    })
+
+    it('treats an entry with no manager as npm, and accepts it under npm', () => {
+      runningUnder('npm')
+      expect(isCacheValid(entryFrom(undefined), rules)).toBe(true)
+    })
+  })
+
   it('returns true when hashes match', () => {
     const rules: QualityRules = {
       version: '1.0.0',

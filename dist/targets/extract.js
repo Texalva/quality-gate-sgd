@@ -45,6 +45,8 @@ export function extractCoverageIssues(coverageDir) {
         projectRoot: config.projectRoot,
         timeoutMs: DEFAULT_MEASUREMENT_LIMITS.typecheckTimeoutMs,
         maxBufferBytes: DEFAULT_MEASUREMENT_LIMITS.maxBufferBytes,
+        packageManager: config.packageManager,
+        typecheckScript: config.typecheckScript,
     });
     if (!reading.ok) {
         console.error(`Warning: Could not parse coverage reports: ${reading.error.message}`);
@@ -96,6 +98,8 @@ export function extractTypescriptIssues() {
         projectRoot: config.projectRoot,
         timeoutMs: DEFAULT_MEASUREMENT_LIMITS.typecheckTimeoutMs,
         maxBufferBytes: DEFAULT_MEASUREMENT_LIMITS.maxBufferBytes,
+        packageManager: config.packageManager,
+        typecheckScript: config.typecheckScript,
     });
     // Still [] on failure, and still wrong for the same reason: a type-check that
     // never ran is indistinguishable here from a project with no type errors.
@@ -122,6 +126,8 @@ export function extractEslintIssues() {
         projectRoot: config.projectRoot,
         timeoutMs: DEFAULT_MEASUREMENT_LIMITS.lintTimeoutMs,
         maxBufferBytes: DEFAULT_MEASUREMENT_LIMITS.maxBufferBytes,
+        packageManager: config.packageManager,
+        typecheckScript: config.typecheckScript,
     });
     // See extractTypescriptIssues: advisory-only, so still [] on failure while
     // the gate verdict is protected through extractAllMetrics.

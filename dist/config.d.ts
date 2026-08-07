@@ -9,6 +9,7 @@
  * 2. Set environment variables or use defaults
  * 3. Create a rules.json with your project's thresholds
  */
+import type { RunnerSelection, TypecheckScriptSelection } from './runner.js';
 export interface QualityGateConfig {
     projectName: string;
     projectRoot: string;
@@ -41,6 +42,23 @@ export interface QualityGateConfig {
         file: string;
         maxAgeDays: number;
     };
+    /**
+     * Which package manager runs this project's scripts, and why that was chosen.
+     *
+     * Resolved once, here, so that every measurement and `init`'s calibration shell
+     * the same tool. Resolving it per call site is how the interview measures a
+     * project with one runner and the gate then grades it with another.
+     */
+    packageManager: RunnerSelection;
+    /**
+     * The package.json script the typescript dimension runs, and why that one.
+     *
+     * Resolved here for the same reason as the runner: the provider must not read
+     * package.json itself (a provider shelling `tsc` or `deno check` has no script to
+     * look up), and `init` has to agree with the gate about which script is the
+     * project's type-check.
+     */
+    typecheckScript: TypecheckScriptSelection;
     rulesFile: string;
     codePathspecs: string[];
     scriptTimeouts: Record<string, number>;

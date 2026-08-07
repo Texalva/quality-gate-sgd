@@ -37,10 +37,29 @@ vi.mock('child_process', () => ({
   execSync: vi.fn(),
 }))
 
+/**
+ * Only `manifestDefinesScript` is stubbed, and only because `fs` is mocked above:
+ * the runner reads package.json through the same `existsSync`/`readFileSync` these
+ * tests control for coverage reports, so every script would read as undefined and
+ * `runScript` would short-circuit to `fail` before spawning anything.
+ *
+ * Stubbed to TRUE, which is the premise of the tests below -- "the script exists,
+ * here is what running it does". The function's real behaviour is covered against real
+ * files in tests/runner.test.ts, including the bun `.bin` fall-through it exists for.
+ */
+vi.mock('../src/runner.js', async () => {
+  const actual = await vi.importActual<typeof import('../src/runner.js')>('../src/runner.js')
+  return { ...actual, manifestDefinesScript: vi.fn(() => true) }
+})
+
 // Mock config
 vi.mock('../src/config.js', () => ({
   getConfig: vi.fn(() => ({
     projectRoot: '/test/project',
+    // Every spawn-based measurement reads this; a mock without it makes the
+    // providers throw rather than measure.
+    packageManager: { manager: 'npm', reason: 'test fixture' },
+    typecheckScript: { script: 'type-check', reason: 'test fixture', definedInManifest: true },
     coverage: {
       unitDir: 'coverage',
       lambdaDir: 'coverage-lambda',
@@ -990,6 +1009,28 @@ describe('Script Execution', () => {
   })
 
   describe('runScript', () => {
+    /**
+     * The bun fall-through on the requiredScripts path.
+     *
+     * `bun run <name>` for a script package.json does not define executes a same-named
+     * `node_modules/.bin` binary and can exit 0 -- so a required script the project
+     * does not have would report `pass`, where npm exits 1 and reports `fail`.
+     * Reproduced against bun 1.3.14.
+     *
+     * `manifestDefinesScript` is stubbed true for the whole file (see the mock at the
+     * top, needed because `fs` is mocked), so this case has to override it explicitly.
+     * Without this test the guard has NO coverage: deleting it left all 96 tests in
+     * this file green, which is how a guard rots.
+     */
+    it('fails a script the manifest does not define, without spawning it', async () => {
+      const { spawnSync } = await import('child_process')
+      const { manifestDefinesScript } = await import('../src/runner.js')
+      vi.mocked(manifestDefinesScript).mockReturnValueOnce(false)
+
+      expect(runScript('type-check')).toBe('fail')
+      expect(vi.mocked(spawnSync)).not.toHaveBeenCalled()
+    })
+
     it('returns pass when script exits with 0', async () => {
       const { spawnSync } = await import('child_process')
       vi.mocked(spawnSync).mockReturnValue({

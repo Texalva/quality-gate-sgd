@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
+import { spawnSync } from 'child_process';
 import type { SpawnSyncReturns } from 'child_process';
 
 import { isErr, isOk } from '../../src/providers/result.js';
@@ -12,6 +13,8 @@ const CONTEXT: MeasurementContext = {
   projectRoot: '/test/project',
   timeoutMs: 60_000,
   maxBufferBytes: 1024,
+  packageManager: { manager: 'npm', reason: 'test fixture' },
+  typecheckScript: { script: 'type-check', reason: 'test fixture', definedInManifest: true },
 };
 
 async function mockTsc(overrides: Partial<SpawnSyncReturns<string>> = {}) {
@@ -31,6 +34,54 @@ const TWO_ERRORS = [
   "src/file.ts(10,5): error TS2345: Argument of type 'string' is not assignable.",
   "src/file.ts(15,3): error TS2339: Property 'foo' does not exist.",
 ].join('\n');
+
+/**
+ * The bun fall-through, refused before anything is spawned.
+ *
+ * `bun run <name>` for a script package.json does not define runs a same-named binary
+ * from node_modules/.bin instead. Reproduced against bun 1.3.14 with a `.bin/type-check`
+ * that printed nothing and exited 0, where npm exited 1. Exit 0 with empty output is
+ * exactly what a clean project looks like, so no check after the spawn can catch it --
+ * which is why the assertion below is that spawnSync was never CALLED.
+ */
+describe('a typecheck script the manifest does not define', () => {
+  const undefinedScript = {
+    ...CONTEXT,
+    typecheckScript: { script: 'type-check', reason: 'package.json defines none of type-check, typecheck', definedInManifest: false },
+  }
+
+  it('fails as tool-missing without spawning anything', () => {
+    const result = typescriptTypecheckProvider.measure(undefinedScript)
+
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.error.kind).toBe('tool-missing')
+    expect(vi.mocked(spawnSync)).not.toHaveBeenCalled()
+  })
+
+  it('does not report zero errors, which is what the fall-through produced', () => {
+    const result = typescriptTypecheckProvider.measure(undefinedScript)
+
+    // The defect: a successful exit-0 run of the wrong binary yielded {errors: 0}.
+    expect(result.ok).toBe(false)
+  })
+
+  it('names the script and how it was chosen, so the fix is obvious', () => {
+    const result = typescriptTypecheckProvider.measure(undefinedScript)
+
+    if (result.ok) throw new Error('expected a failure')
+    expect(result.error.message).toContain('type-check')
+    expect(result.error.message).toContain('QUALITY_TYPECHECK_SCRIPT')
+  })
+
+  // Evidence must not claim a process ran when none did.
+  it('reports read evidence rather than fabricated process evidence', () => {
+    const result = typescriptTypecheckProvider.measure(undefinedScript)
+
+    if (result.ok) throw new Error('expected a failure')
+    expect(result.error.evidence.via).toBe('report')
+  })
+})
 
 describe('typescriptTypecheckProvider', () => {
   beforeEach(() => {

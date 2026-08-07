@@ -25,9 +25,17 @@
  */
 
 import { spawnSync } from 'child_process';
+import path from 'path';
 
 import type { LocatedIssue } from '../targets/types.js';
 import type { TypescriptMetrics } from '../types.js';
+
+import {
+  MISSING_SCRIPT_PATTERN,
+  PACKAGE_MANAGER_ENV_VAR,
+  scriptCommand,
+  TYPECHECK_SCRIPT_ENV_VAR,
+} from '../runner.js';
 
 import { buildEvidence, classifyProcessOutput, err, measurementFailure, ok } from './result.js';
 import type {
@@ -46,9 +54,6 @@ interface TypeScriptError {
   message: string;
 }
 
-const SCRIPT_NAME = 'type-check';
-const TYPECHECK_ARGS = ['run', SCRIPT_NAME] as const;
-const COMMAND = `npm ${TYPECHECK_ARGS.join(' ')}`;
 
 /**
  * Exit codes that mean "the type-check ran"; anything else means it did not.
@@ -139,27 +144,54 @@ function toIssues(errors: TypeScriptError[]): LocatedIssue[] {
   }));
 }
 
-/**
- * npm's own wording when the script does not exist. Used only to LABEL a
- * failure that is already established -- never to decide whether one occurred.
- *
- * Reading package.json here instead would be more robust to npm's phrasing, and
- * was the first attempt, but it welds npm's script layout into a provider whose
- * entire purpose is to keep the toolchain swappable. A provider that shells
- * `tsc` directly, or `deno check`, has no script to look up.
- *
- * If npm rewords this, the failure degrades to `crashed` with npm's message
- * sitting in the evidence. A worse label, never a wrong verdict.
- */
-const NPM_MISSING_SCRIPT = /missing script/i;
-
 export const typescriptTypecheckProvider: TypecheckProvider = {
   name: 'tsc',
   dimension: 'typescript',
 
   measure(context: MeasurementContext): Result<TypecheckReading, MeasurementFailure> {
+    const { script, definedInManifest } = context.typecheckScript;
+    const command = scriptCommand(script, context.packageManager);
+
+    // Refused BEFORE spawning, and that ordering is the whole point. `bun run <name>`
+    // does not fail on a missing script -- it falls through to a same-named binary in
+    // node_modules/.bin, which for a `type-check` shim that prints nothing and exits 0
+    // yields a genuine exit 0 with genuine empty output. The corroboration check below
+    // cannot distinguish that from a clean project, because nothing about it is a
+    // failure at the process level; something really did run successfully. It just was
+    // not the project's type-check. Reproduced against bun 1.3.14.
+    if (!definedInManifest) {
+      return err(
+        measurementFailure(
+          'tool-missing',
+          'typescript',
+          `\`${command.display}\` was not run: package.json defines no \`${script}\` script, so ` +
+            'there is nothing to type-check with. A configuration failure, not a clean project. ' +
+            `That script was chosen because ${context.typecheckScript.reason} -- set ` +
+            `${TYPECHECK_SCRIPT_ENV_VAR} to name the right one.`,
+          // `via: 'report'` because this failure was established by READING the
+          // manifest, not by running anything -- there is no exit code or byte count
+          // to report, and claiming process evidence for a spawn that never happened
+          // would be a lie in the one field an investigator trusts.
+          {
+            via: 'report',
+            command: command.display,
+            elapsedMs: 0,
+            attempts: [
+              {
+                path: path.join(context.projectRoot, 'package.json'),
+                existed: definedInManifest,
+                bytesRead: null,
+                modifiedMs: null,
+                outcome: 'absent',
+              },
+            ],
+          }
+        )
+      );
+    }
+
     const startedAt = Date.now();
-    const spawn = spawnSync('npm', [...TYPECHECK_ARGS], {
+    const spawn = spawnSync(command.executable, [...command.args], {
       cwd: context.projectRoot,
       encoding: 'utf-8',
       shell: true,
@@ -169,7 +201,7 @@ export const typescriptTypecheckProvider: TypecheckProvider = {
     const elapsedMs = Date.now() - startedAt;
 
     const classified = classifyProcessOutput(spawn, {
-      command: COMMAND,
+      command: command.display,
       dimension: 'typescript',
       elapsedMs,
       timeoutMs: context.timeoutMs,
@@ -206,19 +238,22 @@ export const typescriptTypecheckProvider: TypecheckProvider = {
     // liveness probe re-runs the tool from outside for exactly this reason, and
     // that is where the check belongs.
     if (spawn.status !== 0 && diagnosticCount === 0) {
-      const missingScript = NPM_MISSING_SCRIPT.test(combined);
+      const missingScript = MISSING_SCRIPT_PATTERN.test(combined);
       return err(
         measurementFailure(
           missingScript ? 'tool-missing' : 'crashed',
           'typescript',
           missingScript
-            ? `\`${COMMAND}\` cannot run: no \`${SCRIPT_NAME}\` script is defined, so nothing was ` +
-              'type-checked. A configuration failure, not a clean project. (Apollo Client, the ' +
-              'subject that surfaced this, names its script `typecheck`.)'
-            : `\`${COMMAND}\` exited ${spawn.status} but emitted no TypeScript diagnostics at ` +
-              'all. Something other than a type error ended the run, and its output cannot be ' +
-              'read as a measurement of zero errors.',
-          buildEvidence(spawn, COMMAND, elapsedMs)
+            ? `\`${command.display}\` cannot run: no \`${script}\` script is defined, so nothing ` +
+              'was type-checked. A configuration failure, not a clean project. That script was ' +
+              `chosen because ${context.typecheckScript.reason} -- set ` +
+              `${TYPECHECK_SCRIPT_ENV_VAR} to name the right one. The runner was chosen because ` +
+              `${context.packageManager.reason}; if that is the wrong package manager for this ` +
+              `project, set ${PACKAGE_MANAGER_ENV_VAR}.`
+            : `\`${command.display}\` exited ${spawn.status} but emitted no TypeScript ` +
+              'diagnostics at all. Something other than a type error ended the run, and its ' +
+              'output cannot be read as a measurement of zero errors.',
+          buildEvidence(spawn, command.display, elapsedMs)
         )
       );
     }

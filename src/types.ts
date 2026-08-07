@@ -4,6 +4,7 @@
  */
 
 import type { MeasurementFailure } from './providers/types.js';
+import type { PackageManager } from './runner.js';
 
 // =============================================================================
 // Cache Schema
@@ -104,6 +105,23 @@ export interface CacheEntry {
    * which is what it meant when they were written.
    */
   monotonicEvaluated?: boolean;
+
+  /**
+   * Which package manager produced these numbers.
+   *
+   * The cache key is a hash of tracked code under `codePathspecs` (default
+   * `src/,tests/,scripts/`), which does NOT include lockfiles -- so adding a
+   * `bun.lock` to an npm project changes the runner, and can change the
+   * measurements, without moving the key by a single bit. The stored verdict would
+   * then be served for a toolchain that never produced it. Coverage is the
+   * concrete path: a different test runner produces a different report, or none.
+   *
+   * Absence means npm, and that is an inference rather than a default: entries
+   * written before this field existed came from versions with `npm` hardcoded at
+   * every spawn site, so npm is what they measured with. That is why adding this
+   * needs no schema bump -- no existing entry is ambiguous.
+   */
+  packageManager?: PackageManager;
 }
 
 export interface Metrics {

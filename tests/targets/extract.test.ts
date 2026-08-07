@@ -29,6 +29,10 @@ vi.mock('child_process', () => ({
 vi.mock('../../src/config.js', () => ({
   getConfig: vi.fn(() => ({
     projectRoot: '/test/project',
+    // Every spawn-based measurement reads this; a mock without it makes the
+    // providers throw rather than measure.
+    packageManager: { manager: 'npm', reason: 'test fixture' },
+    typecheckScript: { script: 'type-check', reason: 'test fixture', definedInManifest: true },
     coverage: {
       unitDir: 'coverage',
       lambdaDir: 'coverage-lambda',

@@ -11,6 +11,7 @@
  */
 import * as path from 'path';
 import * as fs from 'fs';
+import { detectPackageManager, detectTypecheckScript } from './runner.js';
 // =============================================================================
 // Default Configuration
 // =============================================================================
@@ -96,6 +97,8 @@ export function loadConfig() {
                 path.join(projectRoot, '.quality-gate-cache.json'),
             maxAgeDays: parseInt(process.env.QUALITY_CACHE_MAX_AGE_DAYS || '90', 10),
         },
+        packageManager: detectPackageManager(projectRoot),
+        typecheckScript: detectTypecheckScript(projectRoot),
         rulesFile: process.env.QUALITY_RULES_FILE || 'rules.json',
         codePathspecs: (process.env.QUALITY_CODE_PATHSPECS || 'src/,tests/,scripts/').split(','),
         scriptTimeouts: {

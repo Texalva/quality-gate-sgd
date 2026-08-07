@@ -23,9 +23,14 @@
  *     or truncated process) before parsing is ever reached.
  */
 import { spawnSync } from 'child_process';
+import { binaryCommand } from '../runner.js';
 import { buildEvidence, classifyProcessOutput, err, measurementFailure, ok } from './result.js';
-const ESLINT_ARGS = ['eslint', '--format', 'json', 'src/'];
-const COMMAND = `npx ${ESLINT_ARGS.join(' ')}`;
+/**
+ * `src/` is hardcoded on purpose -- see src/layout.ts. It is how a project says
+ * which code the ratchet governs, and `assertSupportedLayout` refuses to run
+ * against a project laid out otherwise rather than letting this lint a subset.
+ */
+const ESLINT_ARGS = ['--format', 'json', 'src/'];
 /** eslint's own severity encoding: 2 is an error, 1 a warning, 0 disabled. */
 const SEVERITY_ERROR = 2;
 /**
@@ -143,8 +148,9 @@ export const eslintLintProvider = {
     name: 'eslint',
     dimension: 'eslint',
     measure(context) {
+        const command = binaryCommand('eslint', ESLINT_ARGS, context.packageManager);
         const startedAt = Date.now();
-        const spawn = spawnSync('npx', [...ESLINT_ARGS], {
+        const spawn = spawnSync(command.executable, [...command.args], {
             cwd: context.projectRoot,
             encoding: 'utf-8',
             shell: true,
@@ -153,7 +159,7 @@ export const eslintLintProvider = {
         });
         const elapsedMs = Date.now() - startedAt;
         const output = classifyProcessOutput(spawn, {
-            command: COMMAND,
+            command: command.display,
             dimension: 'eslint',
             elapsedMs,
             timeoutMs: context.timeoutMs,
@@ -162,7 +168,7 @@ export const eslintLintProvider = {
         });
         if (!output.ok)
             return output;
-        const unparseable = (detail) => err(measurementFailure('unparseable-output', 'eslint', `\`${COMMAND}\` ${detail}, so no finding count can be derived from it.`, buildEvidence(spawn, COMMAND, elapsedMs)));
+        const unparseable = (detail) => err(measurementFailure('unparseable-output', 'eslint', `\`${command.display}\` ${detail}, so no finding count can be derived from it.`, buildEvidence(spawn, command.display, elapsedMs)));
         // No `|| '[]'` fallback. eslint's JSON formatter is literally
         // `JSON.stringify(results)`, and even a wholly clean project emits a full
         // per-file report -- so empty stdout is never a legitimate zero-finding

@@ -8,6 +8,7 @@ import * as crypto from 'crypto';
 import { execSync } from 'child_process';
 import { computeRulesHash } from './rules.js';
 import { getConfig } from './config.js';
+import { readEntryManager } from './runner.js';
 /**
  * 4 since an absent coverage summary became a measurement failure. Before that, 3
  * since zero-denominator dimensions changed value and only rule-graded measurement
@@ -377,6 +378,11 @@ monotonicEvaluated) {
         },
         metrics,
         monotonicEvaluated,
+        // Read from config rather than taken as a parameter, unlike the flag above:
+        // which manager ran is ambient for the whole process, not a property of this
+        // run that only the caller knows, so there is nothing here for a writer to
+        // forget or to get wrong.
+        packageManager: getConfig().packageManager.manager,
     };
 }
 // =============================================================================
@@ -441,7 +447,26 @@ export function findBaselineEntry(cache, _rules, isWIP = false) {
 function usableBaseline(entry) {
     if (!entry)
         return undefined;
-    return (entry.metrics.measurementFailures?.length ?? 0) > 0 ? undefined : entry;
+    if ((entry.metrics.measurementFailures?.length ?? 0) > 0)
+        return undefined;
+    // A baseline measured by a different package manager is refused here as well as in
+    // `isCacheValid`, and the two are NOT the same check even though they compare the
+    // same field. `isCacheValid` asks "may this entry be served as a verdict"; this asks
+    // "are these numbers comparable to the ones I just took". For `monotonicEvaluated`
+    // those questions have different answers -- an unevaluated entry is still an honest
+    // reading of its commit, so it makes a fine baseline. For the package manager they
+    // have the SAME answer, because numbers from two toolchains cannot be differenced:
+    //
+    //   parent measured under npm: typescript.errors = 10
+    //   this run under bun:        typescript.errors = 5
+    //   the parent's TRUE bun reading would have been 4
+    //
+    // A `down` ratchet should fail 4 -> 5 and instead passes 10 -> 5, and the run is then
+    // recorded with `monotonicEvaluated: true`, so the unearned pass becomes cacheable.
+    // Guarding only the verdict path left exactly this open.
+    return readEntryManager(entry.packageManager) === getConfig().packageManager.manager
+        ? entry
+        : undefined;
 }
 // =============================================================================
 // Cache Pruning

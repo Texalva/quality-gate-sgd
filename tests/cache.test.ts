@@ -10,6 +10,9 @@ vi.mock('../src/config.js', () => ({
   getConfig: vi.fn(() => ({
     projectRoot: '/test/project',
     codePathspecs: ['src/', 'tests/'],
+    // Stamped onto every entry so a cached verdict cannot be served for a run made
+    // by a different toolchain.
+    packageManager: { manager: 'npm', reason: 'test fixture' },
     cache: {
       file: '/test/project/.quality-cache.json',
     },
@@ -767,6 +770,64 @@ describe('cache module', () => {
       const rules: QualityRules = { version: '1.0.0', rules: {} }
 
       expect(findBaselineEntry(cache, rules, false)).toBe(seedEntry)
+    })
+
+    /**
+     * A baseline from a different package manager, which the verdict-path guard in
+     * `isCacheValid` does NOT cover -- `findBaselineEntry` is a separate route and was
+     * left open when that guard was added.
+     *
+     * Numbers from two toolchains cannot be differenced. Concretely: the parent was
+     * measured under npm at `typescript.errors: 10`, this run is bun at 5, and the
+     * parent's true bun reading would have been 4. A `down` ratchet should fail 4 -> 5
+     * and instead passes 10 -> 5 -- then the run is recorded `monotonicEvaluated: true`,
+     * so the unearned pass becomes cacheable as a fully-earned verdict.
+     *
+     * Note this differs from `monotonicEvaluated` directly above, where the baseline IS
+     * accepted. That entry is an honest reading of its commit; this one is a reading of
+     * a different toolchain.
+     */
+    it('refuses a baseline measured by a different package manager', () => {
+      const npmBaseline: CacheEntry = {
+        timestamp: 12345,
+        rulesVersion: '1.0.0',
+        rulesHash: 'hash',
+        evaluation: { status: 'pass', failedRules: [] },
+        metrics: { scripts: {}, typescript: { errors: 10 } } as unknown as Metrics,
+        packageManager: 'bun',
+      }
+
+      mockExecSync.mockReturnValue(commitObject(['parentcommit']))
+
+      const cache: QualityGateCache = {
+        schemaVersion: 4,
+        entries: { parentcommit: npmBaseline },
+      }
+      const rules: QualityRules = { version: '1.0.0', rules: {} }
+
+      // The mocked config runs npm; the entry says bun.
+      expect(findBaselineEntry(cache, rules, false)).toBeUndefined()
+    })
+
+    it('accepts a baseline measured by the same package manager', () => {
+      const npmBaseline: CacheEntry = {
+        timestamp: 12345,
+        rulesVersion: '1.0.0',
+        rulesHash: 'hash',
+        evaluation: { status: 'pass', failedRules: [] },
+        metrics: { scripts: {}, typescript: { errors: 10 } } as unknown as Metrics,
+        packageManager: 'npm',
+      }
+
+      mockExecSync.mockReturnValue(commitObject(['parentcommit']))
+
+      const cache: QualityGateCache = {
+        schemaVersion: 4,
+        entries: { parentcommit: npmBaseline },
+      }
+      const rules: QualityRules = { version: '1.0.0', rules: {} }
+
+      expect(findBaselineEntry(cache, rules, false)).toBe(npmBaseline)
     })
 
     it('refuses a baseline whose own reading recorded a measurement failure', () => {

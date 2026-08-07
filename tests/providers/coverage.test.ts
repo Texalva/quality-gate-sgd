@@ -19,6 +19,8 @@ const CONTEXT: MeasurementContext = {
   projectRoot: '/p',
   timeoutMs: 60_000,
   maxBufferBytes: 1024,
+  packageManager: { manager: 'npm', reason: 'test fixture' },
+  typecheckScript: { script: 'type-check', reason: 'test fixture', definedInManifest: true },
 };
 
 const PATHS = {

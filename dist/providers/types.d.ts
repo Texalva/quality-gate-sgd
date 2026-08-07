@@ -22,6 +22,7 @@
  * a union forces every implementation to say which of the two happened, and
  * makes "measured nothing" unrepresentable as an error.
  */
+import type { RunnerSelection, TypecheckScriptSelection } from '../runner.js';
 import type { IssueSource, LocatedIssue } from '../targets/types.js';
 import type { AllCoverageMetrics, EslintMetrics, TypescriptMetrics } from '../types.js';
 /**
@@ -232,6 +233,24 @@ export interface MeasurementContext {
     readonly timeoutMs: number;
     /** Fail loudly rather than truncating past this many bytes of stdout. */
     readonly maxBufferBytes: number;
+    /**
+     * Which package manager to shell, already resolved.
+     *
+     * Required rather than defaulted, and that is the point: an optional field
+     * falling back to npm would let a call site that forgot to thread it through
+     * silently measure with the wrong runner, which is the class of drift this
+     * indirection exists to remove. A provider that shells nothing still takes it,
+     * for the same reason.
+     */
+    readonly packageManager: RunnerSelection;
+    /**
+     * The script the typecheck provider should run, already resolved.
+     *
+     * Here rather than looked up by the provider, because a provider that shells `tsc`
+     * or `deno check` directly has no package.json script to look up -- the same
+     * reasoning that keeps the missing-script pattern out of the provider.
+     */
+    readonly typecheckScript: TypecheckScriptSelection;
 }
 /**
  * Metrics and located issues together, because they come from a SINGLE run of

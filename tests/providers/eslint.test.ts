@@ -12,6 +12,8 @@ const CONTEXT: MeasurementContext = {
   projectRoot: '/test/project',
   timeoutMs: 120_000,
   maxBufferBytes: 1024,
+  packageManager: { manager: 'npm', reason: 'test fixture' },
+  typecheckScript: { script: 'type-check', reason: 'test fixture', definedInManifest: true },
 };
 
 function spawnResult(overrides: Partial<SpawnSyncReturns<string>> = {}): SpawnSyncReturns<string> {

@@ -240,6 +240,12 @@ async function runQualityGate(options: RunOptions = { skipSonarQube: false }): P
   const layoutConfig = getConfig();
   assertSupportedLayout(layoutConfig.projectRoot, layoutConfig.codePathspecs);
 
+  // Stated once, up front, because every script this run shells goes through it and
+  // a mis-detected runner is otherwise diagnosed only at the failure it causes.
+  log(
+    `Runner: ${layoutConfig.packageManager.manager} (${layoutConfig.packageManager.reason})`
+  );
+
   // Commit hash for a clean tree, `wip:<HEAD>:<contentHash>` for a dirty one.
   const { key: cacheKey, isWIP } = getCacheKey();
   if (isWIP) {

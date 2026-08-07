@@ -57,6 +57,8 @@ export function extractCoverageIssues(coverageDir?: string): LocatedIssue[] {
     projectRoot: config.projectRoot,
     timeoutMs: DEFAULT_MEASUREMENT_LIMITS.typecheckTimeoutMs,
     maxBufferBytes: DEFAULT_MEASUREMENT_LIMITS.maxBufferBytes,
+    packageManager: config.packageManager,
+    typecheckScript: config.typecheckScript,
   });
 
   if (!reading.ok) {
@@ -115,6 +117,8 @@ export function extractTypescriptIssues(): LocatedIssue[] {
     projectRoot: config.projectRoot,
     timeoutMs: DEFAULT_MEASUREMENT_LIMITS.typecheckTimeoutMs,
     maxBufferBytes: DEFAULT_MEASUREMENT_LIMITS.maxBufferBytes,
+    packageManager: config.packageManager,
+    typecheckScript: config.typecheckScript,
   });
 
   // Still [] on failure, and still wrong for the same reason: a type-check that
@@ -145,6 +149,8 @@ export function extractEslintIssues(): LocatedIssue[] {
     projectRoot: config.projectRoot,
     timeoutMs: DEFAULT_MEASUREMENT_LIMITS.lintTimeoutMs,
     maxBufferBytes: DEFAULT_MEASUREMENT_LIMITS.maxBufferBytes,
+    packageManager: config.packageManager,
+    typecheckScript: config.typecheckScript,
   });
 
   // See extractTypescriptIssues: advisory-only, so still [] on failure while

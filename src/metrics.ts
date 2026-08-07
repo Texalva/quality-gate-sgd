@@ -20,6 +20,7 @@ import {
   registerCustomDimensions,
   type CustomDimensionConfig,
 } from './dimensions/index.js';
+import { manifestDefinesScript, scriptCommand } from './runner.js';
 import { eslintLintProvider } from './providers/eslint.js';
 import { typescriptTypecheckProvider } from './providers/typescript.js';
 import { DEFAULT_MEASUREMENT_LIMITS } from './providers/result.js';
@@ -87,6 +88,8 @@ function measureCoverageReading(
     // enforces.
     timeoutMs: DEFAULT_MEASUREMENT_LIMITS.typecheckTimeoutMs,
     maxBufferBytes: DEFAULT_MEASUREMENT_LIMITS.maxBufferBytes,
+    packageManager: config.packageManager,
+    typecheckScript: config.typecheckScript,
   });
 }
 
@@ -380,8 +383,11 @@ export function runSonarqubeScan(): { success: boolean; error?: string } {
       spawnSync('sleep', ['5'], { shell: true });
     }
 
-    // Run npm run sonar which handles the full scan (with locking)
-    const result = spawnSync('npm', ['run', 'sonar'], {
+    // Runs the project's `sonar` script, which handles the full scan (with
+    // locking). Routed through the runner only so no npm literal is left behind;
+    // this function's own reporting is still unfixed -- see task #23/#42.
+    const sonar = scriptCommand('sonar', config.packageManager);
+    const result = spawnSync(sonar.executable, [...sonar.args], {
       cwd: config.projectRoot,
       encoding: 'utf-8',
       shell: true,
@@ -447,6 +453,8 @@ function measureTypescript(): Result<TypecheckReading, MeasurementFailure> {
     projectRoot: config.projectRoot,
     timeoutMs: DEFAULT_MEASUREMENT_LIMITS.typecheckTimeoutMs,
     maxBufferBytes: DEFAULT_MEASUREMENT_LIMITS.maxBufferBytes,
+    packageManager: config.packageManager,
+    typecheckScript: config.typecheckScript,
   });
 }
 
@@ -480,6 +488,8 @@ function measureEslint(): Result<LintReading, MeasurementFailure> {
     projectRoot: config.projectRoot,
     timeoutMs: DEFAULT_MEASUREMENT_LIMITS.lintTimeoutMs,
     maxBufferBytes: DEFAULT_MEASUREMENT_LIMITS.maxBufferBytes,
+    packageManager: config.packageManager,
+    typecheckScript: config.typecheckScript,
   });
 }
 
@@ -504,7 +514,17 @@ export function extractEslintMetrics(): EslintMetrics | undefined {
 export function runScript(script: string): 'pass' | 'fail' {
   const config = getConfig();
   const timeout = config.scriptTimeouts[script] ?? config.defaultScriptTimeout;
-  const result = spawnSync('npm', ['run', script], {
+
+  // The same bun fall-through that the typecheck provider refuses, on the path that
+  // decides `requiredScripts`. `bun run <name>` for an undefined script executes a
+  // same-named `node_modules/.bin` binary and can exit 0, so a required script the
+  // project does not have would report `pass` -- while npm exits 1 and reports `fail`.
+  // Two managers disagreeing about whether a script ran is not a difference this
+  // function may pass on to the gate. Reproduced against bun 1.3.14.
+  if (!manifestDefinesScript(config.projectRoot, script)) return 'fail';
+
+  const command = scriptCommand(script, config.packageManager);
+  const result = spawnSync(command.executable, [...command.args], {
     cwd: config.projectRoot,
     encoding: 'utf-8',
     shell: true,

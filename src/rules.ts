@@ -15,6 +15,7 @@ import type {
 } from './types.js';
 import type { MeasurementEvidence } from './providers/types.js';
 import { getConfig } from './config.js';
+import { readEntryManager } from './runner.js';
 import { getDefaultRules, isEmbeddedDefaults } from './defaults.js';
 import { getMetricValue as getFitnessMetricValue } from './fitness.js';
 
@@ -607,6 +608,20 @@ export function isCacheValid(entry: CacheEntry, rules: QualityRules): boolean {
   // `!== false` rather than `=== true`: entries written before the field existed
   // carry no value, and for them "evaluated" is what the absence meant.
   if (entry.monotonicEvaluated === false) {
+    return false;
+  }
+
+  // An entry measured by a different package manager is a reading of a different
+  // toolchain. The key cannot catch this: it hashes tracked code under
+  // `codePathspecs`, and lockfiles are not in it, so adding a `bun.lock` swaps the
+  // runner without moving the key. Coverage is the concrete path -- a different test
+  // runner writes a different report, or none at all -- so serving the entry would
+  // report npm's numbers for a bun run.
+  //
+  // `readEntryManager` treats an ABSENT field as npm, which is sound rather than
+  // lenient -- every entry written before the field existed came from a version with
+  // npm hardcoded at each spawn site. It refuses any other unrecognised value.
+  if (readEntryManager(entry.packageManager) !== getConfig().packageManager.manager) {
     return false;
   }
 

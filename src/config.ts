@@ -13,6 +13,9 @@
 import * as path from 'path';
 import * as fs from 'fs';
 
+import { detectPackageManager, detectTypecheckScript } from './runner.js';
+import type { RunnerSelection, TypecheckScriptSelection } from './runner.js';
+
 // =============================================================================
 // Configuration Interface
 // =============================================================================
@@ -55,6 +58,25 @@ export interface QualityGateConfig {
     file: string;
     maxAgeDays: number;
   };
+
+  /**
+   * Which package manager runs this project's scripts, and why that was chosen.
+   *
+   * Resolved once, here, so that every measurement and `init`'s calibration shell
+   * the same tool. Resolving it per call site is how the interview measures a
+   * project with one runner and the gate then grades it with another.
+   */
+  packageManager: RunnerSelection;
+
+  /**
+   * The package.json script the typescript dimension runs, and why that one.
+   *
+   * Resolved here for the same reason as the runner: the provider must not read
+   * package.json itself (a provider shelling `tsc` or `deno check` has no script to
+   * look up), and `init` has to agree with the gate about which script is the
+   * project's type-check.
+   */
+  typecheckScript: TypecheckScriptSelection;
 
   // Rules file path (relative to projectRoot or absolute)
   rulesFile: string;
@@ -163,6 +185,9 @@ export function loadConfig(): QualityGateConfig {
         path.join(projectRoot, '.quality-gate-cache.json'),
       maxAgeDays: parseInt(process.env.QUALITY_CACHE_MAX_AGE_DAYS || '90', 10),
     },
+
+    packageManager: detectPackageManager(projectRoot),
+    typecheckScript: detectTypecheckScript(projectRoot),
 
     rulesFile: process.env.QUALITY_RULES_FILE || 'rules.json',
 

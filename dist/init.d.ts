@@ -10,6 +10,7 @@
  * 4. Run initial metrics to calibrate "barely passing" thresholds
  * 5. Generate rules.json + explanatory QUALITY.md
  */
+import { type RunnerSelection } from './runner.js';
 /** One npm script `init` would consider running to measure coverage. */
 export interface TestScriptCandidate {
     readonly name: string;
@@ -51,6 +52,16 @@ export interface RepoAnalysis {
     coverageWritingScripts: readonly string[];
     srcDir: string;
     estimatedSloc: number;
+    /**
+     * Which package manager runs this project.
+     *
+     * On the analysis rather than passed separately, because it IS a fact discovered
+     * by looking at the repository, and because everything that formats advice for the
+     * adopter already receives the analysis. The alternative -- a parameter threaded
+     * to each -- is how some of those messages end up saying `npm run test` while the
+     * gate runs `bun run test`, which is the divergence this whole indirection is for.
+     */
+    packageManager: RunnerSelection;
 }
 export interface GeometrySuggestion {
     dimensions: string[];
@@ -146,10 +157,31 @@ export type CoverageCalibration = {
     readonly kind: 'not-written';
     readonly detail: string;
 };
+/**
+ * A finding count init can calibrate a ceiling from, or the reason it cannot.
+ *
+ * A plain `number` was the shape here, initialised to 0 and left there when the
+ * measurement failed -- so a crashed linter wrote `eslint.errors: 0` into the
+ * generated rules. That is the permanently-red build the coverage calibration
+ * above goes to such lengths to avoid, arrived at by a different route: the gate
+ * later measures eslint successfully, finds the project's real findings, and
+ * fails against a ceiling that was never a reading of anything.
+ *
+ * Same discriminated shape as CoverageCalibration, for the same reason: the
+ * decision "should this dimension be graded at all" cannot be made from a number
+ * that has lost the distinction between zero and unknown.
+ */
+export type CountCalibration = {
+    readonly kind: 'measured';
+    readonly errors: number;
+} | {
+    readonly kind: 'unmeasurable';
+    readonly detail: string;
+};
 export interface CalibrationMetrics {
     coverage: CoverageCalibration;
-    typescriptErrors: number;
-    eslintErrors: number;
+    typescript: CountCalibration;
+    eslint: CountCalibration;
 }
 /**
  * Reads a coverage `total` the way the GATE reads it.

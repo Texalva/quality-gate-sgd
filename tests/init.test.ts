@@ -26,6 +26,7 @@ import {
 } from '../src/init.js'
 import type {
   CalibrationMetrics,
+  CountCalibration,
   CoverageCalibration,
   GeneratedConfig,
   GeometrySuggestion,
@@ -80,10 +81,15 @@ const ANALYSIS: RepoAnalysis = {
   coverageWritingScripts: ['test:coverage'],
   srcDir: 'src',
   estimatedSloc: 100,
+  packageManager: { manager: 'npm', reason: 'test fixture' },
 }
 
 function metricsWith(coverage: CoverageCalibration): CalibrationMetrics {
-  return { coverage, typescriptErrors: 0, eslintErrors: 0 }
+  return {
+    coverage,
+    typescript: { kind: 'measured', errors: 0 },
+    eslint: { kind: 'measured', errors: 0 },
+  }
 }
 
 function generate(
@@ -544,11 +550,88 @@ describe('generateConfig', () => {
       { ...ANALYSIS, hasTypeScript: true, hasEslint: true },
       SUGGESTION,
       ANSWERS,
-      { coverage: { kind: 'not-written', detail: 'x' }, typescriptErrors: 3, eslintErrors: 7 }
+      {
+        coverage: { kind: 'not-written', detail: 'x' },
+        typescript: { kind: 'measured', errors: 3 },
+        eslint: { kind: 'measured', errors: 7 },
+      }
     )
 
     expect(rules.rules.ceilings['typescript.errors']).toBe(3)
     expect(rules.rules.ceilings['eslint.errors']).toBe(7)
+  })
+
+  // A ceiling is a claim about the project's current state, so it needs a reading of
+  // that state. The old code initialised both counts to 0 and left them there when
+  // the measurement failed, writing `eslint.errors: 0` for a project whose linter
+  // never ran -- and the gate, measuring successfully later, then fails against a
+  // number nothing ever measured, with no edit that clears it.
+  describe('a dimension that could not be measured', () => {
+    const generateWith = (
+      typescript: CountCalibration,
+      eslint: CountCalibration,
+      answers = ANSWERS
+    ) =>
+      generateConfig(
+        { ...ANALYSIS, hasTypeScript: true, hasEslint: true },
+        SUGGESTION,
+        answers,
+        { coverage: { kind: 'not-written', detail: 'x' }, typescript, eslint }
+      )
+
+    it('gets no ceiling, rather than a ceiling of zero', () => {
+      const { rules } = generateWith(
+        { kind: 'unmeasurable', detail: 'the type-check crashed' },
+        { kind: 'unmeasurable', detail: 'eslint exited 2' }
+      )
+
+      expect(rules.rules.ceilings['typescript.errors']).toBeUndefined()
+      expect(rules.rules.ceilings['eslint.errors']).toBeUndefined()
+    })
+
+    it('gets no ratchet either, since there is no baseline to ratchet from', () => {
+      const { rules } = generateWith(
+        { kind: 'unmeasurable', detail: 'crashed' },
+        { kind: 'unmeasurable', detail: 'crashed' }
+      )
+      const ratcheted = rules.rules.monotonic.flatMap((m) => m.metrics)
+
+      expect(ratcheted).not.toContain('typescript.errors')
+      expect(ratcheted).not.toContain('eslint.errors')
+    })
+
+    it('does not stop the OTHER dimension being graded', () => {
+      const { rules } = generateWith(
+        { kind: 'measured', errors: 4 },
+        { kind: 'unmeasurable', detail: 'eslint exited 2' }
+      )
+
+      expect(rules.rules.ceilings['typescript.errors']).toBe(4)
+      expect(rules.rules.ceilings['eslint.errors']).toBeUndefined()
+    })
+
+    // strictMode's 0 is the user's stated intent, not a calibration, so it needs no
+    // measurement behind it.
+    it('still gets a ceiling of 0 under strictMode, which is intent not calibration', () => {
+      const { rules } = generateWith(
+        { kind: 'unmeasurable', detail: 'crashed' },
+        { kind: 'unmeasurable', detail: 'crashed' },
+        { ...ANSWERS, strictMode: true }
+      )
+
+      expect(rules.rules.ceilings['typescript.errors']).toBe(0)
+      expect(rules.rules.ceilings['eslint.errors']).toBe(0)
+    })
+
+    it('says so in QUALITY.md rather than printing a number beside no ceiling', () => {
+      const { explanation } = generateWith(
+        { kind: 'unmeasurable', detail: 'crashed' },
+        { kind: 'unmeasurable', detail: 'crashed' }
+      )
+
+      expect(explanation).toContain('not measured')
+      expect(explanation).not.toContain('≤undefined')
+    })
   })
 
   it('does not print an undefined floor into QUALITY.md', () => {

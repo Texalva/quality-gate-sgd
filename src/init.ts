@@ -17,6 +17,15 @@ import * as path from 'path';
 import * as readline from 'readline';
 import { loadConfig } from './config.js';
 import { getDimensionsByCategory } from './dimensions/index.js';
+import { eslintLintProvider } from './providers/eslint.js';
+import { DEFAULT_MEASUREMENT_LIMITS } from './providers/result.js';
+import { typescriptTypecheckProvider } from './providers/typescript.js';
+import {
+  detectPackageManager,
+  detectTypecheckScript,
+  scriptCommand,
+  type RunnerSelection,
+} from './runner.js';
 
 // =============================================================================
 // Types
@@ -64,6 +73,16 @@ export interface RepoAnalysis {
   coverageWritingScripts: readonly string[];
   srcDir: string;
   estimatedSloc: number;
+  /**
+   * Which package manager runs this project.
+   *
+   * On the analysis rather than passed separately, because it IS a fact discovered
+   * by looking at the repository, and because everything that formats advice for the
+   * adopter already receives the analysis. The alternative -- a parameter threaded
+   * to each -- is how some of those messages end up saying `npm run test` while the
+   * gate runs `bun run test`, which is the divergence this whole indirection is for.
+   */
+  packageManager: RunnerSelection;
 }
 
 export interface GeometrySuggestion {
@@ -150,6 +169,7 @@ export function analyzeRepo(projectRoot: string): RepoAnalysis {
     coverageWritingScripts: [],
     srcDir: 'src',
     estimatedSloc: 0,
+    packageManager: detectPackageManager(projectRoot),
   };
 
   // Read package.json
@@ -498,7 +518,7 @@ export function reportTestCommandChoice(analysis: RepoAnalysis): void {
       .map((c) => c.name);
     if (skipped.length > 0) {
       console.error(
-        `\nUsing \`npm run ${analysis.testCommand}\` as the test command: it writes a coverage ` +
+        `\nUsing \`${analysis.packageManager.manager} run ${analysis.testCommand}\` as the test command: it writes a coverage ` +
           `report, and \`${skipped.join('`, `')}\` do${skipped.length === 1 ? 'es' : ''} not. ` +
           'The generated coverage floors are graded against the report the gate itself produces.'
       );
@@ -507,7 +527,7 @@ export function reportTestCommandChoice(analysis: RepoAnalysis): void {
   }
 
   console.error(
-    `\nNote: \`npm run ${analysis.testCommand}\` does not appear to write a coverage report, ` +
+    `\nNote: \`${analysis.packageManager.manager} run ${analysis.testCommand}\` does not appear to write a coverage report, ` +
       'so the gate cannot measure coverage on the commit it is grading.'
   );
 
@@ -608,10 +628,28 @@ export type CoverageCalibration =
   | { readonly kind: 'unreadable'; readonly detail: string }
   | { readonly kind: 'not-written'; readonly detail: string };
 
+/**
+ * A finding count init can calibrate a ceiling from, or the reason it cannot.
+ *
+ * A plain `number` was the shape here, initialised to 0 and left there when the
+ * measurement failed -- so a crashed linter wrote `eslint.errors: 0` into the
+ * generated rules. That is the permanently-red build the coverage calibration
+ * above goes to such lengths to avoid, arrived at by a different route: the gate
+ * later measures eslint successfully, finds the project's real findings, and
+ * fails against a ceiling that was never a reading of anything.
+ *
+ * Same discriminated shape as CoverageCalibration, for the same reason: the
+ * decision "should this dimension be graded at all" cannot be made from a number
+ * that has lost the distinction between zero and unknown.
+ */
+export type CountCalibration =
+  | { readonly kind: 'measured'; readonly errors: number }
+  | { readonly kind: 'unmeasurable'; readonly detail: string };
+
 export interface CalibrationMetrics {
   coverage: CoverageCalibration;
-  typescriptErrors: number;
-  eslintErrors: number;
+  typescript: CountCalibration;
+  eslint: CountCalibration;
 }
 
 /** The four dimensions an istanbul `total` reports, in report order. */
@@ -732,12 +770,16 @@ function mtimeMsOf(filePath: string): number | null {
 function collectCalibrationMetrics(
   projectRoot: string,
   testCommand: string,
-  hasTypeScript: boolean
+  hasTypeScript: boolean,
+  selection: RunnerSelection
 ): CalibrationMetrics {
+  // Both counts start UNMEASURABLE rather than at zero. The old initialiser was 0,
+  // and every path that failed to overwrite it -- a project with no TypeScript, a
+  // crashed linter -- silently contributed a calibrated ceiling of zero.
   const metrics: CalibrationMetrics = {
     coverage: { kind: 'not-written', detail: 'coverage was not measured' },
-    typescriptErrors: 0,
-    eslintErrors: 0,
+    typescript: { kind: 'unmeasurable', detail: 'the type-check was not run' },
+    eslint: { kind: 'unmeasurable', detail: 'the linter was not run' },
   };
 
   console.error('\nCollecting current metrics for calibration...');
@@ -755,8 +797,12 @@ function collectCalibrationMetrics(
   const coveragePaths = coverageSummaryCandidates(projectRoot);
   const mtimesBefore = new Map(coveragePaths.map((p) => [p, mtimeMsOf(p)]));
 
-  console.error(`  Running \`npm run ${testCommand}\` (exactly as the gate will)...`);
-  const testRun = spawnSync('npm', ['run', testCommand], {
+  // "Exactly as the gate will" now includes WHICH RUNNER. Hardcoding npm here while
+  // the gate resolves bun would calibrate from one toolchain and grade with another,
+  // which is the same class of mismatch as the `-- --coverage` bug above.
+  const test = scriptCommand(testCommand, selection);
+  console.error(`  Running \`${test.display}\` (exactly as the gate will)...`);
+  const testRun = spawnSync(test.executable, [...test.args], {
     cwd: projectRoot,
     encoding: 'utf-8',
     timeout: 300000,
@@ -781,7 +827,7 @@ function collectCalibrationMetrics(
     metrics.coverage = {
       kind: 'not-written',
       detail:
-        `\`npm run ${testCommand}\` exited ${String(testRun.status)} and wrote no coverage ` +
+        `\`${test.display}\` exited ${String(testRun.status)} and wrote no coverage ` +
         `report to ${coveragePaths.join(' or ')}.` +
         (stale.length > 0
           ? ` ${stale.join(', ')} exists but was not rewritten by this run, so it describes an ` +
@@ -821,36 +867,58 @@ function collectCalibrationMetrics(
     }
   }
 
-  // TypeScript errors
+  // Both dimensions now go through the SAME providers the gate uses, rather than
+  // init's own second implementation of each. That duplication was not merely
+  // untidy, it disagreed with the gate in three measured ways:
+  //
+  //   - it ran `npx tsc --noEmit` where the gate runs the project's `type-check`
+  //     script, so a project whose script passes flags (a different tsconfig, a
+  //     project reference) was calibrated against a DIFFERENT type-check than the
+  //     one that would grade it;
+  //   - it parsed eslint with `JSON.parse(stdout || '[]')`, the exact fallback the
+  //     lint provider was fixed to remove: a crashed eslint became zero findings,
+  //     and zero findings became a `eslint.errors: 0` ceiling;
+  //   - it hardcoded npm, so on a bun project init measured with a runner the gate
+  //     would not use.
+  //
+  // A provider returns a MeasurementFailure instead of a number when it cannot
+  // measure, which is what makes the `unmeasurable` case below expressible at all.
+  const context = {
+    projectRoot,
+    maxBufferBytes: DEFAULT_MEASUREMENT_LIMITS.maxBufferBytes,
+    packageManager: selection,
+    typecheckScript: detectTypecheckScript(projectRoot),
+  };
+
   if (hasTypeScript) {
     console.error('  Checking TypeScript...');
-    const tscResult = spawnSync('npx', ['tsc', '--noEmit'], {
-      cwd: projectRoot,
-      encoding: 'utf-8',
-      timeout: 60000,
+    const reading = typescriptTypecheckProvider.measure({
+      ...context,
+      timeoutMs: DEFAULT_MEASUREMENT_LIMITS.typecheckTimeoutMs,
     });
-    const output = (tscResult.stdout || '') + (tscResult.stderr || '');
-    const errors = output.match(/error TS\d+/g) || [];
-    metrics.typescriptErrors = errors.length;
-    console.error(`  TypeScript errors: ${metrics.typescriptErrors}`);
+    metrics.typescript = reading.ok
+      ? { kind: 'measured', errors: reading.value.metrics.errors }
+      : { kind: 'unmeasurable', detail: reading.error.message };
+    console.error(
+      metrics.typescript.kind === 'measured'
+        ? `  TypeScript errors: ${metrics.typescript.errors}`
+        : `  TypeScript: could not measure -- ${metrics.typescript.detail}`
+    );
   }
 
-  // ESLint errors
   console.error('  Checking ESLint...');
-  const eslintResult = spawnSync('npx', ['eslint', '--format', 'json', 'src/'], {
-    cwd: projectRoot,
-    encoding: 'utf-8',
-    timeout: 120000,
+  const lint = eslintLintProvider.measure({
+    ...context,
+    timeoutMs: DEFAULT_MEASUREMENT_LIMITS.lintTimeoutMs,
   });
-  try {
-    const results = JSON.parse(eslintResult.stdout || '[]');
-    for (const r of results) {
-      metrics.eslintErrors += r.errorCount || 0;
-    }
-  } catch {
-    // Ignore
-  }
-  console.error(`  ESLint errors: ${metrics.eslintErrors}`);
+  metrics.eslint = lint.ok
+    ? { kind: 'measured', errors: lint.value.metrics.errors }
+    : { kind: 'unmeasurable', detail: lint.error.message };
+  console.error(
+    metrics.eslint.kind === 'measured'
+      ? `  ESLint errors: ${metrics.eslint.errors}`
+      : `  ESLint: could not measure -- ${metrics.eslint.detail}`
+  );
 
   return metrics;
 }
@@ -935,7 +1003,7 @@ export function calibrateCoverageRules(
     floors['coverage.unit.statements'] = Math.round(Math.max(answers.coverageTarget, 40));
     notes.push(
       `Coverage floors are derived from your target of ${answers.coverageTarget}%, not from a ` +
-        `measurement: ${calibration.detail}. Re-run init once \`npm run ${answers.testCommand}\` ` +
+        `measurement: ${calibration.detail}. Re-run init once \`${analysis.packageManager.manager} run ${answers.testCommand}\` ` +
         'produces a report, or adjust them by hand.'
     );
   } else {
@@ -974,7 +1042,7 @@ export function generateConfig(
     description:
       `Quality gates for ${path.basename(process.cwd())} - Generated by quality-gate-sgd init` +
       (coverage.ratchet.length > 0
-        ? `. The coverage floors are graded against the report \`npm run ${answers.testCommand}\` ` +
+        ? `. The coverage floors are graded against the report \`${analysis.packageManager.manager} run ${answers.testCommand}\` ` +
           'writes, which is why that script is in requiredScripts: replace it with another and ' +
           'the floors are graded against whatever generation of the code last wrote coverage.'
         : ''),
@@ -989,32 +1057,31 @@ export function generateConfig(
     },
   };
 
-  // Add TypeScript ceiling if applicable
-  if (analysis.hasTypeScript) {
+  // A ceiling at the CURRENT count needs a current count. When the measurement
+  // failed, there is no honest number to put here, and the old code's `0` was the
+  // worst possible choice: the gate measures the dimension successfully on the next
+  // run, finds the project's real findings, and fails against a ceiling that was
+  // never a reading -- a red build with no edit that clears it. Omitting the rule
+  // leaves the dimension ungraded, which the gate reports loudly on every run until
+  // someone adds a rule, and that is the outcome that converges.
+  //
+  // `strictMode` is exempt because a ceiling of 0 there is the USER'S stated intent
+  // rather than a calibration, so it needs no measurement to justify it.
+  const gradeCount = (
+    dimension: 'typescript.errors' | 'eslint.errors',
+    calibration: CountCalibration
+  ) => {
     if (answers.strictMode) {
-      rules.rules.ceilings['typescript.errors'] = 0;
-    } else {
-      // Allow current errors but require monotonic improvement
-      rules.rules.ceilings['typescript.errors'] = metrics.typescriptErrors;
-      rules.rules.monotonic.push({
-        direction: 'down',
-        metrics: ['typescript.errors'],
-      });
+      rules.rules.ceilings[dimension] = 0;
+      return;
     }
-  }
+    if (calibration.kind !== 'measured') return;
+    rules.rules.ceilings[dimension] = calibration.errors;
+    rules.rules.monotonic.push({ direction: 'down', metrics: [dimension] });
+  };
 
-  // Add ESLint ceiling if applicable
-  if (analysis.hasEslint) {
-    if (answers.strictMode) {
-      rules.rules.ceilings['eslint.errors'] = 0;
-    } else {
-      rules.rules.ceilings['eslint.errors'] = metrics.eslintErrors;
-      rules.rules.monotonic.push({
-        direction: 'down',
-        metrics: ['eslint.errors'],
-      });
-    }
-  }
+  if (analysis.hasTypeScript) gradeCount('typescript.errors', metrics.typescript);
+  if (analysis.hasEslint) gradeCount('eslint.errors', metrics.eslint);
 
   // Add SonarQube rules if enabled
   if (answers.useSonarQube) {
@@ -1081,17 +1148,19 @@ function generateExplanation(
   coverageRow('Branch Coverage', 'branches');
   coverageRow('Statement Coverage', 'statements');
 
-  // TypeScript
+  // An unmeasurable dimension gets a row that says so, rather than a number sitting
+  // beside a ceiling that was never written. The old shape printed `0 | ≤undefined`.
+  const countRow = (label: string, dimension: string, calibration: CountCalibration) => {
+    if (calibration.kind !== 'measured') {
+      lines.push(`| ${label} | not measured | (no rule written) | -- |`);
+      return;
+    }
+    lines.push(`| ${label} | ${calibration.errors} | ≤${rules.rules.ceilings[dimension]} | ↓ |`);
+  };
   if (analysis.hasTypeScript) {
-    const ceiling = rules.rules.ceilings['typescript.errors'];
-    lines.push(`| TypeScript Errors | ${metrics.typescriptErrors} | ≤${ceiling} | ↓ |`);
+    countRow('TypeScript Errors', 'typescript.errors', metrics.typescript);
   }
-
-  // ESLint
-  if (analysis.hasEslint) {
-    const ceiling = rules.rules.ceilings['eslint.errors'];
-    lines.push(`| ESLint Errors | ${metrics.eslintErrors} | ≤${ceiling} | ↓ |`);
-  }
+  if (analysis.hasEslint) countRow('ESLint Errors', 'eslint.errors', metrics.eslint);
 
   lines.push('');
   for (const note of calibrateCoverageRules(analysis, answers, metrics.coverage).notes) {
@@ -1101,7 +1170,7 @@ function generateExplanation(
   lines.push('## Measuring Coverage');
   lines.push('');
   lines.push(
-    `The coverage numbers above are read from the report that \`npm run ${answers.testCommand}\` ` +
+    `The coverage numbers above are read from the report that \`${analysis.packageManager.manager} run ${answers.testCommand}\` ` +
       'writes, which is why that script is in `requiredScripts`. The gate reads the report AFTER ' +
       'running those scripts, so if you replace it with a script that writes no coverage report, ' +
       'the floors below are graded against whatever report was last left in the coverage ' +
@@ -1207,11 +1276,17 @@ export async function runInit(args: string[]): Promise<void> {
   // Conduct interview (or use defaults with -y)
   const answers = await conductInterview(analysis, suggestion, options);
 
-  // Collect calibration metrics
+  // Taken from the analysis, not detected again here. One detection per run means
+  // the advice printed above and the measurement below cannot disagree.
+  console.error(
+    `\nRunner: ${analysis.packageManager.manager} (${analysis.packageManager.reason})`
+  );
+
   const metrics = collectCalibrationMetrics(
     projectRoot,
     answers.testCommand,
-    analysis.hasTypeScript
+    analysis.hasTypeScript,
+    analysis.packageManager
   );
 
   // Generate configuration

@@ -4,7 +4,7 @@
  */
 import type { Metrics, CoverageMetrics, AllCoverageMetrics, SonarqubeAnalysisProvenance, SonarqubeMetrics, EslintMetrics, TypescriptMetrics } from './types.js';
 import { type CustomDimensionConfig } from './dimensions/index.js';
-import { type SuiteProvenance } from './coverage-provenance.js';
+import { type StampOutcome, type SuiteProvenance } from './coverage-provenance.js';
 import type { MeasurementFailure } from './providers/types.js';
 /**
  * The coverage numbers and the reasons any of them are missing, together.
@@ -239,6 +239,23 @@ interface MetricsExtractionOptions {
 export interface MetricsWithCoverageProvenance {
     readonly metrics: Metrics;
     readonly coverageProvenance: readonly SuiteProvenance[];
+    /**
+     * What happened when this run tried to stamp each suite.
+     *
+     * Carried out because the `cannot-stamp` reasons are the only place three specific
+     * remedies are worded, and discarding this made all three unreachable on the run
+     * path: an adopter whose `build` script generates code into `src/` while coverage is
+     * being measured got the generic "no sidecar" advisory telling them to run
+     * `stamp-coverage`, which they may already be doing and which cannot fix it. The
+     * verdicts in `coverageProvenance` say a report could not be vouched for; these say
+     * WHY the stamp that would have vouched for it was not written.
+     *
+     * Distinct from `coverageProvenance` rather than folded into it because they are
+     * taken at different moments -- stamping before the read, verification after -- and
+     * a suite can legitimately be `not-rewritten` here and `verified` there, on somebody
+     * else's stamp that this run correctly left alone.
+     */
+    readonly stampOutcomes: readonly StampOutcome[];
 }
 export declare function extractAllMetrics(scriptsToRunOrOptions?: string[] | MetricsExtractionOptions): Metrics;
 export declare function extractAllMetricsAndCoverageProvenance(scriptsToRunOrOptions?: string[] | MetricsExtractionOptions): MetricsWithCoverageProvenance;

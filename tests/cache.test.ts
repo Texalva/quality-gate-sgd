@@ -408,6 +408,35 @@ describe('cache module', () => {
       expect(result.key).toMatch(/^wip:/)
     })
 
+    // The module extensions node and every bundler treat as source. With only
+    // `.ts/.tsx/.js/.jsx` in CODE_EXTENSIONS, an untracked `src/new.mts` was invisible to
+    // BOTH the key and the provenance check: `git diff` cannot see an untracked file, so
+    // a stamped coverage report read VERIFIED over code it had never measured, and its
+    // floor could pass and be cached.
+    it.each(['src/new.mts', 'src/new.cts', 'src/new.mjs', 'src/new.cjs'])(
+      'counts an untracked %s as code',
+      (file) => {
+        // The untracked file's bytes vary between the two runs and EVERYTHING ELSE is
+        // held constant. Returning one varying value from `readFileSync` would move the
+        // key through `measurementInputsListing`, which reads the root config files
+        // through the same mock -- so the test would pass with the extension filter
+        // deleted, proving nothing. Measured: it did exactly that on the first attempt.
+        const keyWith = (contents: string): string => {
+          mockGit({ status: `?? ${file}\n`, others: `${file}\n` })
+          mockFs.existsSync.mockReturnValue(true)
+          mockFs.statSync.mockReturnValue({ isFile: () => true } as fs.Stats)
+          mockFs.readFileSync.mockImplementation((p: unknown) =>
+            String(p).endsWith(file) ? contents : 'held constant'
+          )
+          return getCacheKey().key
+        }
+
+        expect(keyWith('export const added = 1')).not.toBe(
+          keyWith('export const added = 2')
+        )
+      }
+    )
+
     it('skips non-code untracked files', () => {
       mockGit({ status: '?? docs/readme.md\n', others: 'docs/readme.md\n' })
 

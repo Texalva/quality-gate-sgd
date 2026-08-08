@@ -2936,6 +2936,32 @@ describe('binding a sonarqube reading to the analysis that produced it', () => {
       ).toContain('not naming the same thing')
     })
 
+    // `JSON.parse('null')` SUCCEEDS, so the parse guard above this does not catch a body
+    // of `null` -- and `parsed.analyses?.[0]` guarded the array, not the object it hangs
+    // off. A proxy normalising an empty response threw a TypeError out of a measurement
+    // path whose contract is errors-as-values, taking the CLI and the MCP request down
+    // instead of producing this advisory.
+    it('treats a 200 carrying the literal null as an unanswerable question, not a crash', () => {
+      answerCurlByUrl((url) =>
+        url.includes('/api/project_analyses/search')
+          ? curlSays(200, null)
+          : measuresOk()
+      )
+
+      const reading = readSonarqubeMetrics({
+        kind: 'named',
+        taskId: 't1',
+        analysisId: 'AN-1',
+      })
+
+      expect(reading.failure).toBeUndefined()
+      expect(reading.metrics?.bugs).toBe(3)
+      expect(reading.provenance?.kind).toBe('unconfirmed')
+      expect(
+        reading.provenance?.kind === 'unconfirmed' ? reading.provenance.why : ''
+      ).toContain('named no current analysis')
+    })
+
     // A corroborator that could not answer does not turn the mismatch into an advisory
     // -- both platforms that exist were measured to share the id space and to answer
     // this probe -- but the message must not claim the id WAS recognised.

@@ -608,7 +608,14 @@ function bindReadingToAnalysis(metrics, submitted) {
             'read. The measures themselves parsed, so this is one endpoint answering oddly ' +
             'rather than a proxy in front of the whole API.');
     }
-    const current = parsed.analyses?.[0];
+    // `parsed?.` and not `parsed.`, because `JSON.parse('null')` SUCCEEDS and returns
+    // null. The optional chain after `analyses` guarded the array and not the object it
+    // hangs off, so a 200 carrying the body `null` -- a proxy normalising an empty
+    // response, an edition answering with a bare literal -- threw a TypeError out of a
+    // measurement path whose contract is errors-as-values, crashing the CLI and the MCP
+    // request instead of producing the advisory two lines below. `undefined` reaches the
+    // same `currentKey === undefined` branch, which already says the right thing.
+    const current = parsed?.analyses?.[0];
     const currentKey = typeof current?.key === 'string' && current.key.length > 0
         ? current.key
         : undefined;
@@ -1216,9 +1223,9 @@ export function extractAllMetricsAndCoverageProvenance(scriptsToRunOrOptions = [
     // shell extractors, which are arbitrary commands -- and the read is next. Stamping
     // here is what makes the sidecar describe the report that is about to be graded
     // rather than some later state of it.
-    if (summariesBeforeScripts !== undefined) {
-        stampCoverageSummariesRewrittenDuringRun(summariesBeforeScripts, 'run');
-    }
+    const stampOutcomes = summariesBeforeScripts === undefined
+        ? []
+        : stampCoverageSummariesRewrittenDuringRun(summariesBeforeScripts, 'run');
     // Measured once each, and both halves of every reading kept together: the
     // metrics if it worked, the reason if it did not. Calling the public
     // `extract*Metrics` wrappers here instead would discard the reason, which is
@@ -1270,6 +1277,7 @@ export function extractAllMetricsAndCoverageProvenance(scriptsToRunOrOptions = [
             measurementFailures: measurementFailures.length > 0 ? measurementFailures : undefined,
         },
         coverageProvenance,
+        stampOutcomes,
     };
 }
 /**

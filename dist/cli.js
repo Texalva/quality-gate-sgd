@@ -24,7 +24,7 @@ extractAllMetricsAsyncAndCoverageProvenance, describeUnmeasured, isSonarqubeAvai
 import { coverageProvenanceUnevaluated, stampAllCoverageSummaries, describeCodeCommit, PROVENANCE_SIDECAR_FILE, } from './coverage-provenance.js';
 import { loadRules, evaluateRules, isCacheValid, isMeasurementUnderRule, coverageAbsenceIsFailure, } from './rules.js';
 import { loadCache, saveCache, getCacheKey, getCacheEntry, setCacheEntry, createCacheEntry, findBaselineEntry, resolveBaselineCommit, pruneOldEntries, } from './cache.js';
-import { getConfig } from './config.js';
+import { getConfig, redactUrlCredentials } from './config.js';
 import { assertSupportedLayout } from './layout.js';
 import { listIssues } from './list-issues.js';
 import { buildTrajectory, formatTrajectorySummary, trajectorySparkline, } from './trajectory.js';
@@ -155,7 +155,10 @@ function runSonarqubeScanOrExit() {
     const config = getConfig();
     log('\nChecking SonarQube...');
     if (!isSonarqubeAvailable()) {
-        log(`ERROR: SonarQube is not running at ${config.sonarqube.url}`);
+        // Redacted, like every other surface that names this URL. `user:token@host` is a
+        // legal SONARQUBE_URL, and this line -- the FIRST one an adopter with a misconfigured
+        // server sees -- printed it verbatim into stdout and therefore into CI logs.
+        log(`ERROR: SonarQube is not running at ${redactUrlCredentials(config.sonarqube.url)}`);
         log('Start it with: npm run sonar:start');
         log('Or use --coverage-only to skip SonarQube');
         process.exit(1);
@@ -310,7 +313,7 @@ async function runQualityGate(options = { skipSonarQube: false }) {
     // skipped for want of a metric, so those rules were never enforced.
     log('\nExtracting metrics...');
     const requiredScripts = rules.rules.requiredScripts || ['quality'];
-    const { metrics, coverageProvenance } = await extractAllMetricsAsyncAndCoverageProvenance({
+    const { metrics, coverageProvenance, stampOutcomes } = await extractAllMetricsAsyncAndCoverageProvenance({
         scriptsToRun: requiredScripts,
         skipSonarQube: options.skipSonarQube,
         coverageAbsenceIsFailure: coverageAbsenceIsFailure(rules),
@@ -500,12 +503,30 @@ async function runQualityGate(options = { skipSonarQube: false }) {
         for (const entry of unverifiedProvenance) {
             log(`  ${entry.metricPath}: ${entry.message}`);
         }
+        // WHY the stamp was not written, when this run tried and could not, printed BEFORE
+        // the generic remedy below so it is not buried under advice that cannot help.
+        //
+        // These three reasons were unreachable on this path: `extractAllMetrics...` computed
+        // them and the run discarded the return value, so an adopter whose `build` script
+        // generates code into `src/` while coverage is measured -- the codegen case, which
+        // `stamp-coverage` cannot fix because the tree genuinely holds two generations of
+        // the code -- was told to run `stamp-coverage`. The advisory named a remedy they
+        // may already have been performing, for a cause it did not mention.
+        const couldNotStamp = stampOutcomes.filter((outcome) => outcome.kind === 'cannot-stamp');
+        for (const outcome of couldNotStamp) {
+            log(`  ${outcome.suite}: this run could not stamp it -- ${outcome.why}`);
+        }
         log('  Not failing the gate on these -- an unstamped report is not evidence that its ' +
             'numbers are wrong. This run is cached as a BASELINE only, so no later run can ' +
             'inherit it as a verdict, and this repeats every run until a report carries a ' +
-            'sidecar. Run `stamp-coverage` in the SAME step that produces the report, never ' +
-            'after restoring a cached coverage directory: it asserts that this code produced ' +
-            'that report, and it cannot check.');
+            'sidecar.' +
+            (couldNotStamp.length > 0
+                ? ' Fix the cause named above first: where this run rewrote the report but ' +
+                    'could not establish the code state, stamping by hand would assert something ' +
+                    'equally unprovable.'
+                : ' Run `stamp-coverage` in the SAME step that produces the report, never ' +
+                    'after restoring a cached coverage directory: it asserts that this code ' +
+                    'produced that report, and it cannot check.'));
     }
     // A measurement failure is different in kind and still blocks the write: those
     // numbers are not a reading of anything, so they are no use as a baseline either.

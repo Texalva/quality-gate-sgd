@@ -223,13 +223,12 @@ function getCodePathspec(): string {
  */
 function isCodeFile(filePath: string): boolean {
   const config = getConfig();
-  const codeExtensions = ['.ts', '.tsx', '.js', '.jsx'];
 
   // Check if file is in any of the configured code directories
   const isInCodeDir = config.codePathspecs.some((pathspec) =>
     filePath.startsWith(pathspec.replace(/\/$/, '') + '/')
   );
-  const hasCodeExt = codeExtensions.some((ext) => filePath.endsWith(ext));
+  const hasCodeExt = CODE_EXTENSIONS.some((ext) => filePath.endsWith(ext));
 
   return isInCodeDir && hasCodeExt;
 }
@@ -239,9 +238,28 @@ function isCodeFile(filePath: string): boolean {
  *
  * One list, because two lists is how a file becomes code for the key and not for
  * provenance (or the reverse), and either direction is a report vouched for over a
- * file one of them cannot see.
+ * file one of them cannot see. That claim was FALSE when it was written:
+ * `isCodeFile` above kept its own local copy, so the two could drift with nothing
+ * to stop them, in the one function whose comment promised they could not.
+ *
+ * The module extensions are here because node and every bundler treat them as source
+ * and so does every coverage tool: with only the four original entries, adding an
+ * untracked `src/new.mts` to a project whose coverage instruments it left a stamped
+ * report reading VERIFIED over code it had never seen -- `git diff` cannot see an
+ * untracked file, and this filter dropped it. `.d.ts` is deliberately NOT special-cased
+ * off: it ends in `.ts`, it changes what `tsc` reports, and a declaration-only edit that
+ * moves the type-check reading must move the key.
  */
-const CODE_EXTENSIONS = ['.ts', '.tsx', '.js', '.jsx'] as const;
+const CODE_EXTENSIONS = [
+  '.ts',
+  '.tsx',
+  '.mts',
+  '.cts',
+  '.js',
+  '.jsx',
+  '.mjs',
+  '.cjs',
+] as const;
 
 /**
  * Untracked code files, resolved by asking GIT to apply the pathspecs.

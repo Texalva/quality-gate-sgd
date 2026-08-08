@@ -38,6 +38,7 @@ import {
   stampCoverageSummariesRewrittenDuringRun,
   suitesWithNumbers,
   verifyCoverageProvenance,
+  type StampOutcome,
   type SuiteProvenance,
 } from './coverage-provenance.js';
 import { eslintLintProvider } from './providers/eslint.js';
@@ -914,7 +915,14 @@ function bindReadingToAnalysis(
     );
   }
 
-  const current = parsed.analyses?.[0];
+  // `parsed?.` and not `parsed.`, because `JSON.parse('null')` SUCCEEDS and returns
+  // null. The optional chain after `analyses` guarded the array and not the object it
+  // hangs off, so a 200 carrying the body `null` -- a proxy normalising an empty
+  // response, an edition answering with a bare literal -- threw a TypeError out of a
+  // measurement path whose contract is errors-as-values, crashing the CLI and the MCP
+  // request instead of producing the advisory two lines below. `undefined` reaches the
+  // same `currentKey === undefined` branch, which already says the right thing.
+  const current = parsed?.analyses?.[0];
   const currentKey = typeof current?.key === 'string' && current.key.length > 0
     ? current.key
     : undefined;
@@ -1616,6 +1624,24 @@ interface MetricsExtractionOptions {
 export interface MetricsWithCoverageProvenance {
   readonly metrics: Metrics;
   readonly coverageProvenance: readonly SuiteProvenance[];
+
+  /**
+   * What happened when this run tried to stamp each suite.
+   *
+   * Carried out because the `cannot-stamp` reasons are the only place three specific
+   * remedies are worded, and discarding this made all three unreachable on the run
+   * path: an adopter whose `build` script generates code into `src/` while coverage is
+   * being measured got the generic "no sidecar" advisory telling them to run
+   * `stamp-coverage`, which they may already be doing and which cannot fix it. The
+   * verdicts in `coverageProvenance` say a report could not be vouched for; these say
+   * WHY the stamp that would have vouched for it was not written.
+   *
+   * Distinct from `coverageProvenance` rather than folded into it because they are
+   * taken at different moments -- stamping before the read, verification after -- and
+   * a suite can legitimately be `not-rewritten` here and `verified` there, on somebody
+   * else's stamp that this run correctly left alone.
+   */
+  readonly stampOutcomes: readonly StampOutcome[];
 }
 
 export function extractAllMetrics(
@@ -1717,9 +1743,10 @@ export function extractAllMetricsAndCoverageProvenance(
   // shell extractors, which are arbitrary commands -- and the read is next. Stamping
   // here is what makes the sidecar describe the report that is about to be graded
   // rather than some later state of it.
-  if (summariesBeforeScripts !== undefined) {
-    stampCoverageSummariesRewrittenDuringRun(summariesBeforeScripts, 'run');
-  }
+  const stampOutcomes =
+    summariesBeforeScripts === undefined
+      ? []
+      : stampCoverageSummariesRewrittenDuringRun(summariesBeforeScripts, 'run');
 
   // Measured once each, and both halves of every reading kept together: the
   // metrics if it worked, the reason if it did not. Calling the public
@@ -1776,6 +1803,7 @@ export function extractAllMetricsAndCoverageProvenance(
       measurementFailures: measurementFailures.length > 0 ? measurementFailures : undefined,
     },
     coverageProvenance,
+    stampOutcomes,
   };
 }
 

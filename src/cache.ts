@@ -18,6 +18,16 @@ import { getConfig } from './config.js';
 import { readEntryManager } from './runner.js';
 
 /**
+ * 5 since an individual ratcheted metric absent from the baseline became a rule that
+ * did not run. That is a change in what a PASS means, and the previous build recorded
+ * it as the opposite: `monotonicSkipped` was true only when the whole baseline was
+ * missing, so a run whose ratchet was skipped per-metric was stamped
+ * `monotonicEvaluated: true`. `isCacheValid` refuses only an explicit `false`, so
+ * every such entry on disk would be served by the cached-pass exit-0 path -- the
+ * fixed build inheriting exactly the verdict the fix exists to prevent.
+ * CONSTRUCTED and confirmed: a version-4 entry of that shape returns
+ * `isCacheValid() === true`. Bumping discards it, which costs one re-measurement.
+ *
  * 4 since an absent coverage summary became a measurement failure. Before that, 3
  * since zero-denominator dimensions changed value and only rule-graded measurement
  * failures fail. Each one moves the definition of a pass, and `cli.ts` exits 0 on a
@@ -28,7 +38,7 @@ import { readEntryManager } from './runner.js';
  * point: the fix must not be undone by a cache written before it. Full reasoning on
  * QualityGateCache in types.ts.
  */
-const CURRENT_SCHEMA_VERSION = 4;
+const CURRENT_SCHEMA_VERSION = 5;
 
 /**
  * Buffer ceiling for the git reads whose output scales with the repository.
@@ -515,8 +525,24 @@ export function findBaselineEntry(
     return undefined;
   }
 
-  // Note: We still use old entries even if rules changed
-  // The evaluation will be re-done, but we can compare metrics
+  // An entry written under a DIFFERENT ruleset is still a valid baseline, and this
+  // is a decision rather than an oversight -- `isCacheValid` checks `rulesHash` and
+  // this function deliberately does not.
+  //
+  // The worry was that an entry written under a ruleset lacking some ratchet gets
+  // accepted as that ratchet's starting point. It does, and that is correct:
+  // extraction is not rule-scoped (`extractAllMetrics` measures every dimension it
+  // can, whatever the rules say), so the parent's value for the newly-ratcheted
+  // metric is an honest reading of the parent either way. Rules decide what is
+  // GRADED; they do not decide what was measured.
+  //
+  // Refusing on a hash mismatch would cost real enforcement for no correctness gain:
+  // every edit to rules.json would discard every baseline, so the commit that adds a
+  // ratchet -- and every commit until a full re-measure walks forward again -- would
+  // have nothing to compare against, which is the deadlock the two-tier write exists
+  // to avoid. The one case the worry actually names, a metric MISSING from the
+  // baseline, is now caught per-metric by `evaluateMonotonic` and reported as
+  // unevaluated instead of being skipped in silence.
   return usableBaseline(entry);
 }
 

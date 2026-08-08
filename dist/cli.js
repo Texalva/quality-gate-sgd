@@ -380,7 +380,35 @@ async function runQualityGate(options = { skipSonarQube: false }) {
     //
     // Still NOT the same as failing the gate on a missing baseline, which is a live
     // question -- see the note above `describeMissingBaseline`.
-    const monotonicSkipped = (rules.rules.monotonic?.length ?? 0) > 0 && baselineEntry === undefined;
+    // Both ways a ratchet goes unexecuted, not just the missing-baseline one.
+    //
+    // The per-metric case is the quieter of the two and was the one that stayed open:
+    // a baseline entry EXISTS and is accepted, so this expression used to be false and
+    // the run was recorded as fully evaluated, while an individual ratcheted metric
+    // absent from that baseline was skipped in silence by `evaluateMonotonic`. Adding a
+    // ratchet to rules.json after the baseline was written is enough to reach it.
+    const monotonicSkipped = ((rules.rules.monotonic?.length ?? 0) > 0 && baselineEntry === undefined) ||
+        result.unevaluated.length > 0;
+    // Printed on every run that has them, next to the verdict, because this is the one
+    // thing the verdict does not cover. A PASS with an unevaluated rule is narrower
+    // than a PASS without one and nothing else on this surface says so.
+    //
+    // `no-baseline` entries are dropped from the LIST and not from the data. This
+    // surface already printed "No baseline found (...)" with the reason and the count,
+    // which is one clear sentence where the list would be one line per metric saying the
+    // same thing. Every other consumer -- MCP especially, which has no such message --
+    // needs them, so `evaluateMonotonic` produces them and this filter is local.
+    const worthListing = result.unevaluated.filter((u) => u.reason !== 'no-baseline');
+    if (worthListing.length > 0) {
+        log(`\n${worthListing.length} configured rule(s) could not be evaluated this run:`);
+        for (const skipped of worthListing) {
+            log(`  ${skipped.rule}: ${skipped.message}`);
+        }
+        log('  Not failing the gate on these -- a rule that did not run is not evidence of a ' +
+            'violation. This run is cached as a BASELINE only, so no later run can inherit ' +
+            'it as a verdict. A baseline-missing ratchet resolves itself on the next commit, ' +
+            'which compares against the entry this run is about to write.');
+    }
     // A measurement failure is different in kind and still blocks the write: those
     // numbers are not a reading of anything, so they are no use as a baseline either.
     const cachedThisRun = measurementFailures.length === 0;
@@ -395,9 +423,12 @@ async function runQualityGate(options = { skipSonarQube: false }) {
         const entry = createCacheEntry(metrics, rules, result.status, failedRuleNames, !monotonicSkipped);
         setCacheEntry(cache, cacheKey, entry);
         if (monotonicSkipped) {
-            log('\nCaching this run as a BASELINE only -- its monotonic rules had nothing to ' +
-                'compare against, so it is not servable as a verdict and the next run on this ' +
-                'commit will re-measure. The commit after this one can ratchet against it.');
+            const why = baselineEntry === undefined
+                ? 'its monotonic rules had nothing to compare against'
+                : `${worthListing.length} of its rules could not be evaluated`;
+            log(`\nCaching this run as a BASELINE only -- ${why}, so it is not servable as a ` +
+                'verdict and the next run on this commit will re-measure. The commit after ' +
+                'this one can ratchet against it.');
         }
     }
     // Prune old entries (keep last 90 days)

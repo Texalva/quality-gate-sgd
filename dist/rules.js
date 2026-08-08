@@ -370,18 +370,95 @@ function evaluateCeilings(rules, metrics) {
 // =============================================================================
 // Monotonic Evaluation
 // =============================================================================
+/**
+ * Ratchets, and what happens to one that cannot be applied.
+ *
+ * The unevaluated list is the load-bearing part. This function used to `continue`
+ * past a metric whose baseline or current value was absent, which meant an
+ * individual ratcheted metric could go unenforced with nothing recording it -- even
+ * when a baseline entry existed and was accepted, so the caller counted the run as
+ * fully evaluated and cached the pass as fully earned. Ordinary triggers, no
+ * adversarial input: add a ratchet to rules.json after the baseline was written and
+ * that ratchet is unenforced against the very first commit it is supposed to guard.
+ *
+ * Floors already fail loudly on a missing metric (`Metric '...' not available`) and
+ * ceilings already skip silently by design (a ceiling on a dimension you do not
+ * measure is not a promise). Monotonic rules were skipping silently while ADVERTISING
+ * enforcement, which is the combination that produces a vacuous pass.
+ *
+ * The two absences are reported separately because they mean different things. A
+ * missing BASELINE value is a gap in history and converges on its own -- this run's
+ * entry carries the metric, so the next commit has something to compare. A missing
+ * CURRENT value means the reading itself is incomplete, and usually arrives alongside
+ * a measurement failure that fails the gate independently.
+ */
 function evaluateMonotonic(rules, currentMetrics, baselineMetrics) {
     const failures = [];
+    const unevaluated = [];
     const monotonicRules = rules.rules.monotonic;
-    if (!monotonicRules || !baselineMetrics) {
-        return failures;
+    if (!monotonicRules) {
+        return { failures, unevaluated };
     }
+    // No baseline at all is reported HERE as well, not only by the caller.
+    //
+    // It used to return early with an empty list, on the reasoning that the CLI knows
+    // WHY there is no baseline (root commit, no cached parent, a parent whose reading
+    // was incomplete) and says so in one line instead of once per metric. That is still
+    // true of the CLI -- and it was the whole defect, because the CLI is not the only
+    // consumer. Adversarial review confirmed the MCP handler serialising
+    // `{status:"pass", failedRules:[], unevaluated:[]}` on a project where every ratchet
+    // was skipped, which is a clean bill of health for a run that checked nothing. The
+    // rule lives in this function so that no consumer has to re-derive it, exactly as
+    // `coverageAbsenceIsFailure` does.
+    //
+    // The CLI drops these from its own list to keep its output the single clear
+    // sentence it already prints. See `unevaluatedWorthListing` in cli.ts.
+    const baselineAbsent = !baselineMetrics;
     for (const rule of monotonicRules) {
+        // A rule naming no metrics performs no comparison and would otherwise leave no
+        // trace: the loop below simply does not run, `unevaluated` stays empty, and the
+        // run is recorded as fully evaluated. Reachable from any hand-written
+        // `{"direction":"down","metrics":[]}` -- rules.json is `JSON.parse`d and cast,
+        // with no runtime validation of this shape -- and a rule that cannot fail is the
+        // thing this file exists to refuse.
+        if (rule.metrics.length === 0) {
+            unevaluated.push({
+                type: 'monotonic',
+                rule: `${rule.direction}:<no metrics>`,
+                metricPath: '',
+                reason: 'no-metrics',
+                message: `a '${rule.direction}' monotonic rule lists no metrics, so it compares ` +
+                    'nothing -- remove it, or give it the metric paths it should ratchet',
+            });
+            continue;
+        }
         for (const metricPath of rule.metrics) {
+            if (baselineAbsent) {
+                unevaluated.push({
+                    type: 'monotonic',
+                    rule: `${rule.direction}:${metricPath}`,
+                    metricPath,
+                    reason: 'no-baseline',
+                    message: `there is no baseline reading to compare against, so the ` +
+                        `'${rule.direction}' ratchet on ${metricPath} did not run`,
+                });
+                continue;
+            }
             const baselineValue = getMetricValue(baselineMetrics, metricPath);
             const currentValue = getMetricValue(currentMetrics, metricPath);
-            // Skip if either value is unavailable
             if (baselineValue === undefined || currentValue === undefined) {
+                const reason = baselineValue === undefined ? 'baseline-missing' : 'current-missing';
+                unevaluated.push({
+                    type: 'monotonic',
+                    rule: `${rule.direction}:${metricPath}`,
+                    metricPath,
+                    reason,
+                    message: reason === 'baseline-missing'
+                        ? `${metricPath} is absent from the baseline reading, so the ` +
+                            `'${rule.direction}' ratchet on it did not run`
+                        : `${metricPath} is absent from this run's reading, so the ` +
+                            `'${rule.direction}' ratchet on it did not run`,
+                });
                 continue;
             }
             const isViolation = rule.direction === 'up'
@@ -400,7 +477,7 @@ function evaluateMonotonic(rules, currentMetrics, baselineMetrics) {
             }
         }
     }
-    return failures;
+    return { failures, unevaluated };
 }
 // =============================================================================
 // Script Evaluation
@@ -435,18 +512,26 @@ function evaluateScripts(rules, metrics) {
 // =============================================================================
 export function evaluateRules(rules, currentMetrics, baselineEntry) {
     const baselineMetrics = baselineEntry?.metrics;
+    const monotonic = evaluateMonotonic(rules, currentMetrics, baselineMetrics);
     const allFailures = [
         // First, so the reason a dimension is absent is stated before the rules
         // that read it start reporting it as absent.
         ...evaluateMeasurements(rules, currentMetrics),
         ...evaluateFloors(rules, currentMetrics),
         ...evaluateCeilings(rules, currentMetrics),
-        ...evaluateMonotonic(rules, currentMetrics, baselineMetrics),
+        ...monotonic.failures,
         ...evaluateScripts(rules, currentMetrics),
     ];
     return {
+        // `unevaluated` deliberately does NOT feed this. A rule that did not run has
+        // produced no evidence of a violation, and inventing one would fail the gate on
+        // every fresh clone and every commit that adds a ratchet. The consequence is
+        // carried on the CACHE instead -- see `unevaluated`'s doc comment and the
+        // `monotonicEvaluated` write in cli.ts -- so a pass with an unevaluated rule
+        // cannot be inherited by a later run as `PASSED (cached)`.
         status: allFailures.length === 0 ? 'pass' : 'fail',
         failedRules: allFailures,
+        unevaluated: monotonic.unevaluated,
     };
 }
 /**

@@ -1101,6 +1101,83 @@ describe('evaluateRules', () => {
       expect(result.status).toBe('pass')
     })
 
+    // Found by adversarial review after the per-metric fix landed. The no-baseline
+    // case returned early with an empty list, on the reasoning that the CLI says so in
+    // its own words -- true of the CLI, and false of every other consumer. The MCP
+    // handler was confirmed serialising `{status:"pass", failedRules:[],
+    // unevaluated:[]}` for a project where every ratchet was skipped, which is a clean
+    // bill of health for a run that compared nothing. The rule belongs in the
+    // evaluator so no consumer re-derives it; the CLI filters `no-baseline` out of its
+    // own printed list.
+    it('reports every ratchet as unevaluated when there is no baseline at all', () => {
+      const rules: QualityRules = {
+        version: '1.0.0',
+        rules: {
+          monotonic: [
+            { direction: 'up', metrics: ['coverage.unit.branches'] },
+            { direction: 'down', metrics: ['typescript.errors', 'eslint.errors'] },
+          ],
+        },
+      }
+
+      const metrics: Metrics = {
+        coverage: { unit: { branches: 50, statements: 60, functions: 50, lines: 55 } },
+        typescript: { errors: 0, warnings: 0, rootCauses: 0 },
+        eslint: { errors: 0, warnings: 0, rootCauses: 0 },
+        scripts: {},
+        sloc: 1000,
+      }
+
+      const result = evaluateRules(rules, metrics, undefined)
+
+      expect(result.status).toBe('pass')
+      // One per METRIC, not one per rule: three metrics across two rules.
+      expect(result.unevaluated).toHaveLength(3)
+      expect(result.unevaluated.every((u) => u.reason === 'no-baseline')).toBe(true)
+      expect(result.unevaluated.map((u) => u.rule)).toEqual([
+        'up:coverage.unit.branches',
+        'down:typescript.errors',
+        'down:eslint.errors',
+      ])
+    })
+
+    // A rule listing no metrics runs zero comparisons and, before this, left no trace:
+    // the inner loop simply did not execute, so with a baseline present the run was
+    // recorded as fully evaluated and the pass was cacheable. rules.json is
+    // `JSON.parse`d and cast with no runtime validation of this shape, so
+    // `{"direction":"down","metrics":[]}` is a config anyone can write.
+    it('reports a monotonic rule that names no metrics', () => {
+      const rules: QualityRules = {
+        version: '1.0.0',
+        rules: { monotonic: [{ direction: 'down', metrics: [] }] },
+      }
+
+      const metrics: Metrics = {
+        typescript: { errors: 0, warnings: 0, rootCauses: 0 },
+        eslint: { errors: 0, warnings: 0, rootCauses: 0 },
+        scripts: {},
+        sloc: 1000,
+      }
+
+      const baselineEntry: CacheEntry = {
+        timestamp: Date.now(),
+        rulesHash: 'def',
+        rulesVersion: '1.0.0',
+        metrics: {
+          typescript: { errors: 0, warnings: 0, rootCauses: 0 },
+          eslint: { errors: 0, warnings: 0, rootCauses: 0 },
+          scripts: {},
+          sloc: 1000,
+        },
+        evaluation: { status: 'pass', failedRules: [] },
+      }
+
+      const result = evaluateRules(rules, metrics, baselineEntry)
+
+      expect(result.unevaluated).toHaveLength(1)
+      expect(result.unevaluated[0].reason).toBe('no-metrics')
+    })
+
     it('skips monotonic evaluation when no baseline', () => {
       const rules: QualityRules = {
         version: '1.0.0',
@@ -1124,7 +1201,13 @@ describe('evaluateRules', () => {
       expect(result.status).toBe('pass')
     })
 
-    it('skips metric comparison when baseline metric is undefined', () => {
+    // #28. A ratchet whose baseline value is absent does not fail -- a rule that did
+    // not run is not evidence of a violation -- but it must not pass in SILENCE
+    // either. The `unevaluated` assertion is the point of this test; the `pass` was
+    // all it checked before, and that is exactly the state a run could reach while
+    // being cached as a fully-earned verdict. Reachable by adding a ratchet to
+    // rules.json after the baseline was written.
+    it('reports a ratchet whose baseline value is absent instead of skipping it', () => {
       const rules: QualityRules = {
         version: '1.0.0',
         rules: {
@@ -1158,11 +1241,29 @@ describe('evaluateRules', () => {
 
       const result = evaluateRules(rules, currentMetrics, baselineEntry)
 
-      // Should pass because missing baseline metric is skipped
+      // No violation to report -- there is nothing to compare against.
       expect(result.status).toBe('pass')
+      expect(result.failedRules).toHaveLength(0)
+
+      // ...but the run is on the record as narrower than a clean one.
+      expect(result.unevaluated).toHaveLength(1)
+      expect(result.unevaluated[0]).toMatchObject({
+        type: 'monotonic',
+        rule: 'up:coverage.unit.branches',
+        metricPath: 'coverage.unit.branches',
+        reason: 'baseline-missing',
+      })
+      expect(result.unevaluated[0].message).toContain('absent from the baseline')
     })
 
-    it('skips metric comparison when current metric is undefined', () => {
+    // The other half of the same guard. A ratchet with a live baseline and no CURRENT
+    // value is a different diagnosis -- the reading is incomplete, not history --
+    // and it is reported as such. Usually a measurement failure arrives with it and
+    // fails the gate independently (see the #43 test above, which asserts exactly
+    // that); this fixture omits the failure so the unevaluated channel is what is
+    // under test, which is also the shape a dimension with no failure channel
+    // produces (#42).
+    it('reports a ratchet whose current value is absent, distinguishing it from a stale baseline', () => {
       const rules: QualityRules = {
         version: '1.0.0',
         rules: {
@@ -1196,8 +1297,102 @@ describe('evaluateRules', () => {
 
       const result = evaluateRules(rules, currentMetrics, baselineEntry)
 
-      // Should pass because missing current metric is skipped
       expect(result.status).toBe('pass')
+      expect(result.unevaluated).toHaveLength(1)
+      expect(result.unevaluated[0].reason).toBe('current-missing')
+      expect(result.unevaluated[0].message).toContain("absent from this run's")
+    })
+
+    // The negative control for the pair above. Without it, "report everything as
+    // unevaluated" would satisfy both of them, and every run would be demoted to a
+    // baseline-only entry -- which is the same cache deadlock the two-tier write
+    // exists to avoid, arrived at from the other direction.
+    it('reports nothing unevaluated when both values are present', () => {
+      const rules: QualityRules = {
+        version: '1.0.0',
+        rules: {
+          monotonic: [
+            { direction: 'up', metrics: ['coverage.unit.branches'] },
+            { direction: 'down', metrics: ['typescript.errors'] },
+          ],
+        },
+      }
+
+      const metrics: Metrics = {
+        coverage: { unit: { branches: 85, statements: 90, functions: 80, lines: 85 } },
+        typescript: { errors: 0, warnings: 0, rootCauses: 0 },
+        eslint: { errors: 0, warnings: 0, rootCauses: 0 },
+        scripts: {},
+        sloc: 1000,
+      }
+
+      const baselineEntry: CacheEntry = {
+        timestamp: Date.now(),
+        rulesHash: 'def',
+        rulesVersion: '1.0.0',
+        metrics: {
+          coverage: { unit: { branches: 80, statements: 85, functions: 75, lines: 80 } },
+          typescript: { errors: 0, warnings: 0, rootCauses: 0 },
+          eslint: { errors: 0, warnings: 0, rootCauses: 0 },
+          scripts: {},
+          sloc: 1000,
+        },
+        evaluation: { status: 'pass', failedRules: [] },
+      }
+
+      const result = evaluateRules(rules, metrics, baselineEntry)
+
+      expect(result.status).toBe('pass')
+      expect(result.unevaluated).toEqual([])
+    })
+
+    // Per-METRIC, not per-rule: one rule naming two metrics, one of which the
+    // baseline carries. The comparable metric must still be enforced. An
+    // implementation that gave up on the whole rule at the first absent metric would
+    // pass this test's `pass` assertion and fail its `failedRules` one.
+    it('still enforces the comparable metrics of a rule that also names an absent one', () => {
+      const rules: QualityRules = {
+        version: '1.0.0',
+        rules: {
+          monotonic: [
+            {
+              direction: 'up',
+              metrics: ['coverage.unit.branches', 'coverage.lambda.branches'],
+            },
+          ],
+        },
+      }
+
+      const metrics: Metrics = {
+        coverage: { unit: { branches: 70, statements: 90, functions: 80, lines: 85 } },
+        typescript: { errors: 0, warnings: 0, rootCauses: 0 },
+        eslint: { errors: 0, warnings: 0, rootCauses: 0 },
+        scripts: {},
+        sloc: 1000,
+      }
+
+      const baselineEntry: CacheEntry = {
+        timestamp: Date.now(),
+        rulesHash: 'def',
+        rulesVersion: '1.0.0',
+        metrics: {
+          coverage: { unit: { branches: 80, statements: 85, functions: 75, lines: 80 } },
+          typescript: { errors: 0, warnings: 0, rootCauses: 0 },
+          eslint: { errors: 0, warnings: 0, rootCauses: 0 },
+          scripts: {},
+          sloc: 1000,
+        },
+        evaluation: { status: 'pass', failedRules: [] },
+      }
+
+      const result = evaluateRules(rules, metrics, baselineEntry)
+
+      expect(result.status).toBe('fail')
+      expect(result.failedRules).toHaveLength(1)
+      expect(result.failedRules[0].rule).toBe('up:coverage.unit.branches')
+
+      expect(result.unevaluated).toHaveLength(1)
+      expect(result.unevaluated[0].metricPath).toBe('coverage.lambda.branches')
     })
 
     it('fails when metric increases (direction: down)', () => {

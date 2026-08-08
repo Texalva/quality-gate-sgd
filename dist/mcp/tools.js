@@ -124,6 +124,17 @@ export async function handleRun(args) {
                 rule: f.rule,
                 message: f.message,
             })),
+            // Same reasoning as `unmeasured` above, one step further along: a rule that
+            // did not RUN is not in `failedRules` either, and an agent reading
+            // `status: "pass"` with an empty `failedRules` would conclude the ratchet held.
+            // It did not run. Omitting this key is how an agent gets talked into believing
+            // a narrower reading than it actually got.
+            unevaluatedRules: result.unevaluated.map(u => ({
+                type: u.type,
+                rule: u.rule,
+                reason: u.reason,
+                message: u.message,
+            })),
         };
         return {
             content: [{ type: 'text', text: JSON.stringify(response, null, 2) }],

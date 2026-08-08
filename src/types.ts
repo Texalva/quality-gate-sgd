@@ -63,9 +63,19 @@ import type { PackageManager } from './runner.js';
  *       whose code falls outside `codePathspecs` the WIP hash is sha256("") for
  *       every working-tree state, so the key never moves (#40).
  *   Do not strengthen this claim back to "complete" until those are closed.
+ *
+ * 5 -- an individual ratcheted metric absent from the baseline became a rule that
+ *   DID NOT RUN, rather than one that silently passed. Version 4 recorded the
+ *   opposite: `monotonicSkipped` in cli.ts was true only when the whole baseline was
+ *   missing, so a run that skipped a ratchet per-metric was stamped
+ *   `monotonicEvaluated: true`, and `isCacheValid` refuses only an explicit `false`.
+ *   Adversarial review CONSTRUCTED such an entry and confirmed `isCacheValid`
+ *   returns true for it -- so without this bump the fixed build would serve, as an
+ *   earned verdict, precisely the run the fix exists to catch. Reachable by anyone
+ *   who ran a previous build with a ratchet in rules.json.
  */
 export interface QualityGateCache {
-  schemaVersion: 4;
+  schemaVersion: 5;
   entries: Record<string, CacheEntry>;
 }
 
@@ -82,8 +92,15 @@ export interface CacheEntry {
   metrics: Metrics;
 
   /**
-   * False when this run had monotonic rules configured and no baseline to compare
-   * them against, so they did not execute.
+   * False when some monotonic rule configured for this run did not execute.
+   *
+   * TWO ways that happens, and the second was silently unrecorded for longer than
+   * the first. (1) No baseline entry at all, so `evaluateMonotonic` returns nothing.
+   * (2) A baseline exists and is accepted, but an INDIVIDUAL ratcheted metric is
+   * absent from it (a ratchet added to rules.json after the baseline was written, a
+   * dimension renamed, a dimension that was failing to measure when the baseline was
+   * taken) or absent from this run's reading. Both leave a configured rule
+   * unexecuted, so both write `false`; see `EvaluationResult.unevaluated`.
    *
    * The entry is then a usable BASELINE and not a usable VERDICT, and that
    * distinction is the whole reason the field exists. Refusing to write it at all --
@@ -340,6 +357,61 @@ export interface MonotonicRule {
 export interface EvaluationResult {
   status: 'pass' | 'fail';
   failedRules: FailedRule[];
+
+  /**
+   * Rules that were configured and did not execute -- neither passed nor failed.
+   *
+   * A third outcome, distinct from both lists above, and it exists because the
+   * second list cannot express it. This tool's thesis is that a passing check is
+   * evidence only if it was capable of failing; a rule that never ran produced no
+   * evidence either way, and folding that into `status: 'pass'` with an empty
+   * `failedRules` is exactly the vacuous pass everything else here is built to
+   * prevent.
+   *
+   * Reported rather than failed, deliberately: failing here would break every fresh
+   * clone and every commit that adds a ratchet, which is a policy change adopters
+   * must opt into. What it DOES buy is that the run is recorded as a narrower
+   * reading -- `monotonicEvaluated: false` -- so `isCacheValid` will not serve it as
+   * a verdict later. The gap converges instead of being inherited: the entry written
+   * now carries the metric, so the next commit ratchets against it properly.
+   *
+   * REQUIRED, not optional. An optional list defaulting to empty lets a future
+   * evaluation path forget to report what it skipped, which is the failure mode this
+   * field exists to close.
+   */
+  unevaluated: UnevaluatedRule[];
+}
+
+/**
+ * A configured rule that could not be applied, and why.
+ *
+ * `rule` uses the same identity string as `FailedRule.rule` for the same rule
+ * (`${direction}:${metricPath}` for monotonic), so a reader can match the two.
+ */
+export interface UnevaluatedRule {
+  type: 'monotonic';
+  rule: string;
+  metricPath: string;
+  /**
+   * `no-baseline`: there is no baseline entry at all, so nothing was compared. The
+   * CLI states this once in its own words and drops these from the list it prints;
+   * every other consumer needs them, which is why they are produced (an MCP client
+   * was confirmed reporting `{status:"pass", failedRules:[], unevaluated:[]}` for a
+   * run where every ratchet was skipped).
+   *
+   * `baseline-missing`: a baseline exists and was accepted, but carries no value for
+   * this metric -- a ratchet added after it was written, a renamed dimension.
+   *
+   * `current-missing`: this run's reading carries no value. Usually arrives with a
+   * measurement failure that fails the gate on its own, but not always -- a
+   * dimension with no failure channel (sonarqube, #42) loses its value silently.
+   *
+   * `no-metrics`: the rule itself names no metric paths, so it compares nothing. A
+   * configuration error rather than a missing reading, and reported here because the
+   * consequence is identical: a configured rule that cannot fail.
+   */
+  reason: 'no-baseline' | 'baseline-missing' | 'current-missing' | 'no-metrics';
+  message: string;
 }
 
 export interface FailedRule {

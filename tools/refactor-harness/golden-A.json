@@ -22376,6 +22376,43 @@
         "baseline": 0,
         "current": 640
       }
+    ],
+    "unevaluated": [
+      {
+        "type": "monotonic",
+        "rule": "up:coverage.unit.branches",
+        "metricPath": "coverage.unit.branches",
+        "reason": "no-baseline",
+        "message": "there is no baseline reading to compare against, so the 'up' ratchet on coverage.unit.branches did not run"
+      },
+      {
+        "type": "monotonic",
+        "rule": "up:coverage.unit.statements",
+        "metricPath": "coverage.unit.statements",
+        "reason": "no-baseline",
+        "message": "there is no baseline reading to compare against, so the 'up' ratchet on coverage.unit.statements did not run"
+      },
+      {
+        "type": "monotonic",
+        "rule": "down:typescript.errors",
+        "metricPath": "typescript.errors",
+        "reason": "no-baseline",
+        "message": "there is no baseline reading to compare against, so the 'down' ratchet on typescript.errors did not run"
+      },
+      {
+        "type": "monotonic",
+        "rule": "down:eslint.errors",
+        "metricPath": "eslint.errors",
+        "reason": "no-baseline",
+        "message": "there is no baseline reading to compare against, so the 'down' ratchet on eslint.errors did not run"
+      },
+      {
+        "type": "monotonic",
+        "rule": "down:eslint.warnings",
+        "metricPath": "eslint.warnings",
+        "reason": "no-baseline",
+        "message": "there is no baseline reading to compare against, so the 'down' ratchet on eslint.warnings did not run"
+      }
     ]
   },
   "evaluationError": null,
@@ -22387,7 +22424,7 @@
       "parsedOk": true,
       "filesCount": 524,
       "messageCount": 1038,
-      "elapsedMs": 38978,
+      "elapsedMs": 37861,
       "budgetMs": 120000,
       "killed": false,
       "toolReportedCount": 1038,
@@ -22399,7 +22436,7 @@
       "exitCode": 0,
       "combinedBytes": 92,
       "errorCount": 0,
-      "elapsedMs": 29183,
+      "elapsedMs": 27696,
       "budgetMs": 60000,
       "killed": false,
       "unexpectedExit": false,

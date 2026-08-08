@@ -240,25 +240,28 @@ export function coverageAbsenceIsFailure(rules) {
  * `metrics.measurementFailures` carries them, `describeUnmeasured` renders them
  * for `score` and `suggest`, and the CLI lists them by name.
  *
- * With ONE exception, which is a hole rather than a design: `sonarqube` has no
- * failure channel at all. `extractSonarqubeMetrics` returns `undefined` from a
- * bare catch and from an empty-`measures` check, and `extractAllMetrics` builds
- * `measurementFailures` from typescript, eslint, coverage and custom only. So an
- * expired token or an unprovisioned projectKey loses the whole dimension with an
- * empty failure list, and every `sonarqube.*` ceiling hits the silent `continue`
- * in `evaluateCeilings` while the run is graded as a complete reading. Filed as
- * #23/#42. Read every "carries every failure" claim in this codebase as "every
- * failure from a dimension that has a channel" until that is closed.
+ * Every dimension now HAS a channel, sonarqube included, so the qualification that
+ * used to stand here is gone. It read: sonarqube has none, an expired token or an
+ * unprovisioned projectKey loses the whole dimension with an empty failure list, and
+ * every `sonarqube.*` ceiling hits the silent `continue` below while the run is
+ * graded as a complete reading. `readSonarqubeMetrics` closed that -- it classifies
+ * the loss as unreachable / access-denied / project-not-found / empty-measures and
+ * `extractAllMetrics` carries it here like any other.
  *
  * This reverses the stance that stood here, and the reason is worth stating,
  * because the old stance was right when it was written. Every failure the tool
  * could then produce came from a dimension the default rules gate: a dead
  * type-checker or linter is guarded by `typescript.errors` and `eslint.errors`
  * ceilings that both embedded defaults ship, and the floor/ceiling asymmetry
- * below is what made it necessary -- a missing FLOOR metric fails loudly
- * (`Metric '...' not available`) while a missing CEILING metric is skipped
+ * was what made it necessary -- a missing FLOOR metric failed loudly
+ * (`Metric '...' not available`) while a missing CEILING metric was skipped
  * without a word. So "evaluate regardless of the rules" cost nothing and closed
  * a real hole.
+ *
+ * That asymmetry is closed now, from the other side: `evaluateCeilings` reports an
+ * absent ceiling metric as a rule that did not run, which the CLI prints and which
+ * makes the entry baseline-only. So the hole this stance used to cover no longer
+ * needs covering, and the narrowing costs nothing it used to.
  *
  * It stopped being right once a provider measured a suite nobody configured.
  * `lambdaDir` defaults to `coverage-lambda` and is populated unconditionally, so
@@ -344,16 +347,50 @@ function evaluateFloors(rules, metrics) {
 // =============================================================================
 // Ceiling Evaluation
 // =============================================================================
+/**
+ * Ceilings, and the ones that could not be applied.
+ *
+ * The silent `continue` on an absent metric was the last vacuous pass with no
+ * channel of its own, and this codebase already named it: a missing FLOOR metric
+ * fails loudly (`Metric '...' not available`) while a missing CEILING metric was
+ * skipped without a word. So `sonarqube.blocker: 0` was satisfied by a dimension
+ * nobody measured, `custom.leaks: 0` by an extractor nobody configured, and the gate
+ * printed a clean pass over both.
+ *
+ * It still does not FAIL, and that is deliberate -- see `evaluateMeasurements` for
+ * why promoting an unmeasured dimension to a failure was tried and reversed. What
+ * changes is that the rule is now REPORTED as unevaluated, which the CLI prints and
+ * which marks the cache entry baseline-only, so no later run inherits the pass as a
+ * verdict it never earned.
+ *
+ * A failure that already explains the absence is not reported twice: an unreachable
+ * SonarQube produces one `sonarqube.measurement` failed rule, and every
+ * `sonarqube.*` ceiling behind it is silent. The distinction is exactly "is there a
+ * stated reason this is missing" -- if there is, it is reported there; if there is
+ * not, it is reported here.
+ */
 function evaluateCeilings(rules, metrics) {
     const failures = [];
+    const unevaluated = [];
     const ceilings = rules.rules.ceilings;
     if (!ceilings) {
-        return failures;
+        return { failures, unevaluated };
     }
+    const explained = new Set((metrics.measurementFailures ?? []).map((failure) => failure.dimension));
     for (const [metricPath, threshold] of Object.entries(ceilings)) {
         const value = getMetricValue(metrics, metricPath);
         if (value === undefined) {
-            // Ceilings are optional - missing metric is not a failure
+            if (!dimensionOf(metricPath).some((dimension) => explained.has(dimension))) {
+                unevaluated.push({
+                    type: 'skipped-dimension',
+                    rule: metricPath,
+                    metricPath,
+                    reason: 'dimension-skipped',
+                    message: `Ceiling '${metricPath}' <= ${threshold} was not applied: this run has no ` +
+                        'value for that metric, and nothing reported a reason it is missing. The ' +
+                        'dimension was skipped (--coverage-only), or nothing produces it.',
+                });
+            }
             continue;
         }
         if (value > threshold) {
@@ -366,7 +403,18 @@ function evaluateCeilings(rules, metrics) {
             });
         }
     }
-    return failures;
+    return { failures, unevaluated };
+}
+/**
+ * The dimension names a metric path could belong to, longest first.
+ *
+ * `coverage.unit.lines` is measured by `coverage.unit`, not by `coverage`, and
+ * `sonarqube.blocker` by `sonarqube` -- so a prefix walk rather than a single split,
+ * because a measurement failure names whichever level actually failed.
+ */
+function dimensionOf(metricPath) {
+    const parts = metricPath.split('.');
+    return parts.slice(0, -1).map((_, index) => parts.slice(0, index + 1).join('.'));
 }
 // =============================================================================
 // Monotonic Evaluation
@@ -514,12 +562,13 @@ function evaluateScripts(rules, metrics) {
 export function evaluateRules(rules, currentMetrics, baselineEntry) {
     const baselineMetrics = baselineEntry?.metrics;
     const monotonic = evaluateMonotonic(rules, currentMetrics, baselineMetrics);
+    const ceilings = evaluateCeilings(rules, currentMetrics);
     const allFailures = [
         // First, so the reason a dimension is absent is stated before the rules
         // that read it start reporting it as absent.
         ...evaluateMeasurements(rules, currentMetrics),
         ...evaluateFloors(rules, currentMetrics),
-        ...evaluateCeilings(rules, currentMetrics),
+        ...ceilings.failures,
         ...monotonic.failures,
         ...evaluateScripts(rules, currentMetrics),
     ];
@@ -532,7 +581,7 @@ export function evaluateRules(rules, currentMetrics, baselineEntry) {
         // cannot be inherited by a later run as `PASSED (cached)`.
         status: allFailures.length === 0 ? 'pass' : 'fail',
         failedRules: allFailures,
-        unevaluated: monotonic.unevaluated,
+        unevaluated: [...monotonic.unevaluated, ...ceilings.unevaluated],
     };
 }
 /**

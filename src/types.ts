@@ -56,8 +56,6 @@ import type { PackageManager } from './runner.js';
  *   intermediate build that scoped the suppression to gated failures only.
  *
  *   "No recorded failure" is weaker than COMPLETE, and the gap is not closed:
- *     - `sonarqube` has no failure channel at all, so a reading that lost that
- *       whole dimension records an empty failure list and caches as clean (#42).
  *     - The key covers tracked content only, so a coverage report corrupted after
  *       a clean entry was written is never re-read (#41) -- and for a project
  *       whose code falls outside `codePathspecs` the WIP hash is sha256("") for
@@ -75,9 +73,29 @@ import type { PackageManager } from './runner.js';
  *   who ran a previous build with a ratchet in rules.json.
  *
  *   Also carried by 5: `measurementInputsHash`, below.
+ *
+ * 6 -- a lost SonarQube reading became a measurement failure, where version 5 had no
+ *   channel for one at all. A version-5 entry can therefore hold a PASS from a run
+ *   whose SonarQube was unreachable, refusing, or unprovisioned: no `sonarqube`
+ *   metrics, no recorded failure, and every `sonarqube.*` ceiling reached by the
+ *   silent skip in `evaluateCeilings`. Adversarial review constructed that entry and
+ *   confirmed `isCacheValid` accepts it -- so the fixed build would serve, as an
+ *   earned verdict, the exact run the fix exists to catch, and would exit 0 before
+ *   contacting the server. Reachable by anyone who ran a version-5 build, which is
+ *   every build between the ratchet fix and this one.
+ *
+ *   Three further changes to what a pass means arrived with it, any one sufficient:
+ *     - An absent CEILING metric with no stated reason is now reported as a rule that
+ *       did not run, which marks the entry baseline-only. Version 5 skipped it in
+ *       silence, so a stored PASS can rest on ceilings nothing applied.
+ *     - A partial `/api/measures/component` response is refused. Version 5
+ *       substituted 0 for any measure the server did not send, so a response
+ *       carrying only `bugs` satisfied every other sonarqube ceiling at zero.
+ *     - Only HTTP 200 counts as a reading. Version 5 accepted every status below
+ *       400, so a 3xx redirect body of the right shape was accepted as measures.
  */
 export interface QualityGateCache {
-  schemaVersion: 5;
+  schemaVersion: 6;
   entries: Record<string, CacheEntry>;
 }
 
@@ -341,8 +359,15 @@ export interface SonarqubeMetrics {
   bugs: number;
   vulnerabilities: number;
   codeSmells: number;
-  coverage: number;
-  duplications: number;
+  /**
+   * Optional because SonarQube reports coverage only where the scan imported a
+   * coverage report, and a project that feeds it none is not a project with 0%
+   * coverage. Absent is not zero: a floor on this fails as "not available", where a
+   * substituted 0 would report a real measurement of nil.
+   */
+  coverage?: number;
+  /** Optional for the same reason as {@link coverage}. */
+  duplications?: number;
   // Severity breakdown
   blocker: number;
   critical: number;
@@ -415,7 +440,17 @@ export interface EvaluationResult {
  * (`${direction}:${metricPath}` for monotonic), so a reader can match the two.
  */
 export interface UnevaluatedRule {
-  type: 'monotonic';
+  /**
+   * `monotonic`: a ratchet that compared nothing.
+   *
+   * `skipped-dimension`: a floor or ceiling on a dimension this run was told not to
+   * measure. `--coverage-only` with a rules.json that grades `sonarqube.*` is the
+   * case: the metric is absent, so the ceiling hits the silent `continue` in
+   * `evaluateCeilings` and the run reports a clean pass on rules nothing checked.
+   * Reported rather than failed, because the adopter asked for the skip -- but
+   * recorded, so the entry cannot later be served to a run that did NOT skip it.
+   */
+  type: 'monotonic' | 'skipped-dimension';
   rule: string;
   metricPath: string;
   /**
@@ -430,13 +465,22 @@ export interface UnevaluatedRule {
    *
    * `current-missing`: this run's reading carries no value. Usually arrives with a
    * measurement failure that fails the gate on its own, but not always -- a
-   * dimension with no failure channel (sonarqube, #42) loses its value silently.
+   * dimension whose reading is absent for a reason nothing classified loses its
+   * value silently. (sonarqube was that dimension until it got a channel of its own.)
    *
    * `no-metrics`: the rule itself names no metric paths, so it compares nothing. A
    * configuration error rather than a missing reading, and reported here because the
    * consequence is identical: a configured rule that cannot fail.
+   *
+   * `dimension-skipped`: the run was told not to measure the dimension this rule
+   * grades, so there is no value to compare against the threshold.
    */
-  reason: 'no-baseline' | 'baseline-missing' | 'current-missing' | 'no-metrics';
+  reason:
+    | 'no-baseline'
+    | 'baseline-missing'
+    | 'current-missing'
+    | 'no-metrics'
+    | 'dimension-skipped';
   message: string;
 }
 

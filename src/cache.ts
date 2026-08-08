@@ -39,7 +39,7 @@ import { measurementInputsHash, measurementInputsListing } from './measurement-i
  * point: the fix must not be undone by a cache written before it. Full reasoning on
  * QualityGateCache in types.ts.
  */
-const CURRENT_SCHEMA_VERSION = 5;
+const CURRENT_SCHEMA_VERSION = 6;
 
 /**
  * Buffer ceiling for the git reads whose output scales with the repository.

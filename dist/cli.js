@@ -183,9 +183,6 @@ async function runQualityGate(options = { skipSonarQube: false }) {
             // for the tree in front of us, because both are reachable and neither is
             // closed:
             //
-            //   - `sonarqube` has no failure channel (see `evaluateMeasurements`), so a
-            //     reading that lost that dimension wholesale records an empty failure
-            //     list and is cached as complete. #23/#42.
             //   - The cache key covers tracked content only. Coverage reports are
             //     untracked by design, so a report that is corrupted AFTER a clean
             //     entry is written is never re-read: the same tree is a hard FAIL when

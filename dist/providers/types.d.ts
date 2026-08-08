@@ -83,7 +83,17 @@ export type Result<T, E> = {
  * other project used to lose its coverage ceilings and ratchets in silence,
  * because `evaluateFloors` is the only evaluator that reports a missing metric.
  */
-export type MeasurementFailureKind = 'tool-missing' | 'crashed' | 'timed-out' | 'output-truncated' | 'unparseable-output' | 'report-missing' | 'measured-nothing';
+export type MeasurementFailureKind = 'tool-missing' | 'crashed' | 'timed-out' | 'output-truncated' | 'unparseable-output' | 'report-missing' | 'measured-nothing'
+/**
+ * The service answered and REFUSED: 401 or 403 from a SonarQube endpoint.
+ *
+ * Its own kind for the reason the others are: the response it calls for is
+ * different from every neighbour. `tool-missing` says fix the URL, this says
+ * rotate or grant the token, and confusing the two sends an adopter to the wrong
+ * file. It is also the likeliest sonarqube failure in practice -- a rotated
+ * SONARQUBE_TOKEN needs no change to anything else to arrive.
+ */
+ | 'access-denied';
 /**
  * What a failed measurement was measuring.
  *

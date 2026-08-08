@@ -5,6 +5,8 @@ import {
   resetConfig,
   getSonarAuthToken,
   getSonarCurlAuth,
+  sonarAuthArgs,
+  redactUrlCredentials,
 } from '../src/config.js'
 import {
   writeFileSync,
@@ -430,5 +432,81 @@ describe('getSonarCurlAuth', () => {
     const auth = getSonarCurlAuth()
 
     expect(auth).toBe('-u my-token:')
+  })
+})
+
+/**
+ * The argv form, which exists because the string form above is only usable where a
+ * shell parses it -- and a shell is exactly what a credential must not reach.
+ */
+describe('sonarAuthArgs', () => {
+  const testTokenPath = path.join(process.cwd(), '.test-sonar-token-argv')
+
+  afterEach(() => {
+    if (existsSync(testTokenPath)) unlinkSync(testTokenPath)
+    delete process.env.SONARQUBE_DEFAULT_PASSWORD
+    resetConfig()
+  })
+
+  it('returns two argv words, never one string', () => {
+    expect(sonarAuthArgs()).toEqual(['-u', 'admin:admin'])
+  })
+
+  it('returns the token with an empty password when a token file exists', () => {
+    process.env.SONARQUBE_TOKEN_FILE = testTokenPath
+    writeFileSync(testTokenPath, 'my-token\n')
+    resetConfig()
+
+    expect(sonarAuthArgs()).toEqual(['-u', 'my-token:'])
+  })
+
+  // The string form splits this into `-u`, `admin:first`, `second`, so curl reads a
+  // password of `first` and a URL of `second`. As argv it survives intact -- and the
+  // by-value redaction can find it, which a `-u \S+` regex could not.
+  it('carries a password containing a space as one argv word', () => {
+    process.env.SONARQUBE_DEFAULT_PASSWORD = 'first second'
+    resetConfig()
+
+    expect(sonarAuthArgs()).toEqual(['-u', 'admin:first second'])
+  })
+
+  // Through a shell these change what runs. Through execve they are just bytes.
+  it('carries shell metacharacters verbatim', () => {
+    process.env.SONARQUBE_DEFAULT_PASSWORD = 'a;rm -rf /$(id)`whoami`'
+    resetConfig()
+
+    expect(sonarAuthArgs()).toEqual(['-u', 'admin:a;rm -rf /$(id)`whoami`'])
+  })
+})
+
+// SONARQUBE_URL may itself embed a credential, and every failure message and piece
+// of evidence names the URL -- so redacting the `-u` argument alone is not enough.
+describe('redactUrlCredentials', () => {
+  it('leaves a URL with no credential untouched', () => {
+    expect(redactUrlCredentials('https://sonar.example.com/')).toBe(
+      'https://sonar.example.com/'
+    )
+  })
+
+  it('removes userinfo from a URL that carries it', () => {
+    const redacted = redactUrlCredentials('https://user:squ_secret@sonar.example.com')
+
+    expect(redacted).not.toContain('squ_secret')
+    expect(redacted).not.toContain('user:')
+    expect(redacted).toContain('sonar.example.com')
+  })
+
+  it('removes a token-only userinfo as well', () => {
+    expect(redactUrlCredentials('https://squ_secret@sonar.example.com')).not.toContain(
+      'squ_secret'
+    )
+  })
+
+  // Falls back to a textual strip rather than returning the input, because returning
+  // the input is how a credential reaches a log.
+  it('still strips userinfo from a string that will not parse as a URL', () => {
+    expect(redactUrlCredentials('not a url //user:squ_secret@host/x')).not.toContain(
+      'squ_secret'
+    )
   })
 })

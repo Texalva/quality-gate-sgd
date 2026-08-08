@@ -1856,3 +1856,134 @@ describe('isCacheValid', () => {
     expect(isCacheValid(withFailure('fail'), rules)).toBe(false)
   })
 })
+
+/**
+ * The floor/ceiling asymmetry, which this codebase documented as a known hole for as
+ * long as it stood: a missing FLOOR metric fails loudly (`Metric '...' not
+ * available`) while a missing CEILING metric was skipped without a word. Adversarial
+ * review reached it through `--coverage-only` with a rules.json that grades
+ * `sonarqube.*`, which is a supported configuration and reported a clean pass on
+ * rules nothing applied.
+ */
+describe('a ceiling whose metric was never measured', () => {
+  const ceilingRules = (ceilings: Record<string, number>): QualityRules => ({
+    version: '1.0.0',
+    rules: { ceilings },
+  })
+
+  const bare: Metrics = { scripts: {}, coverage: {}, sloc: 100 }
+
+  it('is reported as a rule that did not run, not silently skipped', () => {
+    const result = evaluateRules(ceilingRules({ 'sonarqube.blocker': 0 }), bare)
+
+    expect(result.unevaluated).toHaveLength(1)
+    expect(result.unevaluated[0]).toMatchObject({
+      type: 'skipped-dimension',
+      rule: 'sonarqube.blocker',
+      reason: 'dimension-skipped',
+    })
+  })
+
+  // Reported, not failed. Promoting an unmeasured dimension to a failure was tried
+  // and reversed -- see `evaluateMeasurements` -- because it fails a project for a
+  // dimension nobody configured, and noise in the loud channel trains adopters to
+  // stop reading it.
+  it('does not fail the gate', () => {
+    const result = evaluateRules(ceilingRules({ 'sonarqube.blocker': 0 }), bare)
+
+    expect(result.status).toBe('pass')
+    expect(result.failedRules).toHaveLength(0)
+  })
+
+  // The consequence that matters: `cli.ts` turns a nonempty `unevaluated` into
+  // `monotonicEvaluated: false`, and `isCacheValid` refuses such an entry as a
+  // verdict. So the pass is not inheritable by a later run that DID measure.
+  it('leaves the run uncacheable as a verdict', () => {
+    const rules = ceilingRules({ 'sonarqube.blocker': 0 })
+    const result = evaluateRules(rules, bare)
+
+    const entry = {
+      timestamp: 1,
+      rulesVersion: '1.0.0',
+      rulesHash: computeRulesHash(rules),
+      evaluation: { status: 'pass' as const, failedRules: [] },
+      metrics: bare,
+      monotonicEvaluated: result.unevaluated.length === 0,
+    }
+
+    expect(isCacheValid(entry, rules)).toBe(false)
+  })
+
+  // Not reported twice. An unreachable SonarQube already produces one
+  // `sonarqube.measurement` failed rule that names the reason; repeating it once per
+  // ceiling behind it would bury the one line that says what to fix.
+  it('stays silent when a measurement failure already explains the absence', () => {
+    const withFailure: Metrics = {
+      ...bare,
+      measurementFailures: [
+        {
+          kind: 'tool-missing',
+          dimension: 'sonarqube',
+          message: 'SonarQube did not answer',
+          evidence: {
+            via: 'process',
+            command: 'curl -u <redacted> "http://localhost:9000/api/x"',
+            exitCode: null,
+            signal: null,
+            elapsedMs: 1,
+            stdoutBytes: 0,
+            stderrBytes: 0,
+          },
+        },
+      ],
+    }
+
+    const result = evaluateRules(
+      ceilingRules({ 'sonarqube.blocker': 0, 'sonarqube.critical': 0 }),
+      withFailure
+    )
+
+    expect(result.unevaluated).toHaveLength(0)
+  })
+
+  // The prefix walk. A coverage failure names the SUITE (`coverage.unit`), and the
+  // ceiling names a metric under it, so matching only the first path segment would
+  // report the ceiling as unexplained while the reason sat right beside it.
+  it('matches a failure named for the suite, not just the top-level dimension', () => {
+    const withSuiteFailure: Metrics = {
+      ...bare,
+      measurementFailures: [
+        {
+          kind: 'report-missing',
+          dimension: 'coverage.unit',
+          message: 'no coverage summary',
+          evidence: {
+            via: 'report',
+            command: 'read coverage/coverage-summary.json',
+            elapsedMs: 0,
+            attempts: [],
+          },
+        },
+      ],
+    }
+
+    const result = evaluateRules(
+      ceilingRules({ 'coverage.unit.uncoveredLines': 10 }),
+      withSuiteFailure
+    )
+
+    expect(result.unevaluated).toHaveLength(0)
+  })
+
+  it('says nothing about a ceiling whose metric IS present', () => {
+    const measured: Metrics = {
+      ...bare,
+      typescript: { errors: 0, warnings: 0, rootCauses: 0 },
+    }
+
+    const result = evaluateRules(ceilingRules({ 'typescript.errors': 0 }), measured)
+
+    expect(result.unevaluated).toHaveLength(0)
+    expect(result.status).toBe('pass')
+  })
+})

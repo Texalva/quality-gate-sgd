@@ -274,6 +274,14 @@ export function getSonarAuthToken(): string {
 
 /**
  * Get curl auth argument for SonarQube API calls
+ *
+ * Returns ONE shell word pair as a single string, which makes it usable only where
+ * a shell parses the result. That is the problem: a token or password containing a
+ * space, a quote, `$`, a backtick or `;` either splits into extra arguments or is
+ * interpreted. Prefer `sonarAuthArgs()`, which cannot be reinterpreted, and treat
+ * this as retained for the published API surface.
+ *
+ * @deprecated Use {@link sonarAuthArgs} -- see the note above.
  */
 export function getSonarCurlAuth(): string {
   const config = getConfig();
@@ -283,4 +291,50 @@ export function getSonarCurlAuth(): string {
   }
   const { user, password } = config.sonarqube.defaultCredentials;
   return `-u ${user}:${password}`;
+}
+
+/**
+ * The SonarQube credential as argv words, for a spawn with no shell.
+ *
+ * Two argv entries, never one string, and never interpolated into a command line.
+ * A credential that reaches a shell has to survive quoting; a credential that
+ * reaches `execve` directly does not, so `p@ss word`, `to;ken` and `$SECRET` are
+ * all passed through verbatim instead of splitting the command or being expanded
+ * by the shell.
+ *
+ * It also means no caller can accidentally print it: the only string form of the
+ * credential in this process is the one curl receives, and nothing builds a
+ * message out of that.
+ */
+export function sonarAuthArgs(): readonly string[] {
+  const config = getConfig();
+  if (fs.existsSync(config.sonarqube.tokenFile)) {
+    const token = fs.readFileSync(config.sonarqube.tokenFile, 'utf-8').trim();
+    // A SonarQube token authenticates as the user with an empty password.
+    return ['-u', `${token}:`];
+  }
+  const { user, password } = config.sonarqube.defaultCredentials;
+  return ['-u', `${user}:${password}`];
+}
+
+/**
+ * A SonarQube URL with any embedded credential removed, safe to print.
+ *
+ * `https://user:token@sonar.example.com` is a legal value for SONARQUBE_URL, and
+ * every failure message and piece of evidence names the URL. Redacting the `-u`
+ * argument is not enough on its own while the credential can also arrive inside
+ * the URL itself.
+ */
+export function redactUrlCredentials(url: string): string {
+  try {
+    const parsed = new URL(url);
+    if (parsed.username === '' && parsed.password === '') return url;
+    parsed.username = '<redacted>';
+    parsed.password = '';
+    return parsed.toString();
+  } catch {
+    // Not a parseable URL. Fall back to removing anything that looks like
+    // userinfo, rather than returning a string that may carry a credential.
+    return url.replace(/\/\/[^/@]*@/, '//<redacted>@');
+  }
 }

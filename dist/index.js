@@ -27,7 +27,12 @@ export {
 // Coverage
 measureCoverage, extractAllCoverageMetrics, extractCoverageMetrics, 
 // SonarQube
-extractSonarqubeMetrics, isSonarqubeAvailable, runSonarqubeScan, getTopSonarIssues, 
+extractSonarqubeMetrics, 
+// The failure-carrying variant, exported alongside the lossy one. Publishing only
+// `extractSonarqubeMetrics` left every external caller with the defect this
+// package exists to catch: `undefined` from a refused token and `undefined` from
+// a project with no issues are the same value.
+readSonarqubeMetrics, isSonarqubeAvailable, runSonarqubeScan, getTopSonarIssues, 
 // TypeScript & ESLint
 extractTypescriptMetrics, extractEslintMetrics, 
 // Scripts

@@ -7,6 +7,19 @@
  * the file:line:column information so we can compute target-space gradients.
  */
 import type { LocatedIssue, ExtractedIssues, ExtractLocatedIssuesOptions } from './types.js';
+import type { MeasurementFailure } from '../providers/types.js';
+/**
+ * Findings, plus the reason there might be none.
+ *
+ * Each `read*Issues` below returns this and each `extract*Issues` unwraps it to the
+ * bare array. Two functions rather than one changed signature because the bare array
+ * is the shape every existing caller and test already asks for, and widening the
+ * contract everywhere to reach one new consumer is churn that hides the change.
+ */
+interface IssueReading {
+    issues: LocatedIssue[];
+    failures: MeasurementFailure[];
+}
 /**
  * Extract uncovered branches and functions with location information.
  *
@@ -37,8 +50,28 @@ export declare function extractTypescriptIssues(): LocatedIssue[];
 export declare function extractEslintIssues(): LocatedIssue[];
 /**
  * Extract SonarQube issues with location information.
+ *
+ * The lossy wrapper, kept because it is exported from the package root. Callers that
+ * need to know whether an empty list means "no findings" or "could not ask" want
+ * {@link readSonarqubeIssues}.
  */
 export declare function extractSonarqubeIssues(): LocatedIssue[];
+/**
+ * SonarQube issues, and the reason if they could not be read.
+ *
+ * The last source with no failure channel. Every exit from the loop below used to
+ * return `issues` -- a token that will not load, a curl that exits nonzero, a page
+ * of JSON that will not parse -- so a refused query and a genuinely clean project
+ * were the same empty array. The advice channel reported "nothing to fix" for a
+ * server it never reached, which is the same defect `readCoverageIssues` and
+ * `readTypescriptIssues` were given channels for.
+ *
+ * A partial result is a failure too, and deliberately still carries the issues it
+ * did fetch: page 3 failing after two good pages is not five hundred findings, and
+ * saying so is more useful than either discarding them or presenting them as the
+ * whole set.
+ */
+export declare function readSonarqubeIssues(): IssueReading;
 /**
  * Extract located issues from all sources.
  *
@@ -48,4 +81,5 @@ export declare function extractSonarqubeIssues(): LocatedIssue[];
  * symbol information for unified cross-axis analysis.
  */
 export declare function extractLocatedIssues(options?: ExtractLocatedIssuesOptions): ExtractedIssues;
+export {};
 //# sourceMappingURL=extract.d.ts.map

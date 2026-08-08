@@ -15,7 +15,7 @@ export type { QualityGateCache, CacheEntry, Metrics, AllCoverageMetrics, Coverag
 export { type QualityGateConfig, getConfig, loadConfig, resetConfig, getSonarAuthToken, getSonarCurlAuth, } from './config.js';
 export { loadRules, computeRulesHash, evaluateRules, isCacheValid, isUsingEmbeddedDefaults, type LoadRulesOptions, } from './rules.js';
 export { getDefaultRules, isEmbeddedDefaults, COVERAGE_ONLY_DEFAULTS, FULL_DEFAULTS, } from './defaults.js';
-export { measureCoverage, extractAllCoverageMetrics, extractCoverageMetrics, extractSonarqubeMetrics, isSonarqubeAvailable, runSonarqubeScan, getTopSonarIssues, type SonarIssue, extractTypescriptMetrics, extractEslintMetrics, runScript, runScripts, extractSloc, extractAllMetrics, extractAllMetricsAsync, } from './metrics.js';
+export { measureCoverage, extractAllCoverageMetrics, extractCoverageMetrics, extractSonarqubeMetrics, readSonarqubeMetrics, type SonarqubeReading, isSonarqubeAvailable, runSonarqubeScan, getTopSonarIssues, type SonarIssue, extractTypescriptMetrics, extractEslintMetrics, runScript, runScripts, extractSloc, extractAllMetrics, extractAllMetricsAsync, } from './metrics.js';
 export { getCurrentCommitHash, resolveBaselineCommit, getCacheKey, isWIPKey, loadCache, saveCache, getCacheEntry, setCacheEntry, createCacheEntry, findBaselineEntry, pruneOldEntries, } from './cache.js';
 export { DEFAULT_SEVERITY_WEIGHTS, getSeverityWeight, sumSeverityWeights, } from './severity.js';
 export { buildDependencyGraph, buildDependentCounts, getAllTypeScriptFiles, extractLocalImports, calculateDegrees, attachCoverageData, } from './dependency-graph.js';

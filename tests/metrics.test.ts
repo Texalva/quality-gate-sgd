@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import * as fs from 'fs'
+import { spawnSync } from 'child_process'
 import { evaluateRules } from '../src/rules.js'
 import type { Metrics } from '../src/types.js'
 import {
@@ -12,6 +13,7 @@ import {
   extractTypescriptMetrics,
   extractEslintMetrics,
   extractSonarqubeMetrics,
+  readSonarqubeMetrics,
   isSonarqubeAvailable,
   getTopSonarIssues,
   runSonarqubeScan,
@@ -82,6 +84,8 @@ vi.mock('../src/config.js', () => ({
     scriptTimeouts: {},
   })),
   getSonarCurlAuth: vi.fn(() => ''),
+  sonarAuthArgs: vi.fn(() => []),
+  redactUrlCredentials: vi.fn((url: string) => url),
 }))
 
 describe('Coverage Metrics', () => {
@@ -1421,6 +1425,76 @@ describe('ESLint Metrics', () => {
   })
 })
 
+/**
+ * A SonarQube API response as `sonarGet` actually receives it: the body, then the
+ * HTTP status on its own last line.
+ *
+ * The status line is not decoration. `curl -s` exits 0 for a 401 exactly as for a
+ * 200, so the old reader saw a short unparseable string and returned `undefined` --
+ * the dimension vanished with no failure recorded, and every `sonarqube.*` ceiling
+ * was skipped in silence while the run was graded as a complete reading. Appending
+ * `%{http_code}` is what makes refused, absent and empty three different answers.
+ */
+function withStatus(status: number, body: unknown): string {
+  return `${typeof body === 'string' ? body : JSON.stringify(body)}\n${status}`
+}
+
+type SpawnResult = ReturnType<typeof spawnSyncShape>
+
+function spawnSyncShape(stdout: string, status = 0) {
+  return { status, stdout, stderr: '', pid: 1, signal: null, output: [] as string[] }
+}
+
+/**
+ * Every measure `readSonarqubeMetrics` asks for, so a test can drop exactly one and
+ * be testing that omission rather than nine others at the same time.
+ */
+function allMeasures(): { metric: string; value: string }[] {
+  return [
+    { metric: 'bugs', value: '3' },
+    { metric: 'vulnerabilities', value: '2' },
+    { metric: 'code_smells', value: '10' },
+    { metric: 'coverage', value: '75.5' },
+    { metric: 'duplicated_lines_density', value: '3.2' },
+    { metric: 'blocker_violations', value: '1' },
+    { metric: 'critical_violations', value: '2' },
+    { metric: 'major_violations', value: '5' },
+    { metric: 'minor_violations', value: '8' },
+    { metric: 'info_violations', value: '3' },
+  ]
+}
+
+/** A curl answer carrying this HTTP status and body, in the shape `sonarGet` reads. */
+function curlSays(status: number, body: unknown): SpawnResult {
+  return spawnSyncShape(withStatus(status, body))
+}
+
+/**
+ * Answer curl with this response, leaving any other `spawnSync` mock in place.
+ *
+ * Dispatching on the command rather than replacing the mock outright, because the
+ * scan tests need BOTH: a scanner invocation with its own scripted exit codes, and a
+ * task poll over HTTP. A blanket `mockReturnValue` gives the poll the scanner's empty
+ * stdout, which reads as "no HTTP response", which spins `waitForSonarTask` for its
+ * full two minutes -- a 120-second hang rather than a failed assertion.
+ *
+ * These used to mock `execSync`. `sonarGet` spawns curl as argv with no shell now,
+ * because interpolating `-u user:password` into a command line leaked any password
+ * containing a space past the redaction regex and let one containing `;` change what
+ * ran. A mock still answering `execSync` would be exercising a transport the code no
+ * longer has.
+ */
+function answerCurl(response: SpawnResult): void {
+  const existing = vi.mocked(spawnSync).getMockImplementation()
+  vi.mocked(spawnSync).mockImplementation(((cmd: string, ...rest: unknown[]) =>
+    cmd === 'curl'
+      ? response
+      : ((existing as ((...a: unknown[]) => SpawnResult) | undefined)?.(
+          cmd,
+          ...rest
+        ) ?? spawnSyncShape(''))) as never)
+}
+
 describe('SonarQube Metrics', () => {
   beforeEach(() => {
     vi.clearAllMocks()
@@ -1428,8 +1502,7 @@ describe('SonarQube Metrics', () => {
 
   describe('extractSonarqubeMetrics', () => {
     it('returns metrics when API responds successfully', async () => {
-      const { execSync } = await import('child_process')
-      vi.mocked(execSync).mockReturnValue(JSON.stringify({
+      answerCurl(curlSays(200, {
         component: {
           measures: [
             { metric: 'bugs', value: '5' },
@@ -1461,6 +1534,236 @@ describe('SonarQube Metrics', () => {
       expect(result?.info).toBe(3)
     })
 
+    // #42, the channel itself. Four ways to lose the dimension, four kinds, because
+    // each sends the adopter somewhere different: fix the URL, rotate the token,
+    // check the project key, or find out why the analysis published nothing. Before
+    // this they were one `undefined` with no failure attached, and `extractAllMetrics`
+    // never looked at sonarqube when building `measurementFailures` at all.
+    describe('the failure channel', () => {
+      const failureFor = async (mock: () => void) => {
+        mock()
+        const reading = readSonarqubeMetrics()
+        expect(reading.metrics).toBeUndefined()
+        const { failure } = reading
+        if (!failure) throw new Error('expected a measurement failure')
+        return failure
+      }
+
+      // The unreachable message is built from the thrown error, and the thrown error
+      // is the whole command line -- which carries `-u <token>:`. This string reaches
+      // gate output, the `unmeasured` JSON and CI logs.
+      it('does not leak the sonar credential into the failure it reports', async () => {
+        const { sonarAuthArgs } = await import('../src/config.js')
+        vi.mocked(sonarAuthArgs).mockReturnValue([
+          '-u',
+          'squ_deadbeefsecrettoken:',
+        ])
+
+        const failure = await failureFor(() => {
+          answerCurl({
+            ...spawnSyncShape('', null as unknown as number),
+            // Node builds this from the file, not the argv, so a real one would not
+            // carry the token. Planted here anyway: the redaction must not depend on
+            // an error format nobody in this repo controls.
+            error: new Error(
+              'spawnSync curl ENOENT squ_deadbeefsecrettoken'
+            ) as unknown as undefined,
+          })
+        })
+
+        expect(failure.message).not.toContain('squ_deadbeefsecrettoken')
+        expect(failure.evidence.command).not.toContain('squ_deadbeefsecrettoken')
+      })
+
+      // The shape-dependence the value-based scrub exists to remove. `-u <redacted>`
+      // consumed exactly one whitespace-free token, so this password reported
+      // `-u <redacted> second` and published half of itself.
+      it('redacts a credential containing a space', async () => {
+        const { sonarAuthArgs } = await import('../src/config.js')
+        vi.mocked(sonarAuthArgs).mockReturnValue(['-u', 'admin:first second'])
+
+        const failure = await failureFor(() => {
+          answerCurl({
+            ...spawnSyncShape('', null as unknown as number),
+            error: new Error(
+              'spawnSync failed: -u admin:first second'
+            ) as unknown as undefined,
+          })
+        })
+
+        expect(failure.message).not.toContain('first second')
+        expect(failure.message).not.toContain('second')
+      })
+
+      // The structural half of the same guarantee. A credential cannot be scrubbed
+      // out of a message reliably -- `-u <redacted>` consumed one whitespace-free
+      // token, so a password of `first second` reported `-u <redacted> second` -- so
+      // the fix is that no string containing it is ever built. curl is spawned as
+      // argv with no shell, which also stops a password containing `;` or a backtick
+      // from changing what runs.
+      it('spawns curl as argv with no shell, so the credential is never a string', () => {
+        answerCurl(curlSays(200, { component: { measures: [] } }))
+
+        readSonarqubeMetrics()
+
+        const call = vi.mocked(spawnSync).mock.calls.find(([cmd]) => cmd === 'curl')
+        if (!call) throw new Error('expected curl to be spawned')
+        const [, args, options] = call as unknown as [
+          string,
+          string[],
+          { shell?: boolean },
+        ]
+
+        expect(options.shell).toBe(false)
+        expect(Array.isArray(args)).toBe(true)
+        // The URL is its own argv word, not interpolated into a quoted string.
+        expect(args.some((a) => a.includes('/api/measures/component'))).toBe(true)
+      })
+
+      it('reports an unreachable server as tool-missing', async () => {
+        const failure = await failureFor(() => {
+          answerCurl({
+            ...spawnSyncShape('', null as unknown as number),
+            error: new Error('connect ECONNREFUSED') as unknown as undefined,
+          })
+        })
+
+        expect(failure.kind).toBe('tool-missing')
+        expect(failure.dimension).toBe('sonarqube')
+        expect(failure.message).toMatch(/did not answer/)
+      })
+
+      // curl exiting nonzero with no HTTP status is the same refusal as a thrown
+      // spawn: `000` is what it writes when it never got a response, and reading that
+      // as an answer of zero is how a dead server used to look like a clean project.
+      it('reports a curl exit with no HTTP status as tool-missing', async () => {
+        const failure = await failureFor(() => {
+          answerCurl(spawnSyncShape('\n000', 7))
+        })
+
+        expect(failure.kind).toBe('tool-missing')
+        expect(failure.message).toMatch(/did not answer/)
+      })
+
+      // The likeliest failure in practice: a rotated SONARQUBE_TOKEN needs no other
+      // change to arrive, and the server stays up -- which is exactly why
+      // `isSonarqubeAvailable` said yes and the gate carried on.
+      it('reports a 401 as access-denied, not as an absent server', async () => {
+        const failure = await failureFor(() => {
+          answerCurl(curlSays(401, { errors: [{ msg: 'Insufficient privileges' }] }))
+        })
+
+        expect(failure.kind).toBe('access-denied')
+        expect(failure.message).toContain('SONARQUBE_TOKEN')
+      })
+
+      it('reports an unprovisioned project key as report-missing', async () => {
+        const failure = await failureFor(() => {
+          answerCurl(curlSays(404, { errors: [{ msg: 'Component key not found' }] }))
+        })
+
+        expect(failure.kind).toBe('report-missing')
+        expect(failure.message).toContain('404')
+      })
+
+      // A login page or proxy error in front of the API. The old reader handed this
+      // straight to JSON.parse and returned undefined from the catch.
+      it('reports a non-JSON 200 as unparseable-output', async () => {
+        const failure = await failureFor(() => {
+          answerCurl(curlSays(200, '<html>login</html>'))
+        })
+
+        expect(failure.kind).toBe('unparseable-output')
+      })
+
+      it('reports an empty measures array as measured-nothing', async () => {
+        const failure = await failureFor(() => {
+          answerCurl(curlSays(200, { component: { measures: [] } }))
+        })
+
+        expect(failure.kind).toBe('measured-nothing')
+      })
+
+      // The control. Without it, "always report a failure" satisfies every case above
+      // and every sonarqube run would fail the gate.
+      it('reports no failure when the measures arrive', () => {
+        answerCurl(curlSays(200, { component: { measures: allMeasures() } }))
+
+        const reading = readSonarqubeMetrics()
+
+        expect(reading.failure).toBeUndefined()
+        expect(reading.metrics?.bugs).toBe(3)
+      })
+
+      // A PARTIAL response used to be a complete reading: every measure the server
+      // did not send became 0, so a body carrying only `bugs` reported
+      // `vulnerabilities: 0` and `blocker: 0` and satisfied every ceiling on them.
+      // The gate called the code clean on measures it had never been given.
+      it('refuses a response that omits measures every analysis computes', () => {
+        answerCurl(curlSays(200, {
+          component: { measures: [{ metric: 'bugs', value: '3' }] },
+        }))
+
+        const reading = readSonarqubeMetrics()
+
+        expect(reading.metrics).toBeUndefined()
+        expect(reading.failure?.kind).toBe('measured-nothing')
+        expect(reading.failure?.message).toContain('vulnerabilities')
+      })
+
+      // NaN passes every ceiling, because `NaN > 0` is false. A truncated or
+      // malformed measure therefore read as a clean project rather than as a
+      // response nobody could grade.
+      it('refuses a measure that is not a number rather than reading it as NaN', () => {
+        answerCurl(curlSays(200, {
+          component: {
+            measures: allMeasures().map((m) =>
+              m.metric === 'bugs' ? { metric: 'bugs', value: 'NaN' } : m
+            ),
+          },
+        }))
+
+        const reading = readSonarqubeMetrics()
+
+        expect(reading.metrics).toBeUndefined()
+        expect(reading.failure?.kind).toBe('unparseable-output')
+        expect(reading.failure?.message).toContain('bugs')
+      })
+
+      // The two conditional measures. A project that imports no coverage report into
+      // its scan is not a project with 0% coverage, so these stay ABSENT -- which a
+      // floor reports as "not available" instead of grading a substituted zero.
+      it('leaves coverage absent rather than zero when SonarQube omits it', () => {
+        answerCurl(curlSays(200, {
+          component: {
+            measures: allMeasures().filter(
+              (m) => m.metric !== 'coverage' && m.metric !== 'duplicated_lines_density'
+            ),
+          },
+        }))
+
+        const reading = readSonarqubeMetrics()
+
+        expect(reading.failure).toBeUndefined()
+        expect(reading.metrics?.bugs).toBe(3)
+        expect(reading.metrics?.coverage).toBeUndefined()
+        expect(reading.metrics?.duplications).toBeUndefined()
+      })
+
+      // Without `--location` a 3xx body is not the API's answer -- it is an SSO login
+      // page or a proxy bounce. `status < 400` accepted one of the right shape as
+      // measures.
+      it('refuses a redirect carrying a body of the right shape', () => {
+        answerCurl(curlSays(302, { component: { measures: allMeasures() } }))
+
+        const reading = readSonarqubeMetrics()
+
+        expect(reading.metrics).toBeUndefined()
+        expect(reading.failure?.kind).toBe('crashed')
+        expect(reading.failure?.message).toMatch(/redirect/)
+      })
+    })
+
     it('returns undefined when API fails', async () => {
       const { execSync } = await import('child_process')
       vi.mocked(execSync).mockImplementation(() => {
@@ -1473,8 +1776,7 @@ describe('SonarQube Metrics', () => {
     })
 
     it('returns undefined when response has no measures', async () => {
-      const { execSync } = await import('child_process')
-      vi.mocked(execSync).mockReturnValue(JSON.stringify({
+      answerCurl(curlSays(200, {
         component: {},
       }))
 
@@ -1484,8 +1786,7 @@ describe('SonarQube Metrics', () => {
     })
 
     it('returns undefined when response has empty measures', async () => {
-      const { execSync } = await import('child_process')
-      vi.mocked(execSync).mockReturnValue(JSON.stringify({
+      answerCurl(curlSays(200, {
         component: {
           measures: [],
         },
@@ -1496,9 +1797,11 @@ describe('SonarQube Metrics', () => {
       expect(result).toBeUndefined()
     })
 
-    it('returns 0 for missing metrics', async () => {
-      const { execSync } = await import('child_process')
-      vi.mocked(execSync).mockReturnValue(JSON.stringify({
+    // Was `returns 0 for missing metrics`, asserting the defect: a response carrying
+    // only `bugs` reported every other measure as a measured zero. Nothing is
+    // returned now, and the reason is on the reading.
+    it('returns nothing for a response missing measures every analysis computes', () => {
+      answerCurl(curlSays(200, {
         component: {
           measures: [
             { metric: 'bugs', value: '3' },
@@ -1506,12 +1809,7 @@ describe('SonarQube Metrics', () => {
         },
       }))
 
-      const result = extractSonarqubeMetrics()
-
-      expect(result).toBeDefined()
-      expect(result?.bugs).toBe(3)
-      expect(result?.vulnerabilities).toBe(0) // Missing metric
-      expect(result?.codeSmells).toBe(0)
+      expect(extractSonarqubeMetrics()).toBeUndefined()
     })
   })
 
@@ -1525,10 +1823,10 @@ describe('SonarQube Metrics', () => {
       expect(result).toBe(true)
     })
 
-    it('returns false when SonarQube is unreachable', async () => {
-      const { execSync } = await import('child_process')
-      vi.mocked(execSync).mockImplementation(() => {
-        throw new Error('Connection refused')
+    it('returns false when SonarQube is unreachable', () => {
+      answerCurl({
+        ...spawnSyncShape('', null as unknown as number),
+        error: new Error('connect ECONNREFUSED') as unknown as undefined,
       })
 
       const result = isSonarqubeAvailable()
@@ -1539,8 +1837,7 @@ describe('SonarQube Metrics', () => {
 
   describe('getTopSonarIssues', () => {
     it('returns issues from API', async () => {
-      const { execSync } = await import('child_process')
-      vi.mocked(execSync).mockReturnValue(JSON.stringify({
+      answerCurl(curlSays(200, {
         issues: [
           {
             severity: 'MAJOR',
@@ -1572,10 +1869,10 @@ describe('SonarQube Metrics', () => {
       expect(result[1].line).toBeUndefined()
     })
 
-    it('returns empty array when API fails', async () => {
-      const { execSync } = await import('child_process')
-      vi.mocked(execSync).mockImplementation(() => {
-        throw new Error('Timeout')
+    it('returns empty array when API fails', () => {
+      answerCurl({
+        ...spawnSyncShape('', null as unknown as number),
+        error: new Error('timed out') as unknown as undefined,
       })
 
       const result = getTopSonarIssues()
@@ -1584,8 +1881,7 @@ describe('SonarQube Metrics', () => {
     })
 
     it('returns empty array when no issues in response', async () => {
-      const { execSync } = await import('child_process')
-      vi.mocked(execSync).mockReturnValue(JSON.stringify({
+      answerCurl(curlSays(200, {
         total: 0,
       }))
 
@@ -1596,7 +1892,13 @@ describe('SonarQube Metrics', () => {
   })
 
   describe('runSonarqubeScan', () => {
-    it('returns success when scan completes', async () => {
+    // #23. The scanner exiting 0 is not the same as "this commit was analysed", and
+    // this test used to assert that it was. Without `.scannerwork/report-task.txt`
+    // there is no task to wait for and no way to know the server ever received one --
+    // so the run reported success and `readSonarqubeMetrics` then read whatever the
+    // server already held, which is the PREVIOUS commit's analysis. A
+    // `sonarqube.blocker: 0` ceiling satisfied by a scan of different code.
+    it('refuses to call a scan successful when it cannot confirm the analysis ran', async () => {
       const { spawnSync } = await import('child_process')
       vi.mocked(spawnSync).mockReturnValue({
         status: 0,
@@ -1610,7 +1912,73 @@ describe('SonarQube Metrics', () => {
 
       const result = runSonarqubeScan()
 
-      expect(result.success).toBe(true)
+      expect(result.success).toBe(false)
+      // The remedy has to be named: a scanner writing .scannerwork elsewhere lands
+      // here while working perfectly, and "refused" with no next step is unactionable.
+      expect(result.error).toContain('report-task.txt')
+      expect(result.error).toMatch(/previous commit|--coverage-only/)
+    })
+
+    // The same hole through a different door, found by adversarial review after the
+    // check above landed. `.scannerwork` is not cleaned between runs, so a scanner
+    // that exits 0 without submitting an analysis leaves the PREVIOUS run's file in
+    // place -- and that task id is already SUCCESS on the server, so waiting on it
+    // confirms instantly and this commit is graded against the last one's numbers.
+    it('refuses when the scanner left the task id unchanged', async () => {
+      const { spawnSync } = await import('child_process')
+      vi.mocked(spawnSync).mockReturnValue({
+        status: 0,
+        stdout: 'Scan completed',
+        stderr: '',
+        pid: 123,
+        signal: null,
+        output: [],
+      })
+      // Present before AND after, holding the same id: nothing new was submitted.
+      vi.mocked(fs.existsSync).mockReturnValue(true)
+      vi.mocked(fs.readFileSync).mockReturnValue('ceTaskId=leftover-from-last-run')
+      // And the server confirms it instantly, because it finished on the previous
+      // run. That is what makes this dangerous rather than merely wrong: without the
+      // refusal the scan reports SUCCESS in one poll and the gate grades this commit
+      // against the last one's measures.
+      answerCurl(
+        curlSays(200, { task: { id: 'leftover-from-last-run', status: 'SUCCESS' } })
+      )
+
+      const result = runSonarqubeScan()
+
+      expect(result.success).toBe(false)
+      expect(result.error).toContain('leftover-from-last-run')
+      expect(result.error).toMatch(/unchanged|no new analysis/)
+      expect(result.error).toMatch(/previous commit|--coverage-only/)
+    })
+
+    // A response about a DIFFERENT task is not confirmation of this one. A proxy
+    // serving a cached body, or a server that answers an unknown id with its most
+    // recent task, both land here -- and both would otherwise report SUCCESS for an
+    // analysis that was never submitted.
+    it('refuses a task response that is about another task', async () => {
+      const { spawnSync } = await import('child_process')
+      vi.mocked(spawnSync).mockReturnValue({
+        status: 0,
+        stdout: 'Scan completed',
+        stderr: '',
+        pid: 123,
+        signal: null,
+        output: [],
+      })
+      vi.mocked(fs.existsSync).mockReturnValue(true)
+      vi.mocked(fs.readFileSync).mockReturnValueOnce('ceTaskId=previous-run')
+      vi.mocked(fs.readFileSync).mockReturnValue('ceTaskId=task-we-submitted')
+      answerCurl(
+        curlSays(200, { task: { id: 'somebody-elses-task', status: 'SUCCESS' } })
+      )
+
+      const result = runSonarqubeScan()
+
+      expect(result.success).toBe(false)
+      expect(result.error).toContain('task-we-submitted')
+      expect(result.error).toContain('somebody-elses-task')
     })
 
     it('returns failure when scan fails', async () => {
@@ -1631,7 +1999,7 @@ describe('SonarQube Metrics', () => {
     })
 
     it('waits for task when task ID is found', async () => {
-      const { spawnSync, execSync } = await import('child_process')
+      const { spawnSync } = await import('child_process')
       vi.mocked(spawnSync).mockReturnValue({
         status: 0,
         stdout: '',
@@ -1641,8 +2009,12 @@ describe('SonarQube Metrics', () => {
         output: [],
       })
       vi.mocked(fs.existsSync).mockReturnValue(true)
+      // Two reads: `runSonarqubeScan` samples report-task.txt BEFORE the scanner
+      // runs, so an unchanged id can be told from a new one. A leftover file from an
+      // earlier run, overwritten by this scan.
+      vi.mocked(fs.readFileSync).mockReturnValueOnce('ceTaskId=previous-run')
       vi.mocked(fs.readFileSync).mockReturnValue('ceTaskId=task123\nserverUrl=http://localhost:9000')
-      vi.mocked(execSync).mockReturnValue(JSON.stringify({
+      answerCurl(curlSays(200, {
         task: { id: 'task123', status: 'SUCCESS' },
       }))
 
@@ -1652,7 +2024,7 @@ describe('SonarQube Metrics', () => {
     })
 
     it('returns failure when task fails', async () => {
-      const { spawnSync, execSync } = await import('child_process')
+      const { spawnSync } = await import('child_process')
       vi.mocked(spawnSync).mockReturnValue({
         status: 0,
         stdout: '',
@@ -1662,8 +2034,12 @@ describe('SonarQube Metrics', () => {
         output: [],
       })
       vi.mocked(fs.existsSync).mockReturnValue(true)
+      // Two reads: `runSonarqubeScan` samples report-task.txt BEFORE the scanner
+      // runs, so an unchanged id can be told from a new one. A leftover file from an
+      // earlier run, overwritten by this scan.
+      vi.mocked(fs.readFileSync).mockReturnValueOnce('ceTaskId=previous-run')
       vi.mocked(fs.readFileSync).mockReturnValue('ceTaskId=task123')
-      vi.mocked(execSync).mockReturnValue(JSON.stringify({
+      answerCurl(curlSays(200, {
         task: { id: 'task123', status: 'FAILED', errorMessage: 'Analysis error' },
       }))
 
@@ -1674,7 +2050,7 @@ describe('SonarQube Metrics', () => {
     })
 
     it('returns failure when task is canceled', async () => {
-      const { spawnSync, execSync } = await import('child_process')
+      const { spawnSync } = await import('child_process')
       vi.mocked(spawnSync).mockReturnValue({
         status: 0,
         stdout: '',
@@ -1684,8 +2060,12 @@ describe('SonarQube Metrics', () => {
         output: [],
       })
       vi.mocked(fs.existsSync).mockReturnValue(true)
+      // Two reads: `runSonarqubeScan` samples report-task.txt BEFORE the scanner
+      // runs, so an unchanged id can be told from a new one. A leftover file from an
+      // earlier run, overwritten by this scan.
+      vi.mocked(fs.readFileSync).mockReturnValueOnce('ceTaskId=previous-run')
       vi.mocked(fs.readFileSync).mockReturnValue('ceTaskId=task123')
-      vi.mocked(execSync).mockReturnValue(JSON.stringify({
+      answerCurl(curlSays(200, {
         task: { id: 'task123', status: 'CANCELED' },
       }))
 
@@ -1723,7 +2103,17 @@ describe('SonarQube Metrics', () => {
           output: [],
         }
       })
-      vi.mocked(fs.existsSync).mockReturnValue(false)
+      // A confirmable analysis, so this tests the RETRY and not the task-id refusal
+      // (#23) that the no-report-task.txt path now takes.
+      vi.mocked(fs.existsSync).mockReturnValue(true)
+      // Two reads: `runSonarqubeScan` samples report-task.txt BEFORE the scanner
+      // runs, so an unchanged id can be told from a new one. A leftover file from an
+      // earlier run, overwritten by this scan.
+      vi.mocked(fs.readFileSync).mockReturnValueOnce('ceTaskId=previous-run')
+      vi.mocked(fs.readFileSync).mockReturnValue('ceTaskId=task123')
+      answerCurl(curlSays(200, {
+        task: { id: 'task123', status: 'SUCCESS' },
+      }))
 
       const result = runSonarqubeScan()
 
@@ -1760,7 +2150,17 @@ describe('SonarQube Metrics', () => {
           output: [],
         }
       })
-      vi.mocked(fs.existsSync).mockReturnValue(false)
+      // A confirmable analysis, so this tests the RETRY and not the task-id refusal
+      // (#23) that the no-report-task.txt path now takes.
+      vi.mocked(fs.existsSync).mockReturnValue(true)
+      // Two reads: `runSonarqubeScan` samples report-task.txt BEFORE the scanner
+      // runs, so an unchanged id can be told from a new one. A leftover file from an
+      // earlier run, overwritten by this scan.
+      vi.mocked(fs.readFileSync).mockReturnValueOnce('ceTaskId=previous-run')
+      vi.mocked(fs.readFileSync).mockReturnValue('ceTaskId=task123')
+      answerCurl(curlSays(200, {
+        task: { id: 'task123', status: 'SUCCESS' },
+      }))
 
       const result = runSonarqubeScan()
 
@@ -1806,8 +2206,9 @@ describe('SonarQube Metrics', () => {
 
       const result = runSonarqubeScan()
 
-      // Should succeed because no task ID found
-      expect(result.success).toBe(true)
+      // Unreadable is the same answer as absent: the analysis cannot be confirmed.
+      expect(result.success).toBe(false)
+      expect(result.error).toContain('report-task.txt')
     })
 
     it('handles report-task.txt without ceTaskId', async () => {
@@ -1825,8 +2226,9 @@ describe('SonarQube Metrics', () => {
 
       const result = runSonarqubeScan()
 
-      // Should succeed because no task ID found
-      expect(result.success).toBe(true)
+      // Unreadable is the same answer as absent: the analysis cannot be confirmed.
+      expect(result.success).toBe(false)
+      expect(result.error).toContain('report-task.txt')
     })
   })
 })
@@ -1907,13 +2309,51 @@ describe('coverage report ordering', () => {
 const customFailuresOf = (result: Metrics) =>
   (result.measurementFailures ?? []).filter((f) => f.dimension.startsWith('custom'))
 
+describe('sonarqube reaches the verdict', () => {
+  // The whole point of #42, asserted where it actually matters. REPRODUCED before
+  // this: a server answering 200 on `/` and 401 on `/api/measures/component` gave
+  // `✓ Quality gate PASSED`, exit 0, three configured sonarqube ceilings never
+  // evaluated, and nothing said about any of them; the next run served it from cache.
+  it('fails the gate when the dimension is lost and a rule grades it', async () => {
+    answerCurl(curlSays(401, { errors: [{ msg: 'no' }] }))
+
+    const metrics = extractAllMetrics({ scriptsToRun: [] })
+
+    const failure = (metrics.measurementFailures ?? []).find(
+      (f) => f.dimension === 'sonarqube'
+    )
+    expect(failure?.kind).toBe('access-denied')
+
+    const result = evaluateRules(
+      { version: '1.0.0', rules: { ceilings: { 'sonarqube.blocker': 0 } } },
+      metrics
+    )
+
+    expect(result.status).toBe('fail')
+    expect(result.failedRules.map((f) => f.rule)).toContain('sonarqube.measurement')
+  })
+
+  // `--coverage-only` asked for the dimension to be skipped. A skipped dimension is
+  // not a lost one, and reporting it would put noise in the loud channel on the path
+  // most adopters use.
+  it('reports no sonarqube failure when the dimension was skipped', async () => {
+    answerCurl(curlSays(401, { errors: [{ msg: 'no' }] }))
+
+    const metrics = extractAllMetrics({ scriptsToRun: [], skipSonarQube: true })
+
+    expect(
+      (metrics.measurementFailures ?? []).some((f) => f.dimension === 'sonarqube')
+    ).toBe(false)
+  })
+})
+
 describe('extractAllMetrics', () => {
   beforeEach(() => {
     vi.clearAllMocks()
   })
 
   it('extracts all metrics with default options', async () => {
-    const { spawnSync, execSync } = await import('child_process')
+    const { spawnSync } = await import('child_process')
 
     // Coverage files don't exist
     vi.mocked(fs.existsSync).mockReturnValue(false)
@@ -1928,14 +2368,9 @@ describe('extractAllMetrics', () => {
       output: [],
     })
 
-    // SonarQube returns metrics
-    vi.mocked(execSync).mockReturnValue(JSON.stringify({
-      component: {
-        measures: [
-          { metric: 'bugs', value: '0' },
-        ],
-      },
-    }))
+    // SonarQube returns metrics. A COMPLETE set of them -- a response carrying only
+    // `bugs` is a partial reading now, and refused rather than zero-filled.
+    answerCurl(curlSays(200, { component: { measures: allMeasures() } }))
 
     const result = extractAllMetrics()
 
@@ -1948,7 +2383,7 @@ describe('extractAllMetrics', () => {
   })
 
   it('accepts array of scripts for backward compatibility', async () => {
-    const { spawnSync, execSync } = await import('child_process')
+    const { spawnSync } = await import('child_process')
 
     vi.mocked(fs.existsSync).mockReturnValue(false)
     vi.mocked(spawnSync).mockReturnValue({
@@ -1959,7 +2394,7 @@ describe('extractAllMetrics', () => {
       signal: null,
       output: [],
     })
-    vi.mocked(execSync).mockReturnValue(JSON.stringify({ component: { measures: [] } }))
+    answerCurl(curlSays(200, { component: { measures: [] } }))
 
     const result = extractAllMetrics(['test', 'lint'])
 
@@ -1989,7 +2424,7 @@ describe('extractAllMetrics', () => {
   })
 
   it('extracts custom metrics when dimensions provided', async () => {
-    const { spawnSync, execSync } = await import('child_process')
+    const { spawnSync } = await import('child_process')
 
     // Mock file existence - return false for coverage files
     vi.mocked(fs.existsSync).mockReturnValue(false)
@@ -2005,7 +2440,7 @@ describe('extractAllMetrics', () => {
       signal: null,
       output: [],
     }) as ReturnType<typeof spawnSync>)
-    vi.mocked(execSync).mockReturnValue(JSON.stringify({ component: { measures: [] } }))
+    answerCurl(curlSays(200, { component: { measures: [] } }))
 
     const result = extractAllMetrics({
       customDimensions: [
@@ -2036,7 +2471,7 @@ describe('extractAllMetrics', () => {
     // The dangerous case: `custom.*` is gated by ceilings alone and a
     // lower-better dimension is best at zero, so a broken extractor used to
     // report a perfect score for a dimension nobody measured.
-    const { spawnSync, execSync } = await import('child_process')
+    const { spawnSync } = await import('child_process')
 
     vi.mocked(fs.existsSync).mockReturnValue(false)
     vi.mocked(spawnSync).mockImplementation((cmd) => ({
@@ -2049,7 +2484,7 @@ describe('extractAllMetrics', () => {
       signal: null,
       output: [],
     }) as ReturnType<typeof spawnSync>)
-    vi.mocked(execSync).mockReturnValue(JSON.stringify({ component: { measures: [] } }))
+    answerCurl(curlSays(200, { component: { measures: [] } }))
 
     const result = extractAllMetrics({
       customDimensions: [
@@ -2072,7 +2507,7 @@ describe('extractAllMetrics', () => {
   })
 
   it('skips custom metrics when skipCustomDimensions is true', async () => {
-    const { spawnSync, execSync } = await import('child_process')
+    const { spawnSync } = await import('child_process')
 
     vi.mocked(fs.existsSync).mockReturnValue(false)
     vi.mocked(spawnSync).mockReturnValue({
@@ -2083,7 +2518,7 @@ describe('extractAllMetrics', () => {
       signal: null,
       output: [],
     })
-    vi.mocked(execSync).mockReturnValue(JSON.stringify({ component: { measures: [] } }))
+    answerCurl(curlSays(200, { component: { measures: [] } }))
 
     const result = extractAllMetrics({
       skipCustomDimensions: true,
@@ -2105,7 +2540,7 @@ describe('extractAllMetrics', () => {
   })
 
   it('skips custom metrics when no dimensions provided', async () => {
-    const { spawnSync, execSync } = await import('child_process')
+    const { spawnSync } = await import('child_process')
 
     vi.mocked(fs.existsSync).mockReturnValue(false)
     vi.mocked(spawnSync).mockReturnValue({
@@ -2116,7 +2551,7 @@ describe('extractAllMetrics', () => {
       signal: null,
       output: [],
     })
-    vi.mocked(execSync).mockReturnValue(JSON.stringify({ component: { measures: [] } }))
+    answerCurl(curlSays(200, { component: { measures: [] } }))
 
     const result = extractAllMetrics({
       customDimensions: [],
@@ -2132,7 +2567,7 @@ describe('extractAllMetricsAsync', () => {
   })
 
   it('loads custom dimensions automatically', async () => {
-    const { spawnSync, execSync } = await import('child_process')
+    const { spawnSync } = await import('child_process')
 
     vi.mocked(fs.existsSync).mockReturnValue(false)
     vi.mocked(spawnSync).mockReturnValue({
@@ -2143,7 +2578,7 @@ describe('extractAllMetricsAsync', () => {
       signal: null,
       output: [],
     })
-    vi.mocked(execSync).mockReturnValue(JSON.stringify({ component: { measures: [] } }))
+    answerCurl(curlSays(200, { component: { measures: [] } }))
 
     const result = await extractAllMetricsAsync()
 
@@ -2153,7 +2588,7 @@ describe('extractAllMetricsAsync', () => {
   })
 
   it('uses provided custom dimensions instead of loading', async () => {
-    const { spawnSync, execSync } = await import('child_process')
+    const { spawnSync } = await import('child_process')
 
     vi.mocked(fs.existsSync).mockReturnValue(false)
     vi.mocked(spawnSync).mockReturnValue({
@@ -2164,7 +2599,7 @@ describe('extractAllMetricsAsync', () => {
       signal: null,
       output: [],
     })
-    vi.mocked(execSync).mockReturnValue(JSON.stringify({ component: { measures: [] } }))
+    answerCurl(curlSays(200, { component: { measures: [] } }))
 
     const result = await extractAllMetricsAsync({
       customDimensions: [],
@@ -2174,7 +2609,7 @@ describe('extractAllMetricsAsync', () => {
   })
 
   it('skips custom dimension loading when skipCustomDimensions is true', async () => {
-    const { spawnSync, execSync } = await import('child_process')
+    const { spawnSync } = await import('child_process')
 
     vi.mocked(fs.existsSync).mockReturnValue(false)
     vi.mocked(spawnSync).mockReturnValue({
@@ -2185,7 +2620,7 @@ describe('extractAllMetricsAsync', () => {
       signal: null,
       output: [],
     })
-    vi.mocked(execSync).mockReturnValue(JSON.stringify({ component: { measures: [] } }))
+    answerCurl(curlSays(200, { component: { measures: [] } }))
 
     const result = await extractAllMetricsAsync({
       skipCustomDimensions: true,

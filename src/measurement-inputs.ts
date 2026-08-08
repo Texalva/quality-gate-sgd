@@ -123,7 +123,33 @@ export function measurementInputsListing(): string {
     }
 
     return `@@@ input: ${name} ${digest} @@@`;
-  }).join('\n');
+  })
+    .concat(sonarTargetLine())
+    .join('\n');
+}
+
+/**
+ * The SonarQube server and project this run grades against, as one digest.
+ *
+ * Not a file, so the list above cannot carry it: `SONARQUBE_URL` and
+ * `SONARQUBE_PROJECT_KEY` come from the environment, and `sonar-project.properties`
+ * is only one of the places the answer can come from. Without this line, two runs
+ * pointed at DIFFERENT servers -- or at different project keys on the same server --
+ * produced the same cache identity, so a verdict earned against a staging instance
+ * with an empty quality profile was served for production.
+ *
+ * Digested rather than named, for two reasons: the URL may embed a credential, and a
+ * project key can carry an organisation name nobody chose to publish in a cache file
+ * that gets committed.
+ */
+function sonarTargetLine(): string {
+  const config = getConfig();
+  const digest = crypto
+    .createHash('sha256')
+    .update(`${config.sonarqube.url}\n${config.sonarqube.projectKey}`)
+    .digest('hex');
+
+  return `@@@ target: sonarqube ${digest} @@@`;
 }
 
 /** The stamped form: one hash over the whole listing. */

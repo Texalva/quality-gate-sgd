@@ -44,6 +44,7 @@ vi.mock('../../src/config.js', () => ({
     },
   })),
   getSonarAuthToken: vi.fn(() => 'test-token'),
+  redactUrlCredentials: vi.fn((url: string) => url),
 }))
 
 // Mock symbols/mapper

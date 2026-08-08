@@ -48,7 +48,43 @@ export interface SonarIssue {
     rule: string;
 }
 export declare function getTopSonarIssues(limit?: number): SonarIssue[];
+/**
+ * A reading of the sonarqube dimension, or the reason there is none.
+ *
+ * The reason is the whole point of this shape. `extractSonarqubeMetrics` returned a
+ * bare `undefined` from a catch, from a parse failure and from an empty `measures`
+ * array, and `extractAllMetrics` never looked at sonarqube when building
+ * `measurementFailures` -- so the dimension could vanish entirely while the run was
+ * graded as a complete reading. REPRODUCED: a server answering 200 on `/` and 401 on
+ * `/api/measures/component` produced `✓ Quality gate PASSED`, exit 0, with three
+ * configured sonarqube ceilings never evaluated and nothing said about any of them;
+ * the second run printed `PASSED (cached)`.
+ *
+ * Four outcomes, four kinds, because each sends the adopter somewhere different:
+ * the URL is wrong, the token is wrong, the project key was never provisioned, or
+ * the analysis genuinely published no measures.
+ */
+export interface SonarqubeReading {
+    readonly metrics?: SonarqubeMetrics;
+    readonly failure?: MeasurementFailure;
+}
 export declare function extractSonarqubeMetrics(): SonarqubeMetrics | undefined;
+export declare function readSonarqubeMetrics(): SonarqubeReading;
+/**
+ * Whether there is a SonarQube server here at all.
+ *
+ * It used to return `true` whenever curl did not throw, which is to say whenever
+ * something accepted a TCP connection. `-o /dev/null -w "%{http_code}"` fetched the
+ * status and then discarded it, so a 401, a 503 or an nginx error page all read as
+ * "available", the gate ran the scan, and the failure surfaced -- if at all -- as an
+ * absent dimension much further downstream.
+ *
+ * Deliberately still tolerant of 4xx. A root URL behind auth answers 401 while the
+ * API is perfectly usable with a token, so refusing here would be wrong; what this
+ * has to exclude is "nothing answered" and "the server is broken". Authorization is
+ * judged where it is actually exercised, by `readSonarqubeMetrics`, which can say
+ * which endpoint refused and why.
+ */
 export declare function isSonarqubeAvailable(): boolean;
 export declare function runSonarqubeScan(): {
     success: boolean;

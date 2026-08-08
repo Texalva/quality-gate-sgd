@@ -7,7 +7,7 @@
  * the file:line:column information so we can compute target-space gradients.
  */
 import { spawnSync } from 'child_process';
-import { getConfig, getSonarAuthToken } from '../config.js';
+import { getConfig, getSonarAuthToken, redactUrlCredentials } from '../config.js';
 import { mapLocationToSymbol } from '../symbols/mapper.js';
 import { eslintLintProvider } from '../providers/eslint.js';
 import { typescriptTypecheckProvider } from '../providers/typescript.js';
@@ -202,12 +202,50 @@ function mapSonarTypeToDimension(type) {
 }
 /**
  * Extract SonarQube issues with location information.
+ *
+ * The lossy wrapper, kept because it is exported from the package root. Callers that
+ * need to know whether an empty list means "no findings" or "could not ask" want
+ * {@link readSonarqubeIssues}.
  */
 export function extractSonarqubeIssues() {
+    return readSonarqubeIssues().issues;
+}
+/**
+ * SonarQube issues, and the reason if they could not be read.
+ *
+ * The last source with no failure channel. Every exit from the loop below used to
+ * return `issues` -- a token that will not load, a curl that exits nonzero, a page
+ * of JSON that will not parse -- so a refused query and a genuinely clean project
+ * were the same empty array. The advice channel reported "nothing to fix" for a
+ * server it never reached, which is the same defect `readCoverageIssues` and
+ * `readTypescriptIssues` were given channels for.
+ *
+ * A partial result is a failure too, and deliberately still carries the issues it
+ * did fetch: page 3 failing after two good pages is not five hundred findings, and
+ * saying so is more useful than either discarding them or presenting them as the
+ * whole set.
+ */
+export function readSonarqubeIssues() {
     const config = getConfig();
     const token = getSonarAuthToken();
+    const url = `${redactUrlCredentials(config.sonarqube.url)}/api/issues/search`;
+    const failed = (kind, message, partial = []) => ({
+        issues: partial,
+        failures: [
+            measurementFailure(kind, 'sonarqube', message, {
+                via: 'process',
+                command: `curl -u <redacted> "${url}?componentKeys=${config.sonarqube.projectKey}"`,
+                exitCode: null,
+                signal: null,
+                elapsedMs: 0,
+                stdoutBytes: 0,
+                stderrBytes: 0,
+            }),
+        ],
+    });
     if (!token) {
-        return [];
+        return failed('access-denied', 'No SonarQube token is configured, so its issues could not be listed. Set ' +
+            'SONARQUBE_TOKEN, or the token file named by the config.');
     }
     const issues = [];
     try {
@@ -236,7 +274,12 @@ export function extractSonarqubeIssues() {
                 maxBuffer: SUBPROCESS_MAX_BUFFER,
             });
             if (result.status !== 0 || !result.stdout) {
-                break;
+                return failed(result.error ? 'tool-missing' : 'crashed', `Listing SonarQube issues stopped at page ${page}: ` +
+                    (result.error
+                        ? `curl could not run (${result.error.message}).`
+                        : `curl exited ${String(result.status)} with ${result.stdout ? 'a body' : 'no body'}.`) +
+                    ` ${issues.length} issue(s) had been read; they are reported, and this ` +
+                    'is reported with them rather than presented as the whole list.', issues);
             }
             const response = JSON.parse(result.stdout);
             for (const issue of response.issues) {
@@ -269,10 +312,12 @@ export function extractSonarqubeIssues() {
                 break;
         }
     }
-    catch {
-        // If fetching fails, return empty
+    catch (error) {
+        return failed('unparseable-output', `SonarQube's issue list could not be read: ` +
+            `${error instanceof Error ? error.message : String(error)}. ` +
+            `${issues.length} issue(s) had been read before that.`, issues);
     }
-    return issues;
+    return { issues, failures: [] };
 }
 // =============================================================================
 // Symbol Enrichment
@@ -358,12 +403,11 @@ export function extractLocatedIssues(options = {}) {
     const coverageReading = readCoverageIssues(options.coverageDir);
     const typescriptReading = options.skipTypescript ? empty : readTypescriptIssues();
     const eslintReading = options.skipEslint ? empty : readEslintIssues();
-    // sonarqube has no failure channel at all -- `extractSonarqubeIssues` returns []
-    // from a bare catch, exactly as `extractSonarqubeMetrics` returns undefined. That
-    // is #23/#42 and it is not closed here: this step gives the CHANNEL somewhere to
-    // arrive, and sonarqube still has nothing to put on it. A skipped dimension is
-    // deliberately not a failure either -- `--coverage-only` asked for it.
-    const sonarqube = options.skipSonarQube ? [] : extractSonarqubeIssues();
+    // A skipped dimension is deliberately not a failure -- `--coverage-only` asked for
+    // it -- but a dimension that was ASKED FOR and could not be read now says so, which
+    // is what the comment that stood here recorded as still missing.
+    const sonarqubeReading = options.skipSonarQube ? empty : readSonarqubeIssues();
+    const sonarqube = sonarqubeReading.issues;
     const coverage = coverageReading.issues;
     const typescript = typescriptReading.issues;
     const eslint = eslintReading.issues;
@@ -390,6 +434,8 @@ export function extractLocatedIssues(options = {}) {
             ...coverageReading.failures,
             ...typescriptReading.failures,
             ...eslintReading.failures,
+            // Last, so the orderings the existing tests assert on are untouched.
+            ...sonarqubeReading.failures,
         ],
     };
 }

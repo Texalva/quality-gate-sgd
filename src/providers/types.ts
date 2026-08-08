@@ -101,7 +101,17 @@ export type MeasurementFailureKind =
   | 'output-truncated'
   | 'unparseable-output'
   | 'report-missing'
-  | 'measured-nothing';
+  | 'measured-nothing'
+  /**
+   * The service answered and REFUSED: 401 or 403 from a SonarQube endpoint.
+   *
+   * Its own kind for the reason the others are: the response it calls for is
+   * different from every neighbour. `tool-missing` says fix the URL, this says
+   * rotate or grant the token, and confusing the two sends an adopter to the wrong
+   * file. It is also the likeliest sonarqube failure in practice -- a rotated
+   * SONARQUBE_TOKEN needs no change to anything else to arrive.
+   */
+  | 'access-denied';
 
 /**
  * What a failed measurement was measuring.

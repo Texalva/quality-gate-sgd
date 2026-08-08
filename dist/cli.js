@@ -518,10 +518,18 @@ async function runQualityGate(options = { skipSonarQube: false }) {
     }
     else {
         const failedRuleNames = result.failedRules.map((f) => f.rule);
-        const entry = createCacheEntry(metrics, rules, result.status, failedRuleNames, !notServableAsVerdict);
+        const entry = createCacheEntry(metrics, rules, result.status, failedRuleNames, !notServableAsVerdict, coverageProvenance.map((suite) => ({ suite: suite.suite, kind: suite.kind })));
         setCacheEntry(cache, cacheKey, entry);
         if (notServableAsVerdict) {
-            const why = baselineEntry === undefined
+            // The no-baseline branch is gated on there being a ratchet to have wanted one,
+            // not merely on the baseline being absent. `notServableAsVerdict` is true for ANY
+            // unevaluated rule, so testing `baselineEntry === undefined` first claimed
+            // "its monotonic rules had nothing to compare against" on the first run of a
+            // project with a coverage floor, an unstamped report and no monotonic rules at
+            // all -- which is precisely the population the provenance advisory below exists
+            // for, told instead about rules it does not have.
+            const wantedABaseline = (rules.rules.monotonic?.length ?? 0) > 0;
+            const why = wantedABaseline && baselineEntry === undefined
                 ? 'its monotonic rules had nothing to compare against'
                 : unverifiedProvenance.length > 0 && worthListing.length === 0
                     ? 'its coverage numbers came from a report whose provenance could not be established'

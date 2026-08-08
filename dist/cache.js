@@ -21,6 +21,15 @@ import { measurementInputsHash, measurementInputsListing } from './measurement-i
  * pass before `binaryInvocation` runs, so the fixed build would inherit the verdict the
  * fix exists to prevent. Reachable by upgrading the tool on an unchanged tree.
  *
+ * 7 also carries two more changes to what a pass means, landed in the same unreleased
+ * version rather than as further bumps because no build with one and not the others was
+ * ever published: a sonarqube reading is now bound to the analysis this run submitted
+ * (`Metrics.sonarqubeProvenance`), and a coverage reading is now tied to the code state
+ * its report describes (`CacheEntry.coverageProvenance`). Both add an explicit refusal
+ * beside the counter, because the counter alone cannot catch an entry written by an
+ * intermediate revision of the same version. Full reasoning on QualityGateCache in
+ * types.ts.
+ *
  * 6 since a lost SonarQube reading became a measurement failure.
  *
  * 5 since an individual ratcheted metric absent from the baseline became a rule that
@@ -541,7 +550,14 @@ export function createCacheEntry(metrics, rules, status, failedRules,
 // record an unevaluated ratchet as an evaluated one, which is the shape
 // `isCacheValid` exists to refuse; tolerating history is a reason to accept a
 // missing value when READING, not a reason to let a new entry omit it.
-monotonicEvaluated) {
+monotonicEvaluated, 
+// REQUIRED for the same reason, and the reason is sharper here. A writer that omits
+// this records a suite whose provenance was never established as one that has no
+// recorded verdict -- and `evaluateMonotonic` cannot tell that apart from an entry
+// written before the field existed, so it must read both as "never checked". An
+// omission is therefore not a smaller claim than the truth, it is a LOUDER one: it
+// costs a later run its ratchet. Pass the verdicts this run actually reached.
+coverageProvenance) {
     return {
         timestamp: Date.now(),
         rulesVersion: rules.version,
@@ -552,6 +568,7 @@ monotonicEvaluated) {
         },
         metrics,
         monotonicEvaluated,
+        coverageProvenance,
         // Read from config rather than taken as a parameter, unlike the flag above:
         // which manager ran is ambient for the whole process, not a property of this
         // run that only the caller knows, so there is nothing here for a writer to
@@ -649,12 +666,20 @@ function usableBaseline(entry) {
     // those questions have different answers -- an unevaluated entry is still an honest
     // reading of its commit, so it makes a fine baseline.
     //
-    // "An honest reading of its commit" holds for every dimension EXCEPT an unbound
-    // sonarqube one, and that exception is handled per-metric in `evaluateMonotonic`
-    // (reason `baseline-unbound`) rather than here: an entry whose sonarqube provenance was
-    // never confirmed is still an honest reading of its typescript, eslint and coverage,
-    // and refusing the whole entry would deadlock every commit on a server that can never
-    // confirm one. See that check for the two-commit laundering path it closes.
+    // "An honest reading of its commit" holds for every dimension whose provenance was
+    // established, and there are now TWO that can fail to be: an unbound sonarqube
+    // reading, and a coverage suite whose report could not be tied to the code. Both are
+    // handled per-metric in `evaluateMonotonic` (reason `baseline-unbound`) rather than
+    // here, because refusing the whole entry would deadlock every commit -- forever on a
+    // server that can never confirm an analysis, and forever on a project that generates
+    // coverage out of band and never stamps a sidecar. See that check for the two-commit
+    // laundering path it closes.
+    //
+    // The narrower claim this comment used to make -- that an unconfirmed sonarqube entry
+    // "is still an honest reading of its typescript, eslint and coverage" -- was made
+    // false by the coverage half and is why that half went unguarded: coverage was named
+    // as one of the dimensions needing no check, in the comment a reader would consult to
+    // find out whether it needed one.
     //
     // For the package manager the two questions
     // have the SAME answer, because numbers from two toolchains cannot be differenced:

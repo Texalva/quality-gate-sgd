@@ -11,7 +11,12 @@ import {
 import { resetConfig } from '../src/config.js'
 import { measurementInputsHash } from '../src/measurement-inputs.js'
 import { isEmbeddedDefaults } from '../src/defaults.js'
-import type { QualityRules, Metrics, CacheEntry } from '../src/types.js'
+import type {
+  QualityRules,
+  Metrics,
+  CacheEntry,
+  CoverageProvenanceStamp,
+} from '../src/types.js'
 import type { MeasurementFailure } from '../src/providers/types.js'
 
 describe('loadRules', () => {
@@ -917,6 +922,19 @@ describe('evaluateRules', () => {
   })
 
   describe('monotonic evaluation', () => {
+    // What a baseline entry from a real passing run carries: one provenance verdict per
+    // coverage suite. `evaluateMonotonic` refuses to difference against a suite whose
+    // report it cannot tie to the code (reason `baseline-unbound`), and a MISSING verdict
+    // means "never checked", so a fixture that omits this exercises the guard rather than
+    // the arithmetic it means to test.
+    //
+    // Stamped only on the fixtures whose ratchet is supposed to RUN. The guard itself has
+    // its own describe block -- 'a coverage ratchet whose baseline was never tied to the
+    // code' -- and the fixtures there deliberately leave it off or set it unverifiable.
+    const unitVerified: readonly CoverageProvenanceStamp[] = [
+      { suite: 'coverage.unit', kind: 'verified' },
+    ]
+
     // #43, end to end at the rules layer. The ratchet is the ONLY coverage rule,
     // there IS a baseline to ratchet against, and the current report is absent.
     //
@@ -1058,6 +1076,7 @@ describe('evaluateRules', () => {
           sloc: 1000,
         },
         evaluation: { status: 'pass', failedRules: [] },
+        coverageProvenance: unitVerified,
       }
 
       const result = evaluateRules(rules, currentMetrics, baselineEntry)
@@ -1341,6 +1360,7 @@ describe('evaluateRules', () => {
           sloc: 1000,
         },
         evaluation: { status: 'pass', failedRules: [] },
+        coverageProvenance: unitVerified,
       }
 
       const result = evaluateRules(rules, metrics, baselineEntry)
@@ -1386,6 +1406,7 @@ describe('evaluateRules', () => {
           sloc: 1000,
         },
         evaluation: { status: 'pass', failedRules: [] },
+        coverageProvenance: unitVerified,
       }
 
       const result = evaluateRules(rules, metrics, baselineEntry)
@@ -2243,6 +2264,227 @@ describe('a ratchet whose baseline sonarqube numbers were never bound', () => {
     }
 
     const result = evaluateRules(tsRatchet, after, baselineEntryWith(before))
+
+    expect(result.unevaluated).toHaveLength(0)
+    expect(result.status).toBe('pass')
+  })
+})
+
+/**
+ * #39's BASELINE half, which the sonarqube half above left open by asserting in a
+ * comment that it did not exist.
+ *
+ * `usableBaseline` said an unconfirmed entry "is still an honest reading of its
+ * typescript, eslint and coverage" -- written when coverage provenance was not a thing
+ * that could fail. Once it was, coverage needed the identical guard and did not have
+ * one: `monotonicEvaluated: false` stops the unverified run being served as a VERDICT,
+ * and nothing stopped it being differenced against as a BASELINE.
+ *
+ * Same construction and the same arithmetic as the sonarqube block, one dimension over.
+ */
+describe('a coverage ratchet whose baseline was never tied to the code', () => {
+  const ratchet: QualityRules = {
+    version: '1.0.0',
+    rules: { monotonic: [{ direction: 'up', metrics: ['coverage.unit.statements'] }] },
+  }
+
+  const coverageWith = (statements: number): Metrics['coverage'] => ({
+    unit: { statements, branches: statements, functions: statements, lines: statements },
+  })
+
+  const entryWith = (
+    metrics: Metrics,
+    coverageProvenance?: readonly CoverageProvenanceStamp[]
+  ): CacheEntry => ({
+    timestamp: 1,
+    rulesVersion: '1.0.0',
+    rulesHash: computeRulesHash(ratchet),
+    evaluation: { status: 'pass', failedRules: [] },
+    metrics,
+    ...(coverageProvenance === undefined ? {} : { coverageProvenance }),
+  })
+
+  // C1's report was never stamped, so its 10 is advisory-only and the entry is written
+  // baseline-only. C2 stamps a real report at 40 -- a REGRESSION from C1's true 90 --
+  // and 40 >= 10 passes a naive `up` comparison.
+  const c1: Metrics = { scripts: {}, coverage: coverageWith(10) }
+  const c2: Metrics = { scripts: {}, coverage: coverageWith(40) }
+  const verified: readonly CoverageProvenanceStamp[] = [
+    { suite: 'coverage.unit', kind: 'verified' },
+  ]
+
+  it('does not run, and says which number it refused to difference against', () => {
+    const result = evaluateRules(
+      ratchet,
+      c2,
+      entryWith(c1, [{ suite: 'coverage.unit', kind: 'unverifiable' }])
+    )
+
+    expect(result.unevaluated).toHaveLength(1)
+    expect(result.unevaluated[0]).toMatchObject({
+      type: 'monotonic',
+      rule: 'up:coverage.unit.statements',
+      reason: 'baseline-unbound',
+    })
+    expect(result.unevaluated[0].message).toContain('10')
+    expect(result.unevaluated[0].message).toContain('coverage.unit')
+  })
+
+  // Which is what stops the laundering: without it C2 is stamped
+  // `monotonicEvaluated: true` and served as a verdict on the next run.
+  it('leaves the inheriting run uncacheable as a verdict', () => {
+    const result = evaluateRules(
+      ratchet,
+      c2,
+      entryWith(c1, [{ suite: 'coverage.unit', kind: 'unverifiable' }])
+    )
+
+    expect(
+      isCacheValid(
+        {
+          timestamp: 2,
+          rulesVersion: '1.0.0',
+          rulesHash: computeRulesHash(ratchet),
+          evaluation: { status: 'pass', failedRules: [] },
+          metrics: c2,
+          monotonicEvaluated: result.unevaluated.length === 0,
+        },
+        ratchet
+      )
+    ).toBe(false)
+  })
+
+  // An entry written before the field existed carries coverage numbers and no verdict,
+  // which means "never checked" and not "fine".
+  it('treats an absent baseline verdict the same as an unverifiable one', () => {
+    const result = evaluateRules(ratchet, c2, entryWith(c1))
+
+    expect(result.unevaluated[0]).toMatchObject({ reason: 'baseline-unbound' })
+  })
+
+  // A stale baseline is only reachable from history -- a stale report fails the gate and
+  // the failure blocks the entry write -- but differencing against one is the same defect.
+  it('refuses a baseline whose report was recognised as stale', () => {
+    const result = evaluateRules(
+      ratchet,
+      c2,
+      entryWith(c1, [{ suite: 'coverage.unit', kind: 'stale' }])
+    )
+
+    expect(result.unevaluated[0]).toMatchObject({ reason: 'baseline-unbound' })
+  })
+
+  // The ordinary case must still ratchet, or this check has disabled the feature.
+  it('runs normally when the baseline report was verified', () => {
+    const passing = evaluateRules(ratchet, c2, entryWith(c1, verified))
+    expect(passing.unevaluated).toHaveLength(0)
+    expect(passing.status).toBe('pass')
+
+    const regressed: Metrics = { scripts: {}, coverage: coverageWith(5) }
+    const failing = evaluateRules(ratchet, regressed, entryWith(c1, verified))
+    expect(failing.status).toBe('fail')
+    expect(failing.failedRules[0].rule).toBe('up:coverage.unit.statements')
+  })
+
+  // PER-SUITE. A project whose unit report is stamped and whose lambda report is not
+  // must keep the ratchets that read unit and lose only the ones that read lambda.
+  it('refuses only the suites whose provenance is unestablished', () => {
+    const both: QualityRules = {
+      version: '1.0.0',
+      rules: {
+        monotonic: [
+          {
+            direction: 'up',
+            metrics: ['coverage.unit.statements', 'coverage.lambda.statements'],
+          },
+        ],
+      },
+    }
+    const withLambda = (statements: number): Metrics => ({
+      scripts: {},
+      coverage: {
+        unit: {
+          statements,
+          branches: statements,
+          functions: statements,
+          lines: statements,
+        },
+        lambda: {
+          statements,
+          branches: statements,
+          functions: statements,
+          lines: statements,
+        },
+      },
+    })
+
+    const result = evaluateRules(
+      both,
+      withLambda(40),
+      entryWith(withLambda(10), verified)
+    )
+
+    expect(result.unevaluated).toHaveLength(1)
+    expect(result.unevaluated[0].metricPath).toBe('coverage.lambda.statements')
+    expect(result.unevaluated[0].reason).toBe('baseline-unbound')
+  })
+
+  // A `coverage.union` ratchet is differenced against numbers summed from BOTH reports,
+  // so it must refuse when EITHER suite is unestablished. A single-suite answer here
+  // would keep the ratchet running on half a provenance -- the same "derived number
+  // graded from a failed upstream" shape `measurementsBehind` exists to close.
+  it('refuses a union ratchet when only one of its two suites is verified', () => {
+    const union: QualityRules = {
+      version: '1.0.0',
+      rules: { monotonic: [{ direction: 'up', metrics: ['coverage.union.statements'] }] },
+    }
+    const withUnion = (statements: number): Metrics => ({
+      scripts: {},
+      coverage: {
+        unit: {
+          statements,
+          branches: statements,
+          functions: statements,
+          lines: statements,
+        },
+        union: {
+          statements,
+          branches: statements,
+          functions: statements,
+          lines: statements,
+        },
+      },
+    })
+
+    const result = evaluateRules(
+      union,
+      withUnion(40),
+      entryWith(withUnion(10), verified)
+    )
+
+    expect(result.unevaluated).toHaveLength(1)
+    expect(result.unevaluated[0]).toMatchObject({
+      metricPath: 'coverage.union.statements',
+      reason: 'baseline-unbound',
+    })
+  })
+
+  // A ratchet on a dimension that reads no coverage report is untouched by any of this.
+  it('does not interfere with a ratchet on another dimension', () => {
+    const tsRatchet: QualityRules = {
+      version: '1.0.0',
+      rules: { monotonic: [{ direction: 'down', metrics: ['typescript.errors'] }] },
+    }
+    const before: Metrics = {
+      ...c1,
+      typescript: { errors: 5, warnings: 0, rootCauses: 0 },
+    }
+    const after: Metrics = {
+      ...c2,
+      typescript: { errors: 5, warnings: 0, rootCauses: 0 },
+    }
+
+    const result = evaluateRules(tsRatchet, after, entryWith(before))
 
     expect(result.unevaluated).toHaveLength(0)
     expect(result.status).toBe('pass')

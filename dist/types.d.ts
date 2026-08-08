@@ -2,7 +2,7 @@
  * Type definitions for the Quality Gate system
  * Schema Version: 3
  */
-import type { MeasurementFailure } from './providers/types.js';
+import type { CoverageSuite, MeasurementFailure } from './providers/types.js';
 import type { PackageManager } from './runner.js';
 /**
  * Bumped whenever the DEFINITION OF A PASS changes, because `cli.ts` exits 0 on a
@@ -117,6 +117,14 @@ import type { PackageManager } from './runner.js';
  *   written by an intermediate revision of the same version, which is the same
  *   allowance version 3 records for cache suppression.
  *
+ *   Version 7 carries a THIRD change to what a pass means, for the same reason and in
+ *   the same unreleased version: a coverage reading is now tied to the code state its
+ *   report describes (`CacheEntry.coverageProvenance`). An entry written before that
+ *   field existed records no verdict per suite, and the BASELINE channel reads a missing
+ *   verdict as "never checked" rather than as "fine" -- see `evaluateMonotonic`'s
+ *   `baseline-unbound` guard, which covers coverage for the same two-commit laundering
+ *   path it covers for sonarqube.
+ *
  *   The cost is the standing cost of every bump and it was accepted at 3, 4, 5 and 6:
  *   one re-measurement, and one commit's worth of baseline-missing ratchets, which are
  *   reported as rules that did not run and resolve against the entry that run writes.
@@ -124,6 +132,20 @@ import type { PackageManager } from './runner.js';
 export interface QualityGateCache {
     schemaVersion: 7;
     entries: Record<string, CacheEntry>;
+}
+/**
+ * One coverage suite's provenance verdict, as an entry records it.
+ *
+ * The three `SuiteProvenance` kinds collapsed to their tag, deliberately: the paths,
+ * the changed-file list and the reason a stamp was unusable are all about diagnosing
+ * THIS run, and a later run reading this as a baseline needs exactly one bit of it --
+ * was this suite's number tied to the code or not. Storing the rest would put a
+ * growing diagnostic payload in a file that is committed by adopters who persist the
+ * cache, for a reader that cannot act on it.
+ */
+export interface CoverageProvenanceStamp {
+    readonly suite: CoverageSuite;
+    readonly kind: 'verified' | 'stale' | 'unverifiable';
 }
 export interface CacheEntry {
     timestamp: number;
@@ -173,6 +195,36 @@ export interface CacheEntry {
      * which is what it meant when they were written.
      */
     monotonicEvaluated?: boolean;
+    /**
+     * Whether each coverage suite's numbers were tied to the code they describe.
+     *
+     * THE BASELINE HALF of the coverage-provenance check, and the quieter half -- the
+     * exact counterpart of `Metrics.sonarqubeProvenance`, kept here rather than on
+     * `Metrics` for one reason: `Metrics` is compared byte-for-byte by the refactor
+     * harness's golden master, and a per-run provenance verdict there would move that
+     * capture on every apollo run while proving nothing about the tool's behaviour.
+     *
+     * `monotonicEvaluated: false` already stops an unverified run being served as a
+     * VERDICT. It does not stop it being a BASELINE: `usableBaseline` accepts such an
+     * entry and `evaluateMonotonic` then reads its numbers as the floor. CONSTRUCTED
+     * path, no adversarial input, and the same arithmetic as the sonarqube case:
+     * commit C1's coverage report is unstamped, so its `coverage.unit.statements = 10`
+     * is advisory-only and the entry is written baseline-only. Commit C2 stamps a real
+     * report at 40 -- a regression from C1's true 90 -- differences 40 against 10,
+     * reports no violation on an `up:coverage.unit.statements` ratchet, is stamped
+     * `monotonicEvaluated: true` and IS cached as a verdict. The unverified number was
+     * laundered into an earned pass by the entry the provenance check itself wrote.
+     *
+     * Refused per-metric in `evaluateMonotonic` (reason `baseline-unbound`) rather than
+     * per-entry in `usableBaseline`, because a project that generates coverage out of
+     * band and never stamps would otherwise have no baseline on any commit, forever --
+     * the same permanent-unconfirmable deadlock that decided the sonarqube half.
+     *
+     * Optional, and a MISSING verdict for a suite means "never checked", not "fine":
+     * entries written before this field existed carry coverage numbers whose provenance
+     * nothing established. That asymmetry is the whole point of recording it.
+     */
+    coverageProvenance?: readonly CoverageProvenanceStamp[];
     /**
      * Which package manager produced these numbers.
      *

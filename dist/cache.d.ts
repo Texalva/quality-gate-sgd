@@ -2,7 +2,7 @@
  * Cache Module
  * Handles reading/writing the quality gate cache with schema versioning
  */
-import type { QualityGateCache, CacheEntry, Metrics, QualityRules } from './types.js';
+import type { QualityGateCache, CacheEntry, CoverageProvenanceStamp, Metrics, QualityRules } from './types.js';
 export declare function getCurrentCommitHash(): string;
 /**
  * Where the previous commit's reading should come from, or why it cannot be said.
@@ -187,7 +187,7 @@ export declare function loadCache(): QualityGateCache;
 export declare function saveCache(cache: QualityGateCache): void;
 export declare function getCacheEntry(cache: QualityGateCache, commitHash: string): CacheEntry | undefined;
 export declare function setCacheEntry(cache: QualityGateCache, commitHash: string, entry: CacheEntry): void;
-export declare function createCacheEntry(metrics: Metrics, rules: QualityRules, status: 'pass' | 'fail', failedRules: string[], monotonicEvaluated: boolean): CacheEntry;
+export declare function createCacheEntry(metrics: Metrics, rules: QualityRules, status: 'pass' | 'fail', failedRules: string[], monotonicEvaluated: boolean, coverageProvenance: readonly CoverageProvenanceStamp[]): CacheEntry;
 /**
  * Find the best baseline entry for comparison
  *

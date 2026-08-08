@@ -443,6 +443,31 @@ function gradesSonarqube(metricPath) {
     return measurementsBehind(metricPath).some((required) => sameSubtree(required, 'sonarqube'));
 }
 /**
+ * EVERY coverage suite a rule on this metric path reads.
+ *
+ * Built on `measurementsBehind` for the same reason `gradesSonarqube` is, and the
+ * derivation edge is the whole reason this returns a LIST rather than one suite:
+ * `DERIVED_FROM` maps `coverage.union` to both suites, so an `up:coverage.union.lines`
+ * ratchet is differenced against numbers summed from the unit report AND the lambda
+ * report. A single-suite answer would keep that ratchet running when one of the two
+ * reports had no provenance -- the same "derived number graded from a failed upstream"
+ * shape that was reproduced twice on the floors before `measurementsBehind` existed.
+ *
+ * Per-suite rather than a boolean because provenance is per-suite: a project whose
+ * unit report is stamped and whose lambda report is not must keep its `coverage.unit`
+ * ratchets and lose only the ones that read lambda.
+ *
+ * A path under no suite at all (`coverage.statements`, from a hand-written rules.json
+ * -- nothing validates that shape) returns empty and this guard stays silent, which is
+ * correct rather than a gap: `getMetricValue` finds no such metric, so the
+ * `baseline-missing` / `current-missing` branch above has already reported it.
+ */
+function coverageSuitesBehind(metricPath) {
+    const suites = ['coverage.unit', 'coverage.lambda'];
+    const required = measurementsBehind(metricPath);
+    return suites.filter((suite) => required.some((path) => sameSubtree(path, suite)));
+}
+/**
  * A rule applied to sonarqube numbers that could not be tied to a known analysis.
  *
  * ONE entry, not one per rule, and the message lists the rules it stands for. The
@@ -524,7 +549,11 @@ function dimensionOf(metricPath) {
  * CURRENT value means the reading itself is incomplete, and usually arrives alongside
  * a measurement failure that fails the gate independently.
  */
-function evaluateMonotonic(rules, currentMetrics, baselineMetrics) {
+function evaluateMonotonic(rules, currentMetrics, baselineMetrics, 
+// Separate from `baselineMetrics` because it is stored separately -- on the entry
+// rather than in `Metrics`, to keep it out of the golden master's byte comparison.
+// See `CacheEntry.coverageProvenance`.
+baselineCoverageProvenance) {
     const failures = [];
     const unevaluated = [];
     const monotonicRules = rules.rules.monotonic;
@@ -631,6 +660,37 @@ function evaluateMonotonic(rules, currentMetrics, baselineMetrics) {
                 });
                 continue;
             }
+            // The coverage counterpart of the check above, and it exists because the comment
+            // in `usableBaseline` said coverage did not need one. Same construction, same
+            // arithmetic, different dimension: commit C1's report is unstamped, so
+            // `coverage.unit.statements = 10` is reported as unverifiable provenance and the
+            // entry is written baseline-only -- but `usableBaseline` still hands those numbers
+            // to this function. Commit C2 stamps a real report at 40, a regression from C1's
+            // true 90, differences 40 against 10, finds no violation on `up:` and IS cached as
+            // a verdict. The unverified number becomes an earned pass one commit later.
+            //
+            // A MISSING verdict for the suite is treated as unverified, not as fine, for the
+            // same reason `!== 'confirmed'` is used above: an entry written before the field
+            // existed carries coverage numbers whose provenance nothing ever established.
+            // `stale` is included even though it also fails the gate through its own
+            // measurement failure -- that failure blocks the entry WRITE, so a stale baseline
+            // is only reachable from history, and reading one as a floor is the same defect.
+            const unboundSuites = coverageSuitesBehind(metricPath).filter((suite) => baselineCoverageProvenance?.find((stamp) => stamp.suite === suite)?.kind !==
+                'verified');
+            if (unboundSuites.length > 0) {
+                unevaluated.push({
+                    type: 'monotonic',
+                    rule: `${rule.direction}:${metricPath}`,
+                    metricPath,
+                    reason: 'baseline-unbound',
+                    message: `the baseline's ${metricPath} (${baselineValue}) came from a coverage report ` +
+                        `that could not be tied to the code it describes ` +
+                        `(${unboundSuites.join(', ')}), so the '${rule.direction}' ratchet on it did ` +
+                        `not run -- differencing this run's ${currentValue} against a number of ` +
+                        'unproven origin would report a pass the comparison did not earn',
+                });
+                continue;
+            }
             const isViolation = rule.direction === 'up'
                 ? currentValue < baselineValue
                 : currentValue > baselineValue;
@@ -682,7 +742,7 @@ function evaluateScripts(rules, metrics) {
 // =============================================================================
 export function evaluateRules(rules, currentMetrics, baselineEntry) {
     const baselineMetrics = baselineEntry?.metrics;
-    const monotonic = evaluateMonotonic(rules, currentMetrics, baselineMetrics);
+    const monotonic = evaluateMonotonic(rules, currentMetrics, baselineMetrics, baselineEntry?.coverageProvenance);
     const ceilings = evaluateCeilings(rules, currentMetrics);
     const allFailures = [
         // First, so the reason a dimension is absent is stated before the rules

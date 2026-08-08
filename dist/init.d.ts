@@ -93,6 +93,19 @@ export interface GeneratedConfig {
 export declare function scriptWritesCoverage(name: string, body: string): boolean;
 export declare function analyzeRepo(projectRoot: string): RepoAnalysis;
 /**
+ * Which model the direct-API path asks, and why it is not a literal.
+ *
+ * A pinned id rots on a schedule nobody controls. When the API rejects an unknown
+ * model, `suggestGeometry` falls back to its built-in defaults -- correct behaviour,
+ * and until now an invisible one: an adopter with a key set believed they had an
+ * LLM-suggested coverage target and had the hardcoded one. Reading it from the
+ * environment makes the next deprecation a config change instead of a release, and
+ * the disclosure below makes the fallback impossible to mistake for an answer.
+ *
+ * Only the direct-API path uses it. The Claude CLI picks its own model.
+ */
+export declare const INIT_MODEL_ENV_VAR = "QUALITY_INIT_MODEL";
+/**
  * Reads one line, returning EXACTLY what the user typed -- '' for a bare Enter.
  *
  * Separate from the default-substituting `askQuestion` below because conflating the

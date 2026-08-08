@@ -277,6 +277,25 @@ function estimateSloc(dir: string): number {
 // LLM Integration
 // =============================================================================
 
+/**
+ * Which model the direct-API path asks, and why it is not a literal.
+ *
+ * A pinned id rots on a schedule nobody controls. When the API rejects an unknown
+ * model, `suggestGeometry` falls back to its built-in defaults -- correct behaviour,
+ * and until now an invisible one: an adopter with a key set believed they had an
+ * LLM-suggested coverage target and had the hardcoded one. Reading it from the
+ * environment makes the next deprecation a config change instead of a release, and
+ * the disclosure below makes the fallback impossible to mistake for an answer.
+ *
+ * Only the direct-API path uses it. The Claude CLI picks its own model.
+ */
+export const INIT_MODEL_ENV_VAR = 'QUALITY_INIT_MODEL';
+const DEFAULT_INIT_MODEL = 'claude-sonnet-5';
+
+function initModel(): string {
+  return process.env[INIT_MODEL_ENV_VAR] || DEFAULT_INIT_MODEL;
+}
+
 function checkClaudeCli(): boolean {
   try {
     const result = spawnSync('claude', ['--version'], { encoding: 'utf-8', timeout: 5000 });
@@ -290,7 +309,19 @@ function checkAnthropicKey(): boolean {
   return !!process.env.ANTHROPIC_API_KEY;
 }
 
+/**
+ * Every exit from here is either an answer or a stated reason, never an empty string.
+ *
+ * It used to return `''` when the API responded with something that had no
+ * `content[0].text` -- which is exactly the shape of an API ERROR body, so an expired
+ * key, a rejected model id or a rate limit all produced a successful-looking empty
+ * answer. `suggestGeometry` then found no JSON in it and took its defaults, silently.
+ * Throwing with the API's own `error.message` is the difference between "the LLM
+ * suggested these numbers" and "the LLM said your key is invalid".
+ */
 async function callClaude(prompt: string): Promise<string> {
+  const attempts: string[] = [];
+
   // Try Claude CLI first
   if (checkClaudeCli()) {
     const result = spawnSync('claude', ['-p', prompt], {
@@ -301,6 +332,16 @@ async function callClaude(prompt: string): Promise<string> {
     if (result.status === 0 && result.stdout) {
       return result.stdout;
     }
+    // A CLI that is installed and then fails is worth naming. `checkClaudeCli` runs
+    // `claude --version` under a 5s timeout, so a slow-but-working CLI is reported as
+    // absent -- and that verdict is now visible here rather than being the reason a
+    // config quietly came from defaults.
+    attempts.push(
+      `claude CLI exited ${result.status ?? 'on a signal'}` +
+        `${result.stderr ? `: ${String(result.stderr).trim().slice(0, 200)}` : ''}`
+    );
+  } else {
+    attempts.push('claude CLI not on PATH (or `claude --version` took over 5s)');
   }
 
   // Fall back to API if key exists
@@ -314,7 +355,7 @@ async function callClaude(prompt: string): Promise<string> {
       '-H', `x-api-key: ${process.env.ANTHROPIC_API_KEY}`,
       '-H', 'anthropic-version: 2023-06-01',
       '-d', JSON.stringify({
-        model: 'claude-sonnet-4-20250514',
+        model: initModel(),
         max_tokens: 2048,
         messages: [{ role: 'user', content: prompt }],
       }),
@@ -325,15 +366,34 @@ async function callClaude(prompt: string): Promise<string> {
 
     if (result.stdout) {
       try {
-        const response = JSON.parse(result.stdout) as { content?: Array<{ text?: string }> };
-        return response.content?.[0]?.text || '';
+        const response = JSON.parse(result.stdout) as {
+          content?: Array<{ text?: string }>;
+          error?: { type?: string; message?: string };
+        };
+        const text = response.content?.[0]?.text;
+        if (text) return text;
+
+        attempts.push(
+          response.error
+            ? `API (${initModel()}) returned ${response.error.type ?? 'an error'}: ` +
+              `${response.error.message ?? 'no message'}`
+            : `API (${initModel()}) returned no content`
+        );
       } catch {
-        // Ignore parse errors
+        attempts.push(`API (${initModel()}) returned a response that is not JSON`);
       }
+    } else {
+      attempts.push('curl produced no output (offline, or curl is not installed)');
     }
+  } else {
+    attempts.push('ANTHROPIC_API_KEY is not set');
   }
 
-  throw new Error('No LLM available. Install Claude CLI or set ANTHROPIC_API_KEY.');
+  throw new Error(
+    `No LLM available. Install the Claude CLI or set ANTHROPIC_API_KEY. Tried: ` +
+      `${attempts.join('; ')}. Set ${INIT_MODEL_ENV_VAR} to choose a different model ` +
+      `(default ${DEFAULT_INIT_MODEL}).`
+  );
 }
 
 async function suggestGeometry(analysis: RepoAnalysis): Promise<GeometrySuggestion> {
@@ -380,6 +440,16 @@ Respond with ONLY a JSON object (no markdown, no explanation outside JSON):
   "recommendSonarQube": <true if Docker available and project is >500 SLOC, false otherwise>
 }`;
 
+  // Which of the two produced the numbers below, said out loud.
+  //
+  // The fallback itself is right -- init must work with no LLM. What was wrong is that
+  // it was indistinguishable from an answer: the rationale read "Standard quality
+  // dimensions for a TypeScript project" either way, `conductInterview` prints it as
+  // `LLM Analysis:`, and the coverage target it suggests becomes the floor the gate
+  // enforces. An adopter with a key set and a rejected model got the built-in numbers
+  // presented as analysis of their repository.
+  let why: string | undefined;
+
   try {
     const response = await callClaude(prompt);
     // Extract JSON from response
@@ -387,16 +457,23 @@ Respond with ONLY a JSON object (no markdown, no explanation outside JSON):
     if (jsonMatch) {
       return JSON.parse(jsonMatch[0]) as GeometrySuggestion;
     }
-  } catch {
-    // Fall back to defaults
+    why = 'the model replied with no JSON object';
+  } catch (error) {
+    why = error instanceof Error ? error.message : String(error);
   }
+
+  console.error(`\nNo LLM suggestion -- using built-in defaults. Reason: ${why}`);
 
   // Default suggestion
   return {
     dimensions: analysis.hasTypeScript
       ? ['coverage.branches', 'coverage.statements', 'typescript.errors', 'eslint.errors']
       : ['coverage.branches', 'coverage.statements', 'eslint.errors'],
-    rationale: 'Standard quality dimensions for a TypeScript project',
+    // Names its own provenance, because this string is what `conductInterview` prints
+    // under the label `LLM Analysis:`.
+    rationale:
+      'Built-in defaults, not an LLM suggestion: standard quality dimensions for a ' +
+      'TypeScript project',
     coverageTarget: analysis.estimatedSloc > 5000 ? 60 : 70,
     recommendSonarQube: analysis.hasDocker && analysis.estimatedSloc > 500,
   };

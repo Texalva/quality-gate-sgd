@@ -115,8 +115,14 @@ export function buildEvidence(
  * Existence is probed with `existsSync` first, preserving the contract the
  * previous implementation had, so "the tool never wrote a lambda report" stays
  * the ordinary silent case it has always been. `statSync` is called only for
- * `modifiedMs`, inside its own try, and CANNOT change the outcome -- mtime is
- * supplementary evidence for a human, never a verdict.
+ * `modifiedMs`, inside its own try, and CANNOT change the outcome of THIS read --
+ * nothing below branches on it.
+ *
+ * "mtime is never a verdict" used to stand here without qualification and no longer
+ * can. `coverage-provenance.ts` does compare a coverage summary's mtime, to answer
+ * whether that one file was written during this one process on this one clock; it
+ * takes its own `statSync` and does not consume this field, so the read below is
+ * still incapable of being changed by it.
  *
  * Does not log. The caller decides whether this failure is fatal or discarded,
  * and only the layer that discards an error should be talking about it.

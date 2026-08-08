@@ -130,6 +130,13 @@ export {
   // Full extraction
   extractAllMetrics,
   extractAllMetricsAsync,
+  // The variants that keep the coverage provenance verdicts. Published alongside the
+  // lossy ones for the same reason `readSonarqubeMetrics` is: a consumer producing a
+  // VERDICT needs to know which reports it can stand behind, and the Metrics-only
+  // signatures cannot say.
+  extractAllMetricsAndCoverageProvenance,
+  extractAllMetricsAsyncAndCoverageProvenance,
+  type MetricsWithCoverageProvenance,
 } from './metrics.js';
 
 // =============================================================================
@@ -153,7 +160,40 @@ export {
   createCacheEntry,
   findBaselineEntry,
   pruneOldEntries,
+
+  // The code-state question the provenance sidecar asks, published because a consumer
+  // that wants to stamp a report from its own pipeline needs the same answer the gate
+  // uses rather than a second one.
+  codeStateDigest,
+  type CodeStateDigest,
+  listUntrackedCodeFiles,
 } from './cache.js';
+
+// =============================================================================
+// Coverage Report Provenance
+// =============================================================================
+//
+// Published because the verdict is a FACT ABOUT THE READING, not an internal detail of
+// the CLI. A consumer that reads `metrics.coverage` without being able to ask which
+// state of the code produced it is back where this module started: grading a report
+// nothing ties to the code.
+
+export {
+  verifyCoverageProvenance,
+  snapshotCoverageStateBeforeScripts,
+  stampCoverageSummariesRewrittenDuringRun,
+  stampAllCoverageSummaries,
+  coverageProvenanceFailures,
+  coverageProvenanceUnevaluated,
+  suitesWithNumbers,
+  describeCodeCommit,
+  PROVENANCE_SIDECAR_FILE,
+  type CoverageProvenanceSidecar,
+  type CoverageProvenanceSnapshot,
+  type ProvenanceUnverifiableReason,
+  type StampOutcome,
+  type SuiteProvenance,
+} from './coverage-provenance.js';
 
 // =============================================================================
 // Severity Weights (SGD Gradient)

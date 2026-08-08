@@ -6,7 +6,8 @@
 // Not `extractAllMetrics`: it cannot load custom dimensions, so every handler
 // that used it reported a verdict or a score over a smaller quality space than
 // the project configured.
-import { extractAllMetricsAsync, describeUnmeasured } from '../metrics.js';
+import { extractAllMetricsAsync, extractAllMetricsAsyncAndCoverageProvenance, describeUnmeasured, } from '../metrics.js';
+import { coverageProvenanceUnevaluated } from '../coverage-provenance.js';
 import { loadRules, evaluateRules } from '../rules.js';
 import { loadCache, findBaselineEntry, getCacheKey, } from '../cache.js';
 import { computeFitness, computeGradient, suggestNextFixes } from '../fitness.js';
@@ -108,7 +109,7 @@ export async function handleRun(args) {
         // response now carries an `unbound-provenance` entry in `unevaluatedRules` saying so
         // whenever a rule grades sonarqube. Making MCP scan is a separate decision; what
         // changes here is that the response stops looking complete.
-        const metrics = await extractAllMetricsAsync({
+        const { metrics, coverageProvenance } = await extractAllMetricsAsyncAndCoverageProvenance({
             scriptsToRun: requiredScripts,
             skipSonarQube,
             submittedAnalysis: { kind: 'not-scanned' },
@@ -116,8 +117,23 @@ export async function handleRun(args) {
         const cache = loadCache();
         const { isWIP } = getCacheKey();
         const baselineEntry = findBaselineEntry(cache, rules, isWIP);
-        const result = evaluateRules(rules, metrics, baselineEntry);
+        const evaluation = evaluateRules(rules, metrics, baselineEntry);
         const fitness = computeFitness(metrics);
+        // The coverage-provenance advisory, appended here for the same reason cli.ts
+        // appends it: the verdict cannot travel inside `Metrics` (the refactor harness
+        // byte-compares it) and `evaluateRules` takes nothing else.
+        //
+        // handleRun and not handleScore/handleSuggest, because this is the verdict surface
+        // an agent acts on -- it already carries `unmeasured` and `unevaluatedRules` for
+        // exactly this reason. The MCP server writes no cache entry, so the caching half of
+        // the policy has no analogue here and the advisory is the whole of it.
+        const result = {
+            ...evaluation,
+            unevaluated: [
+                ...evaluation.unevaluated,
+                ...coverageProvenanceUnevaluated(rules, coverageProvenance),
+            ],
+        };
         const response = {
             status: result.status,
             fitnessScore: Math.round(fitness * 10) / 10,
@@ -127,6 +143,11 @@ export async function handleRun(args) {
             // evaluateMeasurements). Without this key, an ungated failure would be
             // invisible to an MCP client -- reported nowhere, on a response that looks
             // complete.
+            //
+            // Each entry carries `numberReported`, because the key name is not true of one
+            // of them: a `stale-report` dimension DOES have a number in `metrics` above, and
+            // an agent that reads this list as "these are absent" would draw the wrong
+            // conclusion about a percentage it can see in the same response.
             unmeasured: describeUnmeasured(metrics),
             failedRules: result.failedRules.map(f => ({
                 type: f.type,

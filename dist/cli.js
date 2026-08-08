@@ -16,7 +16,12 @@ import { writeFileSync } from 'fs';
 import { 
 // Deliberately not importing `extractAllMetrics`: it cannot load custom
 // dimensions, so any surface in here that used it silently omitted them.
-extractAllMetricsAsync, describeUnmeasured, isSonarqubeAvailable, runSonarqubeScan, getTopSonarIssues, } from './metrics.js';
+extractAllMetricsAsync, 
+// The verdict path takes the variant that KEEPS the coverage provenance verdicts.
+// They are computed beside the measurement, once, and cannot travel inside `Metrics`
+// -- see MetricsWithCoverageProvenance.
+extractAllMetricsAsyncAndCoverageProvenance, describeUnmeasured, isSonarqubeAvailable, runSonarqubeScan, getTopSonarIssues, } from './metrics.js';
+import { coverageProvenanceUnevaluated, stampAllCoverageSummaries, describeCodeCommit, PROVENANCE_SIDECAR_FILE, } from './coverage-provenance.js';
 import { loadRules, evaluateRules, isCacheValid, isMeasurementUnderRule, coverageAbsenceIsFailure, } from './rules.js';
 import { loadCache, saveCache, getCacheKey, getCacheEntry, setCacheEntry, createCacheEntry, findBaselineEntry, resolveBaselineCommit, pruneOldEntries, } from './cache.js';
 import { getConfig } from './config.js';
@@ -223,6 +228,12 @@ async function runQualityGate(options = { skipSonarQube: false }) {
             //     sha256("") for every working-tree state, so the key never moves at
             //     all. #40.
             //
+            //   - The coverage provenance sidecar is not read on this exit either. A
+            //     report REPLACED after a verified entry was written is served as a
+            //     cached pass, because nothing here re-reads the report or the sidecar.
+            //     That is the same shape as the first bullet -- #41 -- and it is why
+            //     provenance is a per-MEASUREMENT check rather than a per-verdict one.
+            //
             // Those are pre-existing and out of scope here. What must not happen is
             // this comment claiming they are handled.
             log('\n✓ Quality gate PASSED (cached)');
@@ -299,7 +310,7 @@ async function runQualityGate(options = { skipSonarQube: false }) {
     // skipped for want of a metric, so those rules were never enforced.
     log('\nExtracting metrics...');
     const requiredScripts = rules.rules.requiredScripts || ['quality'];
-    const metrics = await extractAllMetricsAsync({
+    const { metrics, coverageProvenance } = await extractAllMetricsAsyncAndCoverageProvenance({
         scriptsToRun: requiredScripts,
         skipSonarQube: options.skipSonarQube,
         coverageAbsenceIsFailure: coverageAbsenceIsFailure(rules),
@@ -340,7 +351,18 @@ async function runQualityGate(options = { skipSonarQube: false }) {
         .join(', ')}`);
     // Evaluate rules
     log('\nEvaluating rules...');
-    const result = evaluateRules(rules, metrics, baselineEntry);
+    const evaluation = evaluateRules(rules, metrics, baselineEntry);
+    // The coverage-provenance advisory is APPENDED here rather than produced by
+    // `evaluateRules`, and that is not a layering preference: the verdict cannot travel
+    // inside `Metrics` (the refactor harness byte-compares `metrics` and `evaluation`
+    // whole, and apollo-client carries both a coverage number and coverage floors) and
+    // `evaluateRules` takes nothing else. Everything downstream keeps reading `result`,
+    // including the caching logic -- `notServableAsVerdict` below already keys on
+    // `result.unevaluated.length`.
+    const provenanceUnevaluated = coverageProvenanceUnevaluated(rules, coverageProvenance);
+    const result = provenanceUnevaluated.length === 0
+        ? evaluation
+        : { ...evaluation, unevaluated: [...evaluation.unevaluated, ...provenanceUnevaluated] };
     // Create and save cache entry -- unless a measurement failed.
     //
     // A run that could not measure something has nothing worth remembering: its
@@ -372,7 +394,11 @@ async function runQualityGate(options = { skipSonarQube: false }) {
     // Printed on EVERY run, which is the point: nothing else reports these, and the
     // run they appear in is never cached, so there is no run that skips them.
     if (ungated.length > 0) {
-        log(`\n${ungated.length} dimension(s) could not be measured, and no rule grades them:`);
+        // "could not be measured" was true of every kind until `stale-report`, which
+        // arrives WITH a number -- the report parsed and the suite has a percentage in the
+        // same output. One header has to cover both, and the honest one is about the
+        // reading rather than about the measurement attempt.
+        log(`\n${ungated.length} dimension(s) have a reading this run does not stand behind, and no rule grades them:`);
         for (const failure of ungated) {
             log(`  ${failure.dimension} (${failure.kind}): ${failure.message}`);
         }
@@ -421,7 +447,13 @@ async function runQualityGate(options = { skipSonarQube: false }) {
     // the run was recorded as fully evaluated, while an individual ratcheted metric
     // absent from that baseline was skipped in silence by `evaluateMonotonic`. Adding a
     // ratchet to rules.json after the baseline was written is enough to reach it.
-    const monotonicSkipped = ((rules.rules.monotonic?.length ?? 0) > 0 && baselineEntry === undefined) ||
+    //
+    // RENAMED from `monotonicSkipped` without touching the expression: the third
+    // producer is not a monotonic rule at all. An unverifiable coverage report puts an
+    // `unverified-provenance` entry in `result.unevaluated`, which lands here through
+    // the same clause, and the field it writes (`monotonicEvaluated`) is likewise now
+    // narrower than what it means. See CacheEntry.monotonicEvaluated.
+    const notServableAsVerdict = ((rules.rules.monotonic?.length ?? 0) > 0 && baselineEntry === undefined) ||
         result.unevaluated.length > 0;
     // Printed on every run that has them, next to the verdict, because this is the one
     // thing the verdict does not cover. A PASS with an unevaluated rule is narrower
@@ -432,7 +464,12 @@ async function runQualityGate(options = { skipSonarQube: false }) {
     // which is one clear sentence where the list would be one line per metric saying the
     // same thing. Every other consumer -- MCP especially, which has no such message --
     // needs them, so `evaluateMonotonic` produces them and this filter is local.
-    const worthListing = result.unevaluated.filter((u) => u.reason !== 'no-baseline');
+    //
+    // `unverified-provenance` is dropped for the same local reason, one step further:
+    // the block below closes with remedy text about ratchets and baselines, which is the
+    // wrong advice for a coverage report nobody stamped. It gets its own block, with the
+    // two remedies that actually apply.
+    const worthListing = result.unevaluated.filter((u) => u.reason !== 'no-baseline' && u.type !== 'unverified-provenance');
     if (worthListing.length > 0) {
         // "could not be evaluated" was false for one member and had to change: an
         // `unbound-provenance` entry reports rules that DID run -- their thresholds were
@@ -448,6 +485,28 @@ async function runQualityGate(options = { skipSonarQube: false }) {
             'it as a verdict. A baseline-missing ratchet resolves itself on the next commit, ' +
             'which compares against the entry this run is about to write.');
     }
+    // The coverage reports nothing ties to this code, and the two things an adopter can
+    // do about it.
+    //
+    // Its own block because the verdict it reports is a THIRD thing: not a measurement
+    // that failed (the numbers are there and are arithmetically honest) and not a rule
+    // that did not run (the thresholds were compared). What is missing is the evidence
+    // that the report describes the code being graded. Nothing is inferred from a
+    // timestamp -- a report the tool can positively show is stale is a measurement
+    // failure and fails the gate instead.
+    const unverifiedProvenance = result.unevaluated.filter((u) => u.type === 'unverified-provenance');
+    if (unverifiedProvenance.length > 0) {
+        log(`\n${unverifiedProvenance.length} coverage report(s) could not be tied to the code being graded:`);
+        for (const entry of unverifiedProvenance) {
+            log(`  ${entry.metricPath}: ${entry.message}`);
+        }
+        log('  Not failing the gate on these -- an unstamped report is not evidence that its ' +
+            'numbers are wrong. This run is cached as a BASELINE only, so no later run can ' +
+            'inherit it as a verdict, and this repeats every run until a report carries a ' +
+            'sidecar. Run `stamp-coverage` in the SAME step that produces the report, never ' +
+            'after restoring a cached coverage directory: it asserts that this code produced ' +
+            'that report, and it cannot check.');
+    }
     // A measurement failure is different in kind and still blocks the write: those
     // numbers are not a reading of anything, so they are no use as a baseline either.
     const cachedThisRun = measurementFailures.length === 0;
@@ -459,12 +518,14 @@ async function runQualityGate(options = { skipSonarQube: false }) {
     }
     else {
         const failedRuleNames = result.failedRules.map((f) => f.rule);
-        const entry = createCacheEntry(metrics, rules, result.status, failedRuleNames, !monotonicSkipped);
+        const entry = createCacheEntry(metrics, rules, result.status, failedRuleNames, !notServableAsVerdict);
         setCacheEntry(cache, cacheKey, entry);
-        if (monotonicSkipped) {
+        if (notServableAsVerdict) {
             const why = baselineEntry === undefined
                 ? 'its monotonic rules had nothing to compare against'
-                : `${worthListing.length} of its rules could not be applied as written`;
+                : unverifiedProvenance.length > 0 && worthListing.length === 0
+                    ? 'its coverage numbers came from a report whose provenance could not be established'
+                    : `${worthListing.length} of its rules could not be applied as written`;
             log(`\nCaching this run as a BASELINE only -- ${why}, so it is not servable as a ` +
                 'verdict and the next run on this commit will re-measure. The commit after ' +
                 'this one can ratchet against it.');
@@ -589,6 +650,75 @@ function runDimensionsList(args) {
     log('Use --json for machine-readable output');
 }
 /**
+ * Record which state of the code each coverage report on disk was produced from.
+ *
+ * The out-of-band half of coverage provenance, and it exists because the advisory
+ * promises it: a project that generates coverage outside the gate has to have SOME way
+ * to say "this report came from this code", or the advisory is a runaround.
+ *
+ * IT ASSERTS; IT CANNOT VERIFY, and every line it prints is shaped by that. Run in the
+ * step that produced the report it is true. Run after `actions/cache` restores a
+ * `coverage/` directory, or in a catch-all "stamp everything" job, it vouches for a
+ * report this code never produced and the gate will then grade it as fresh. So the
+ * command prints exactly what it asserted -- suite, report path, report digest, code
+ * commit -- and a CI log carries the claim where someone can find it.
+ *
+ * `assertSupportedLayout` first, and it is not decoration. Under an unsupported layout
+ * the code digest is a constant for every state of the working tree, so a sidecar
+ * written there vouches for all of them -- strictly worse than no sidecar. The module
+ * itself never throws (a missing identity is the unverifiable branch), but a command
+ * whose only job is to stamp has to refuse loudly instead, or CI silently never stamps
+ * and the advisory never clears.
+ */
+function runStampCoverage(args) {
+    // Rejected by name rather than ignored. A flag this command does not implement,
+    // silently accepted, reads as "stamped with that option" -- and the one thing it
+    // must never do is look like it did more checking than it did.
+    const unexpected = args.filter((arg) => arg.length > 0);
+    if (unexpected.length > 0) {
+        log(`stamp-coverage takes no arguments; got ${unexpected.join(' ')}`);
+        log('It stamps every coverage summary the current configuration points at.');
+        process.exit(1);
+    }
+    log('Quality Gate SGD - stamp coverage provenance');
+    log('============================================');
+    const config = getConfig();
+    assertSupportedLayout(config.projectRoot, config.codePathspecs);
+    const outcomes = stampAllCoverageSummaries('stamp-coverage');
+    const stamped = outcomes.filter((outcome) => outcome.kind === 'stamped');
+    for (const outcome of outcomes) {
+        if (outcome.kind === 'stamped') {
+            log(`\n${outcome.suite}: vouched for ${outcome.summaryPath}`);
+            log(`  code commit  ${describeCodeCommit(outcome.codeCommit)}`);
+            log(`  report bytes sha256 ${outcome.summarySha256.slice(0, 12)}`);
+            log(`  sidecar      ${outcome.sidecarPath}`);
+            if (!outcome.hiddenFromGit) {
+                log('  NOTE: this sidecar is visible to git. Add ' +
+                    `\`${PROVENANCE_SIDECAR_FILE}\` to the .gitignore in that directory -- ` +
+                    'left visible it makes the working tree dirty on every run, which costs ' +
+                    'every monotonic rule its commit-keyed baseline.');
+            }
+        }
+        else if (outcome.kind === 'no-report') {
+            log(`\n${outcome.suite}: nothing to stamp -- no readable report at ${outcome.summaryPath}`);
+        }
+        else if (outcome.kind === 'cannot-stamp') {
+            log(`\n${outcome.suite}: cannot stamp ${outcome.summaryPath} -- ${outcome.why}`);
+        }
+    }
+    if (stamped.length === 0) {
+        log('\nNothing was stamped. Paths looked at:');
+        for (const outcome of outcomes)
+            log(`  ${outcome.suite}: ${outcome.summaryPath}`);
+        log('\nRun this immediately after the command that writes coverage, from the project root.');
+        process.exit(1);
+    }
+    log(`\n${stamped.length} report(s) stamped. This ASSERTS that the code at ` +
+        'this commit produced them -- it does not check. Run it in the step that produced ' +
+        'the report, never after restoring a cached coverage directory.');
+    process.exit(0);
+}
+/**
  * Compute and display fitness score.
  */
 async function runScore(args) {
@@ -632,10 +762,26 @@ async function runScore(args) {
         }, null, 2));
         return;
     }
+    // PARTITIONED, because one kind of failure arrives with a number and the other does
+    // not, and one sentence cannot be true of both. `computeFitness` reads
+    // `metrics.coverage.unit.statements` straight out of the reading, so a stale report
+    // IS in the score below -- printing "missing from this score" over a dimension the
+    // breakdown table then lists a value for is exactly the confidently-false claim this
+    // tool exists to remove.
     if (unmeasured) {
-        log(`\n${unmeasured.length} dimension(s) could NOT be measured, and are missing from this score:`);
-        for (const u of unmeasured)
-            log(`  ${u.dimension} (${u.kind})`);
+        const missing = unmeasured.filter((u) => !u.numberReported);
+        const unvouched = unmeasured.filter((u) => u.numberReported);
+        if (missing.length > 0) {
+            log(`\n${missing.length} dimension(s) could NOT be measured, and are missing from this score:`);
+            for (const u of missing)
+                log(`  ${u.dimension} (${u.kind})`);
+        }
+        if (unvouched.length > 0) {
+            log(`\n${unvouched.length} dimension(s) were measured but nothing ties the numbers to this code; ` +
+                'they ARE included in the score below:');
+            for (const u of unvouched)
+                log(`  ${u.dimension} (${u.kind}): ${u.why}`);
+        }
         log('');
     }
     log(`Fitness Score: ${formatFitnessScore(score)}`);
@@ -723,10 +869,21 @@ async function runSuggest(args) {
     // that acts on it. Printed once here rather than per mode, because all four
     // modes rank over the same metrics.
     const unmeasured = describeUnmeasured(metrics);
+    // Partitioned for the reason given in `runScore`: a stale report is RANKED below, so
+    // "nothing below ranks them" is false for it.
     if (unmeasured && !jsonFlag) {
-        log(`${unmeasured.length} dimension(s) could NOT be measured, so nothing below ranks them:`);
-        for (const u of unmeasured)
-            log(`  ${u.dimension} (${u.kind})`);
+        const missing = unmeasured.filter((u) => !u.numberReported);
+        const unvouched = unmeasured.filter((u) => u.numberReported);
+        if (missing.length > 0) {
+            log(`${missing.length} dimension(s) could NOT be measured, so nothing below ranks them:`);
+            for (const u of missing)
+                log(`  ${u.dimension} (${u.kind})`);
+        }
+        if (unvouched.length > 0) {
+            log(`${unvouched.length} dimension(s) are ranked below on numbers nothing ties to this code:`);
+            for (const u of unvouched)
+                log(`  ${u.dimension} (${u.kind}): ${u.why}`);
+        }
         log('');
     }
     // Quick mode: dimension-level suggestions only (original behavior)
@@ -1510,6 +1667,7 @@ COMMANDS:
   trajectory    Analyze quality descent trajectory from cache
   list-issues   List SonarQube issues with filtering
   dimensions    List available metric dimensions
+  stamp-coverage Record which state of the code produced the coverage report on disk
   score         Compute current fitness score (0-100)
   suggest       Get recommended next fixes based on gradient
   add-dimension Add a custom dimension using LLM analysis
@@ -1538,6 +1696,19 @@ OPTIONS for 'list-issues':
 OPTIONS for 'dimensions':
   --category=NAME     Filter by category (coverage, errors, quality, custom)
   --json              Output as JSON for programmatic use
+
+OPTIONS for 'stamp-coverage':
+  (No options - stamps every coverage summary the configuration points at)
+
+  Run it in the SAME CI step that produces the report:
+
+    npm run test:coverage && npx quality-gate-sgd stamp-coverage
+
+  It writes \`${PROVENANCE_SIDECAR_FILE}\` beside each coverage-summary.json,
+  recording the commit and the code state the report was produced from, so a later
+  \`run\` can tell whether the numbers describe the code it is grading. It ASSERTS
+  that -- it cannot check it -- so running it after restoring a cached coverage
+  directory vouches for a report your code never produced.
 
 OPTIONS for 'score':
   --coverage-only     Skip SonarQube, only use coverage/TS/ESLint metrics
@@ -1667,6 +1838,9 @@ async function main() {
             break;
         case 'dimensions':
             runDimensionsList(args.slice(1));
+            break;
+        case 'stamp-coverage':
+            runStampCoverage(args.slice(1));
             break;
         case 'score':
             await runScore(args.slice(1));

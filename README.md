@@ -189,6 +189,20 @@ npx quality-gate-sgd
 npx quality-gate-sgd list-issues -severity=MAJOR
 ```
 
+### Commands
+
+| Command | What it does |
+|-----|-----|
+| `run` (default) | Run the quality gate |
+| `init` | Interactive setup, writes `rules.json` |
+| `stamp-coverage` | Record which code produced the coverage report on disk — run it in the step that writes the report, see [Coverage report provenance](#coverage-report-provenance) |
+| `score` | Current fitness score (0–100) |
+| `suggest` | Ranked next fixes |
+| `trajectory` | Quality descent history from the cache |
+| `list-issues` | SonarQube issues, filtered |
+| `dimensions` | Available metric dimensions |
+| `mcp` | Start the MCP server |
+
 ## Rule Types
 
 ### Floors
@@ -238,14 +252,79 @@ and `@vitest/coverage-v8`: `npm run test` on `"test": "vitest run"` created no
 like that means the floors are graded against whatever generation of the code
 last wrote a report.
 
-**The gate does not detect that.** It reads the report on disk and grades it,
-whether the report was written by this run, by a CI step five minutes ago, or by
-a checkout last week. There is no age check: one was built (compare the report's
-mtime against the newest source file) and removed, because it was inert on any
-project whose sources are not under a literal top-level `src/` and it false-failed
-mtime-preserving archive restores, branch switches and clock skew. Getting the
-pairing right is therefore on you, and it is the reason `init` picks a
-coverage-writing script.
+**The gate detects that when the report carries a sidecar, and says so out loud
+when it does not.** There is still no age check — one was built (compare the
+report's mtime against the newest source file) and removed, because it was inert on
+any project whose sources are not under a literal top-level `src/` and it
+false-failed mtime-preserving archive restores, branch switches and clock skew.
+What replaced it records which code produced the report instead of guessing from
+timestamps. See below.
+
+#### Coverage report provenance
+
+When the gate runs a script that writes a coverage report, it also writes
+`.quality-gate-provenance.json` beside that report. The sidecar records the commit
+the report was produced at, a digest of the code under `QUALITY_CODE_PATHSPECS`
+against that commit, and a sha256 of the report's own bytes. One sidecar **per
+coverage suite**, beside that suite's summary, because `coverage/` and
+`coverage-lambda/` are written by different scripts at different times and a shared
+sidecar would vouch for a report it never saw.
+
+On the next run, each suite that produced a number gets one of three verdicts:
+
+| Verdict | When | What it does |
+|-----|-----|-----|
+| **verified** | the digest recomputed against the recorded commit matches exactly | nothing — silent |
+| **stale** | it does not match, and a tracked file's content or an untracked source file differs | a `stale-report` measurement failure on that suite, so every rule grading it FAILS |
+| **unverifiable** | no sidecar, an unreadable one, or a report whose bytes changed after stamping | an advisory; the gate still passes, but the run is cached as a **baseline only** and never served later as `PASSED (cached)` |
+
+Nothing is inferred from a file's age. A README edit, a commit, a revert back to
+identical content, a branch switch and a `chmod +x` all move the cache key and all
+still verify, because the comparison is recomputed against the recorded commit
+rather than being a comparison of two keys.
+
+**Two ways to make a report verifiable.** Either list the coverage-writing script
+in `requiredScripts` so the gate produces the report itself, or stamp it yourself
+in the CI step that writes it:
+
+```yaml
+- run: npm run test:coverage && npx quality-gate-sgd stamp-coverage
+```
+
+**One step, immediately after the coverage command.** `stamp-coverage` *asserts*
+that the code at this commit produced the report on disk — it cannot check. Run
+after `actions/cache` restores a `coverage/` directory, or in a catch-all "stamp
+everything" job, it vouches for a report your code never produced. It prints
+exactly what it vouched for (suite, path, report digest, commit) so the claim is in
+your CI log.
+
+The sidecar travels *inside* `coverage/`, so an `actions/cache` restore keyed on the
+commit stays verified, while a coarser key correctly reports stale. A tar or zip
+step that filters dotfiles drops the sidecar and turns a verifiable report into an
+unverifiable one.
+
+**Limits, stated because a check whose blind spots are undocumented is worse than
+no check:**
+
+- Provenance is exactly as sharp as `QUALITY_CODE_PATHSPECS` and never sharper. A
+  project whose real sources are outside it gets a constant digest, so a sidecar
+  written there reports *verified* for every future state of the tree. The cache key
+  has the same blind spot.
+- A source file **git ignores** is invisible to it. If `src/generated/` is
+  gitignored, regenerating it changes every graded number and does not move the
+  digest.
+- A change to your **coverage tool's configuration** with the report left in place is
+  not detected — the report really is the one that was stamped for this code.
+- A **cache hit** re-reads neither the report nor the sidecar, so a report replaced
+  after a verified entry was written is served as a cached pass.
+- Both embedded default rulesets ship `requiredScripts: []`, so a **zero-config**
+  project never has its report stamped by `run` and gets the advisory (and
+  baseline-only caching) on every run until it writes a `rules.json` naming its
+  coverage script, or stamps in CI. The advisory says so rather than telling you to
+  do something your configuration cannot do.
+
+Getting the `requiredScripts` pairing right is still the better answer, and it is
+the reason `init` picks a coverage-writing script.
 
 ## Available Metrics
 

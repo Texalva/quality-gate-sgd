@@ -4,16 +4,21 @@
  */
 import type { Metrics, CoverageMetrics, AllCoverageMetrics, SonarqubeAnalysisProvenance, SonarqubeMetrics, EslintMetrics, TypescriptMetrics } from './types.js';
 import { type CustomDimensionConfig } from './dimensions/index.js';
+import { type SuiteProvenance } from './coverage-provenance.js';
 import type { MeasurementFailure } from './providers/types.js';
 /**
  * The coverage numbers and the reasons any of them are missing, together.
  *
- * `reads` is deliberately NOT surfaced here. The provider records what it looked
- * at (CoverageReading.reads) and targets/extract.ts uses that to warn about a
- * detail report it could not use, but nothing on the METRICS path judges the
- * reports themselves -- see the note on ReportAttempt.modifiedMs, and #39 for the
- * open question of how a report's provenance should be established. Returning a
- * field no caller reads would suggest something here checks it.
+ * `reads` is deliberately NOT surfaced here, and it is still not the freshness
+ * channel. The provider records what it looked at (CoverageReading.reads) and
+ * targets/extract.ts uses that to warn about a detail report it could not use;
+ * returning a field no caller reads would suggest something here checks it.
+ *
+ * The metrics path DOES now judge a report's provenance -- `extractAllMetrics` calls
+ * verifyCoverageProvenance after this function returns -- but from a sidecar beside
+ * the report, not from anything in `reads` and not from any mtime this provider
+ * recorded. Keeping the two apart is the point: this function answers "what do the
+ * reports say", and coverage-provenance.ts answers "which code do they describe".
  */
 export declare function measureCoverage(options?: {
     readonly absentReportIsFailure?: boolean;
@@ -220,7 +225,23 @@ interface MetricsExtractionOptions {
      */
     submittedAnalysis?: SubmittedAnalysis;
 }
+/**
+ * A reading, and which state of the code each coverage report in it describes.
+ *
+ * The provenance verdicts cannot travel inside `Metrics`: the refactor harness
+ * captures `metrics` whole and compares it with raw `JSON.stringify` equality, and
+ * apollo-client carries a `coverage.unit` number, so a new key there rejects
+ * golden-A.json for a change with no number different anywhere. They travel beside it
+ * instead, computed ONCE where the measurement is taken -- `verifyCoverageProvenance`
+ * shells git, and computing it again in cli.ts would both pay twice and let the two
+ * answers disagree if a watcher rewrote the report in between.
+ */
+export interface MetricsWithCoverageProvenance {
+    readonly metrics: Metrics;
+    readonly coverageProvenance: readonly SuiteProvenance[];
+}
 export declare function extractAllMetrics(scriptsToRunOrOptions?: string[] | MetricsExtractionOptions): Metrics;
+export declare function extractAllMetricsAndCoverageProvenance(scriptsToRunOrOptions?: string[] | MetricsExtractionOptions): MetricsWithCoverageProvenance;
 /**
  * The dimensions a reading is missing, for the surfaces that report a NUMBER
  * rather than a verdict.
@@ -234,11 +255,20 @@ export declare function extractAllMetrics(scriptsToRunOrOptions?: string[] | Met
  *
  * Returns `undefined` rather than an empty array so it disappears from JSON
  * output entirely when everything was measured.
+ *
+ * `numberReported` exists because one kind breaks the assumption the name of this
+ * function is built on. Every failure but `stale-report` arrives with
+ * `metrics: undefined` for its dimension, which is why "missing from this score" was
+ * a true sentence; a stale report parsed fine and `computeFitness` includes its
+ * number. A caller that prints one sentence for both says something false about one
+ * of them, so the distinction is carried in the data rather than left to each
+ * surface to rediscover from the kind.
  */
 export declare function describeUnmeasured(metrics: Metrics): readonly {
     readonly dimension: string;
     readonly kind: string;
     readonly why: string;
+    readonly numberReported: boolean;
 }[] | undefined;
 /**
  * Async version of extractAllMetrics that loads custom dimensions from config.
@@ -259,5 +289,17 @@ export declare function describeUnmeasured(metrics: Metrics): readonly {
 export declare function extractAllMetricsAsync(options: MetricsExtractionOptions & {
     submittedAnalysis: SubmittedAnalysis;
 }): Promise<Metrics>;
+/**
+ * The same extraction, with the coverage provenance verdicts kept.
+ *
+ * For the two surfaces that produce a VERDICT and can therefore write a cache entry:
+ * `runQualityGate` in cli.ts and `handleRun` in mcp/tools.ts. `score` and `suggest`
+ * take the Metrics-only variant on purpose -- they neither produce a verdict nor cache
+ * one, and the unverifiable branch is entirely about those two things. The STALE half
+ * still reaches them, through `metrics.measurementFailures`.
+ */
+export declare function extractAllMetricsAsyncAndCoverageProvenance(options: MetricsExtractionOptions & {
+    submittedAnalysis: SubmittedAnalysis;
+}): Promise<MetricsWithCoverageProvenance>;
 export {};
 //# sourceMappingURL=metrics.d.ts.map

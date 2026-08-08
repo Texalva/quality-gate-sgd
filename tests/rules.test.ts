@@ -4,7 +4,9 @@ import {
   computeRulesHash,
   evaluateRules,
   isCacheValid,
+  isMeasurementUnderRule,
   isUsingEmbeddedDefaults,
+  rulesReadingMeasurement,
 } from '../src/rules.js'
 import { resetConfig } from '../src/config.js'
 import { measurementInputsHash } from '../src/measurement-inputs.js'
@@ -2321,5 +2323,128 @@ describe('a cached entry whose sonarqube numbers were never bound', () => {
     const entry = entryWith({ scripts: {} }, sonarRules)
 
     expect(isCacheValid(entry, sonarRules)).toBe(true)
+  })
+})
+
+// ===========================================================================
+// Which rules read a dimension
+// ===========================================================================
+//
+// `isMeasurementUnderRule` answers this as a boolean, and a boolean cannot be
+// reported. The coverage-provenance advisory has to NAME the rules it stands for --
+// an adopter told "some rule reads this" cannot act on it -- so both callers now go
+// through one matcher and this pins the two answers together.
+describe('rulesReadingMeasurement', () => {
+  const gradesCoverageThreeWays: QualityRules = {
+    version: '1.0.0',
+    rules: {
+      floors: { 'coverage.unit.branches': 50, 'coverage.union.statements': 60 },
+      ceilings: { 'typescript.errors': 0 },
+      monotonic: [{ direction: 'up', metrics: ['coverage.unit.statements'] }],
+    },
+  }
+
+  it('names every rule surface that reads the dimension, including the derived one', () => {
+    // `coverage.union.statements` is in the list because `coverage.union` is COMPUTED
+    // from `coverage.unit` -- name matching cannot see that, so the edge is declared
+    // in DERIVED_FROM and this is the caller that depends on it being followed.
+    expect(rulesReadingMeasurement(gradesCoverageThreeWays, 'coverage.unit')).toEqual([
+      // Sorted, because the caller puts this in a sentence -- and `union` sorts before
+      // `unit` ('o' < 't'), which is worth pinning so a reorder is a test failure
+      // rather than a silently different message.
+      'coverage.union.statements',
+      'coverage.unit.branches',
+      'coverage.unit.statements',
+    ])
+  })
+
+  it('says nothing for a build-only ruleset', () => {
+    // The scoping the advisory depends on. Without it every build-only project with a
+    // stray coverage/ directory would print a coverage advisory it has no rule for and
+    // would stop caching verdicts.
+    const buildOnly: QualityRules = {
+      version: '1.0.0',
+      rules: { ceilings: { 'typescript.errors': 3, 'eslint.errors': 2 }, requiredScripts: [] },
+    }
+
+    expect(rulesReadingMeasurement(buildOnly, 'coverage.unit')).toEqual([])
+    expect(isMeasurementUnderRule(buildOnly, 'coverage.unit')).toBe(false)
+  })
+
+  it('agrees with isMeasurementUnderRule on every row', () => {
+    const rows = [
+      { rules: gradesCoverageThreeWays, dimension: 'coverage.unit', gated: true },
+      { rules: gradesCoverageThreeWays, dimension: 'coverage.lambda', gated: true },
+      { rules: gradesCoverageThreeWays, dimension: 'typescript', gated: true },
+      { rules: gradesCoverageThreeWays, dimension: 'sonarqube', gated: false },
+      { rules: gradesCoverageThreeWays, dimension: 'custom.anyCount', gated: false },
+    ]
+
+    for (const row of rows) {
+      expect(
+        rulesReadingMeasurement(row.rules, row.dimension).length > 0,
+        row.dimension
+      ).toBe(row.gated)
+      expect(isMeasurementUnderRule(row.rules, row.dimension), row.dimension).toBe(row.gated)
+    }
+  })
+})
+
+// ===========================================================================
+// A stale report is not an unmeasured dimension
+// ===========================================================================
+//
+// `stale-report` is the only measurement failure that arrives WITH a number for its
+// dimension: the report parsed, `total` was valid, and `metrics.coverage.unit` holds a
+// percentage. Every other kind arrives with the dimension absent, which is what made
+// "could not be measured" a true sentence. Printing it here would contradict the
+// percentage in the same output.
+describe('the sentence a stale coverage report gets', () => {
+  const staleFailure: MeasurementFailure = {
+    kind: 'stale-report',
+    dimension: 'coverage.unit',
+    message: '/p/coverage/coverage-summary.json describes a different state of the code.',
+    evidence: {
+      via: 'report',
+      command: 'read /p/coverage/coverage-summary.json',
+      elapsedMs: 0,
+      attempts: [
+        {
+          path: '/p/coverage/coverage-summary.json',
+          existed: true,
+          bytesRead: null,
+          modifiedMs: null,
+          outcome: 'read',
+        },
+      ],
+    },
+  }
+
+  it('fails the rule without claiming the dimension was not measured', () => {
+    const result = evaluateRules(
+      { version: '1.0.0', rules: { floors: { 'coverage.unit.statements': 50 } } },
+      {
+        scripts: {},
+        coverage: { unit: { branches: 80, statements: 80, functions: 80, lines: 80 } },
+        measurementFailures: [staleFailure],
+      }
+    )
+
+    expect(result.status).toBe('fail')
+    const measurement = result.failedRules.find((f) => f.rule === 'coverage.unit.measurement')
+    expect(measurement?.message).toContain('was measured, but nothing ties the number to this code')
+    expect(measurement?.message).not.toContain('could not be measured')
+  })
+
+  it('still says "could not be measured" for a dimension that really was not', () => {
+    const result = evaluateRules(
+      { version: '1.0.0', rules: { ceilings: { 'eslint.errors': 0 } } },
+      {
+        scripts: {},
+        measurementFailures: [{ ...staleFailure, kind: 'crashed', dimension: 'eslint' }],
+      }
+    )
+
+    expect(result.failedRules[0].message).toContain('eslint could not be measured')
   })
 })

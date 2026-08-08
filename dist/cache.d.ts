@@ -51,6 +51,88 @@ export type BaselineCommit =
  */
 export declare function resolveBaselineCommit(): BaselineCommit;
 /**
+ * Untracked code files, resolved by asking GIT to apply the pathspecs.
+ *
+ * This deliberately does NOT reuse `isCodeFile` above, and the divergence is the
+ * whole point of the function existing. `isCodeFile` tests a LITERAL prefix
+ * (`filePath.startsWith(pathspec + '/')`), which is blind to every pathspec form
+ * git accepts and this tool documents. MEASURED on git 2.51 with an untracked
+ * `packages/a/src/new.ts` and a tracked edit to `packages/a/src/a.ts`:
+ *
+ *   pathspec                    git diff --name-only <C>   git ls-files --others   isCodeFile
+ *   'packages/*'                a.ts                       new.ts                  DROPS new.ts
+ *   'packages/*\/src/**'        a.ts                       new.ts                  DROPS new.ts
+ *   ':(glob)packages/*\/src/**' a.ts                       new.ts                  DROPS new.ts
+ *   '*.ts'                      a.ts                       new.ts                  DROPS new.ts
+ *   'packages/*\/src'           (empty)                    (empty)                 (empty)
+ *
+ * So git's two answers agree in every form -- including agreeing that
+ * `packages/*\/src` matches nothing -- while the literal prefix test disagrees with
+ * both in four of the five. A provenance check built on the prefix test would say
+ * VERIFIED after new source appeared beside a stamped report, on exactly the
+ * monorepo layouts an earlier freshness rule was rejected for no-oping on.
+ *
+ * `computeContentHash` keeps the prefix test. That is not an oversight either: its
+ * output IS the cache key, and sharpening it here would move the key for every
+ * glob-pathspec project -- discarding their entries and changing what the cache
+ * means -- for a fix that belongs to #40. The two are allowed to differ, provenance
+ * is the sharper of the two, and neither may be quietly aligned with the other
+ * without moving something a user can see.
+ */
+export declare function listUntrackedCodeFiles(): readonly string[];
+/**
+ * How the code under `codePathspecs` differs from one commit, as a single digest.
+ *
+ * The same two git questions `computeContentHash` asks, against a caller-supplied
+ * commit instead of always HEAD, and WITHOUT `measurementInputsListing()`. Each
+ * difference earns its place:
+ *
+ *   - Parameterised commit, because the coverage-provenance sidecar has to ask "is
+ *     the code the same as when this report was stamped", and the stamp may have
+ *     been taken on a dirty tree. Comparing cache-key STRINGS cannot answer that.
+ *     MEASURED: coverage/ not gitignored so the report is untracked, tree therefore
+ *     already `?? coverage/` -- stamp key `wip:fe9d8fb:18217e4f`, then one edit to
+ *     src/a.ts, key `wip:fe9d8fb:5b0c1b69`. String inequality between two `wip:`
+ *     keys cannot distinguish "the code moved" from "a past working tree that
+ *     cannot be recomputed", so a report the tool has direct evidence describes
+ *     other code would have to be reported as merely unverifiable. Recomputing
+ *     THIS digest against the recorded commit answers it exactly.
+ *   - No measurement inputs, because a change to rules.json, tsconfig.json or the
+ *     eslint config does not change which code a coverage report describes.
+ *     Folding them in would turn editing rules.json -- the single most common
+ *     adopter action -- into a claim that the report describes different code,
+ *     which is false. The cache key still folds them in, and still refuses to
+ *     SERVE an entry across such a change; that is a different question.
+ *
+ * Errors as values rather than a throw, because both of its failure modes are
+ * ordinary states with different answers: an unknown commit (shallow clone,
+ * rebased-away stamp) is "cannot verify THIS sidecar", while an unhashable layout
+ * is "cannot verify anything here".
+ */
+export type CodeStateDigest = {
+    readonly kind: 'digest';
+    readonly digest: string;
+}
+/** `codePathspecs` tracks nothing, so every state of the tree hashes the same. */
+ | {
+    readonly kind: 'no-tracked-code';
+    readonly message: string;
+}
+/** Git refused the question -- usually an unknown commit. */
+ | {
+    readonly kind: 'git-failed';
+    readonly message: string;
+};
+export declare function codeStateDigest(againstCommit: string): CodeStateDigest;
+/**
+ * The digest a tree with NO code differences from the commit produces.
+ *
+ * Named rather than inlined because a caller comparing against it is asking a
+ * specific question -- "was the recorded stamp taken over a tree whose code matched
+ * its commit exactly" -- and `sha256('')` at a call site reads like an accident.
+ */
+export declare function digestOfUnchangedCodeState(): string;
+/**
  * Get the cache key for the current state.
  *
  * A clean tree keys on the bare commit hash, and that must not change:
@@ -77,6 +159,16 @@ export declare function resolveBaselineCommit(): BaselineCommit;
  * for the pathspec blind spot -- that is #40's remaining half, which has to
  * classify what git reports rather than diffing a fixed set of paths -- but it is
  * the layout-independent part, and it costs nothing.
+ *
+ * The coverage-provenance sidecar inherits that blind spot exactly, and it is worth
+ * stating here because this is where the sharpness is set. The sidecar records a
+ * commit plus `codeStateDigest`, which asks the same two git questions this key
+ * does; in a layout whose real sources are outside `codePathspecs` the digest is a
+ * constant, so a sidecar written there reports VERIFIED for every future state of
+ * the working tree. Provenance is exactly as sharp as this key and never sharper.
+ * The one place it is deliberately sharper is the UNTRACKED half -- see
+ * `listUntrackedCodeFiles` for the measured reason and for why this function's own
+ * filter was left alone.
  *
  * Old `wip:<64 hex>` keys cannot collide with new `wip:<40 hex>:<64 hex>` ones, so
  * no stale entry is reachable under the new scheme and no schema bump is needed.

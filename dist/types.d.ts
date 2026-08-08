@@ -135,15 +135,23 @@ export interface CacheEntry {
     };
     metrics: Metrics;
     /**
-     * False when some monotonic rule configured for this run did not execute.
+     * False when this run is not one whose verdict may be served again.
      *
-     * TWO ways that happens, and the second was silently unrecorded for longer than
-     * the first. (1) No baseline entry at all, so `evaluateMonotonic` returns nothing.
-     * (2) A baseline exists and is accepted, but an INDIVIDUAL ratcheted metric is
-     * absent from it (a ratchet added to rules.json after the baseline was written, a
-     * dimension renamed, a dimension that was failing to measure when the baseline was
-     * taken) or absent from this run's reading. Both leave a configured rule
-     * unexecuted, so both write `false`; see `EvaluationResult.unevaluated`.
+     * THE NAME IS NOW NARROWER THAN THE FIELD, deliberately. Renaming it would discard
+     * the meaning of every entry already on disk -- `isCacheValid` refuses only an
+     * explicit `false`, so a renamed field reads as absent, which means "evaluated" --
+     * and that is a worse trade than a name that undersells itself.
+     *
+     * THREE ways it goes false. The second was silently unrecorded for longer than the
+     * first, and the third is not about monotonic rules at all. (1) No baseline entry at
+     * all, so `evaluateMonotonic` returns nothing. (2) A baseline exists and is accepted,
+     * but an INDIVIDUAL ratcheted metric is absent from it (a ratchet added to rules.json
+     * after the baseline was written, a dimension renamed, a dimension that was failing to
+     * measure when the baseline was taken) or absent from this run's reading. (3) A
+     * coverage report whose PROVENANCE could not be established graded a rule -- the
+     * threshold really was compared, against a number nothing ties to this code. All three
+     * leave the run narrower than a full pass, so all three write `false`; see
+     * `EvaluationResult.unevaluated`.
      *
      * The entry is then a usable BASELINE and not a usable VERDICT, and that
      * distinction is the whole reason the field exists. Refusing to write it at all --
@@ -420,7 +428,14 @@ export interface EvaluationResult {
     status: 'pass' | 'fail';
     failedRules: FailedRule[];
     /**
-     * Rules that were configured and did not execute -- neither passed nor failed.
+     * Configured rules whose result this run does not stand behind.
+     *
+     * TWO ways in, and the definition had to widen to cover the second. A rule can have
+     * failed to EXECUTE (no baseline, no value, no metrics listed), or it can have
+     * executed against numbers whose ORIGIN could not be established -- a sonarqube
+     * measure that no analysis claims, a coverage number no sidecar ties to this code.
+     * The threshold in the second case really was compared; what is missing is the
+     * evidence that it was compared against a reading of this project.
      *
      * A third outcome, distinct from both lists above, and it exists because the
      * second list cannot express it. This tool's thesis is that a passing check is
@@ -428,6 +443,16 @@ export interface EvaluationResult {
      * against numbers whose origin could not be established, produced no evidence
      * either way, and folding that into `status: 'pass'` with an empty `failedRules` is
      * exactly the vacuous pass everything else here is built to prevent.
+     *
+     * WHO FILLS IT. `evaluateRules` fills it from the two rule evaluators and from the
+     * sonarqube provenance check, all three of which read only `Metrics`. The COVERAGE
+     * provenance entries are appended by cli.ts and by the MCP run handler instead,
+     * because that verdict cannot travel inside `Metrics`: the refactor harness captures
+     * `metrics` and `evaluation` whole and compares them with raw `JSON.stringify`
+     * equality, so a new key in either -- with apollo-client carrying both a
+     * `coverage.unit` number and coverage floors -- rejects golden-A.json for a change
+     * with no number different anywhere. It is computed ONCE, beside the measurement, and
+     * handed to those two surfaces rather than recomputed on each.
      *
      * Reported rather than failed, deliberately: failing here would break every fresh
      * clone and every commit that adds a ratchet, which is a policy change adopters
@@ -470,8 +495,18 @@ export interface UnevaluatedRule {
      * Distinct from `skipped-dimension`, whose whole claim is that there is no value:
      * here there is a value, and what is missing is the evidence that it describes this
      * commit's scan.
+     *
+     * `unverified-provenance`: the same shape one dimension over. A floor, ceiling or
+     * ratchet DID execute against a coverage number, and nothing on disk ties that
+     * number to the code being graded -- no sidecar beside the report, or one this build
+     * cannot read, or a report whose bytes changed after it was stamped. Distinct from
+     * `unbound-provenance` because the remedy is different and belongs to a different
+     * tool: that one says serialise your SonarQube scans, this one says let the gate run
+     * your coverage script or stamp the report in the step that writes it. Never emitted
+     * for a report the tool can positively show is stale -- that is a measurement
+     * failure, and it fails the gate.
      */
-    type: 'monotonic' | 'skipped-dimension' | 'unbound-provenance';
+    type: 'monotonic' | 'skipped-dimension' | 'unbound-provenance' | 'unverified-provenance';
     rule: string;
     metricPath: string;
     /**
@@ -507,8 +542,16 @@ export interface UnevaluatedRule {
      * quiet half of the same problem: an unconfirmed run is only baseline-only, and a
      * later run that ratchets against it is stamped fully evaluated and cached as a
      * verdict -- so the unbound numbers become the floor without ever being graded.
+     *
+     * `provenance-unverifiable`: the coverage number the rule graded came from a report
+     * nothing on disk ties to this code. Reported rather than failed because "nobody
+     * stamped this report" is not evidence that the report is wrong, and failing there
+     * would break every project that generates coverage outside the gate on the first run
+     * after adopting this check. What it buys is that the run is not servable as a
+     * verdict, so the unestablished reading cannot be inherited by a later run as
+     * `PASSED (cached)`.
      */
-    reason: 'no-baseline' | 'baseline-missing' | 'current-missing' | 'no-metrics' | 'dimension-skipped' | 'provenance-unconfirmed' | 'baseline-unbound';
+    reason: 'no-baseline' | 'baseline-missing' | 'current-missing' | 'no-metrics' | 'dimension-skipped' | 'provenance-unconfirmed' | 'baseline-unbound' | 'provenance-unverifiable';
     message: string;
 }
 export interface FailedRule {

@@ -12,16 +12,21 @@
  *
  * WHY IT IS CHECKED RATHER THAN DOCUMENTED. The assumption was already load-bearing
  * in four unrelated places -- eslint lints `src/`, the SLOC counter walks `src/`, the
- * cache hashes `codePathspecs` (default `src/,tests/,scripts/`), and a coverage
- * freshness rule that was cut for being inert relied on it too. A project laid out
- * differently did not fail; it measured a subset, or nothing, and the results still
- * looked like measurements:
+ * cache hashes `codePathspecs` (default `src/,tests/,scripts/`), and coverage
+ * provenance answers "which code does this report describe" by diffing those same
+ * pathspecs against the commit a sidecar records. A project laid out differently did
+ * not fail; it measured a subset, or nothing, and the results still looked like
+ * measurements:
  *
  *   - eslint reports a crashed measurement (loud, and only because of an earlier fix)
  *   - the SLOC counter returns 0, which normalises other dimensions against nothing
  *   - the cache key stops responding to edits, and a stored verdict is served for
  *     code the gate never looked at -- REPRODUCED: 53 tsc errors against a ceiling of
  *     3, `✓ Quality gate PASSED (cached)`, exit 0
+ *   - the coverage provenance digest becomes the same constant too, so a stamped
+ *     report is reported VERIFIED for every future state of the working tree. That is
+ *     why `stamp-coverage` calls this function before writing anything: a sidecar that
+ *     vouches for everything is strictly worse than no sidecar.
  *
  * An unsupported layout that runs anyway and reports a number is precisely the class
  * of failure this tool exists to prevent, so it refuses instead.

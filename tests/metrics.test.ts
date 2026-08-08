@@ -2298,7 +2298,13 @@ describe('SonarQube Metrics', () => {
 // rewrote describes the code being graded. A freshness rule for that was built
 // (report mtime vs. the newest source file) and removed -- inert without a
 // literal top-level `src/`, false-positive on mtime-preserving restores, branch
-// switches and clock skew -- so its tests are gone with it. Backlog #39.
+// switches and clock skew -- so its tests are gone with it. What answers it now is
+// the provenance sidecar (tests/coverage-provenance.test.ts), which records a commit
+// and a code digest rather than comparing ages.
+//
+// That sidecar also adds a SECOND read of coverage-summary.json, before the scripts
+// run, to hash it for the "did this run rewrite it" question. So the assertion below
+// is about the LAST read -- the one the numbers come from -- and not the first.
 describe('coverage report ordering', () => {
   beforeEach(() => {
     vi.clearAllMocks()
@@ -2341,9 +2347,9 @@ describe('coverage report ordering', () => {
     })
 
     expect(sequence.indexOf('run-test:coverage')).toBeGreaterThanOrEqual(0)
-    expect(sequence.indexOf('read-coverage-report')).toBeGreaterThanOrEqual(0)
+    expect(sequence.lastIndexOf('read-coverage-report')).toBeGreaterThanOrEqual(0)
     expect(sequence.indexOf('run-test:coverage')).toBeLessThan(
-      sequence.indexOf('read-coverage-report')
+      sequence.lastIndexOf('read-coverage-report')
     )
   })
 })
@@ -2470,7 +2476,14 @@ describe('extractAllMetrics', () => {
     const result = extractAllMetrics({ skipSonarQube: true })
 
     expect(result.sonarqube).toBeUndefined()
-    expect(execSync).not.toHaveBeenCalled()
+    // Narrowed from `not.toHaveBeenCalled()`, because the claim it was making is no
+    // longer the claim it was written for. `extractAllMetrics` defaults to
+    // `scriptsToRun: ['quality']`, so a coverage report can be rewritten during the
+    // run, so the provenance snapshot asks git which state of the code it is looking
+    // at -- one `git rev-parse HEAD`. What `--coverage-only` promises is that nothing
+    // talks to SonarQube, and that is what is asserted.
+    const commands = vi.mocked(execSync).mock.calls.map((call) => String(call[0]))
+    expect(commands.filter((command) => command.includes('curl'))).toEqual([])
   })
 
   it('extracts custom metrics when dimensions provided', async () => {

@@ -26,6 +26,20 @@ import { manifestDefinesScript, scriptCommand } from './runner.js';
 // imports rules.ts, config.ts, runner.ts and measurement-inputs.ts and none of those
 // imports this module, so this edge adds no cycle.
 import { getCurrentCommitHash } from './cache.js';
+// The provenance judgement lives OUTSIDE the coverage provider (D7): a provider that
+// vouches for its own freshness is self-attestation, which the note on
+// MeasurementProvider rules out. It is driven from here rather than from cli.ts because
+// the STALE verdict is a false-pass channel and has to reach every surface that
+// measures -- `run`, `score`, `suggest` and their three MCP equivalents -- the same
+// argument `Metrics.measurementFailures` makes for itself.
+import {
+  coverageProvenanceFailures,
+  snapshotCoverageStateBeforeScripts,
+  stampCoverageSummariesRewrittenDuringRun,
+  suitesWithNumbers,
+  verifyCoverageProvenance,
+  type SuiteProvenance,
+} from './coverage-provenance.js';
 import { eslintLintProvider } from './providers/eslint.js';
 import { typescriptTypecheckProvider } from './providers/typescript.js';
 import { DEFAULT_MEASUREMENT_LIMITS, measurementFailure } from './providers/result.js';
@@ -103,12 +117,16 @@ function measureCoverageReading(
 /**
  * The coverage numbers and the reasons any of them are missing, together.
  *
- * `reads` is deliberately NOT surfaced here. The provider records what it looked
- * at (CoverageReading.reads) and targets/extract.ts uses that to warn about a
- * detail report it could not use, but nothing on the METRICS path judges the
- * reports themselves -- see the note on ReportAttempt.modifiedMs, and #39 for the
- * open question of how a report's provenance should be established. Returning a
- * field no caller reads would suggest something here checks it.
+ * `reads` is deliberately NOT surfaced here, and it is still not the freshness
+ * channel. The provider records what it looked at (CoverageReading.reads) and
+ * targets/extract.ts uses that to warn about a detail report it could not use;
+ * returning a field no caller reads would suggest something here checks it.
+ *
+ * The metrics path DOES now judge a report's provenance -- `extractAllMetrics` calls
+ * verifyCoverageProvenance after this function returns -- but from a sidecar beside
+ * the report, not from anything in `reads` and not from any mtime this provider
+ * recorded. Keeping the two apart is the point: this function answers "what do the
+ * reports say", and coverage-provenance.ts answers "which code do they describe".
  */
 export function measureCoverage(
   options: { readonly absentReportIsFailure?: boolean } = {}
@@ -1584,9 +1602,31 @@ interface MetricsExtractionOptions {
   submittedAnalysis?: SubmittedAnalysis;
 }
 
+/**
+ * A reading, and which state of the code each coverage report in it describes.
+ *
+ * The provenance verdicts cannot travel inside `Metrics`: the refactor harness
+ * captures `metrics` whole and compares it with raw `JSON.stringify` equality, and
+ * apollo-client carries a `coverage.unit` number, so a new key there rejects
+ * golden-A.json for a change with no number different anywhere. They travel beside it
+ * instead, computed ONCE where the measurement is taken -- `verifyCoverageProvenance`
+ * shells git, and computing it again in cli.ts would both pay twice and let the two
+ * answers disagree if a watcher rewrote the report in between.
+ */
+export interface MetricsWithCoverageProvenance {
+  readonly metrics: Metrics;
+  readonly coverageProvenance: readonly SuiteProvenance[];
+}
+
 export function extractAllMetrics(
   scriptsToRunOrOptions: string[] | MetricsExtractionOptions = ['quality']
 ): Metrics {
+  return extractAllMetricsAndCoverageProvenance(scriptsToRunOrOptions).metrics;
+}
+
+export function extractAllMetricsAndCoverageProvenance(
+  scriptsToRunOrOptions: string[] | MetricsExtractionOptions = ['quality']
+): MetricsWithCoverageProvenance {
   // Support both legacy array signature and new options object
   const options: MetricsExtractionOptions = Array.isArray(scriptsToRunOrOptions)
     ? { scriptsToRun: scriptsToRunOrOptions }
@@ -1609,13 +1649,21 @@ export function extractAllMetrics(
   // both coverage summaries, the SonarQube measures, and the custom-dimension
   // shell extractors, which commonly read build artifacts.
   //
-  // What this does NOT establish is that the report describes the code being
-  // graded when no script the gate ran wrote it: a project that generates
-  // coverage outside the gate is graded on whatever is on disk. That hole is
-  // deliberate and open -- backlog #39 -- after an mtime-comparison rule was
-  // built for it and removed for being inert on any project without a literal
-  // top-level `src/` while false-failing mtime-preserving archive restores,
-  // branch switches and clock skew.
+  // What the ordering alone does NOT establish is that the report describes the
+  // code being graded when no script the gate ran wrote it: a project that
+  // generates coverage outside the gate was graded on whatever was on disk.
+  // coverage-provenance.ts closes that for a report that carries a sidecar, and
+  // says so out loud for one that does not:
+  //
+  //   - the summaries are snapshotted BEFORE the mutating step and stamped after
+  //     it, so a report this run produced records the code it was produced from;
+  //   - after the read, each suite that yielded a NUMBER is verified against its
+  //     sidecar. A recorded state that no longer matches is a `stale-report`
+  //     measurement failure; a report nobody stamped is an advisory, not silence.
+  //
+  // What remains open is the un-stamped report itself -- the advisory does not
+  // prevent it being graded, because "nobody stamped this" is not evidence the
+  // numbers are wrong. It prevents the run being CACHED as a verdict.
   //
   // The return literal's property ORDER is deliberately left exactly as it was,
   // because the refactor harness compares capture sections with raw
@@ -1628,6 +1676,24 @@ export function extractAllMetrics(
   // `skipSonarQube: true`, so the value is `undefined` and `JSON.stringify` omits the
   // key entirely.
   // ---------------------------------------------------------------------------
+
+  // Whether anything in this extraction can rewrite a coverage report at all.
+  //
+  // Gated rather than unconditional so a run that cannot possibly produce a report --
+  // `capture.mjs` passes `scriptsToRun: []` with custom dimensions skipped, and so do
+  // most of the mocked unit suites -- pays nothing: no stat of the summaries, and no
+  // git call to establish the code state. There is no third way for the summary to
+  // move during this function.
+  const canRewriteReports =
+    scriptsToRun.length > 0 ||
+    (!skipCustomDimensions && (options.customDimensions?.length ?? 0) > 0);
+
+  // Taken BEFORE the mutating step, and it carries the code state as well as the
+  // summaries -- see CoverageProvenanceSnapshot for the codegen-during-build false
+  // pass that second half exists to refuse.
+  const summariesBeforeScripts = canRewriteReports
+    ? snapshotCoverageStateBeforeScripts()
+    : undefined;
 
   // First: this is the step that MUTATES the project.
   const scripts = runScripts(scriptsToRun);
@@ -1647,6 +1713,14 @@ export function extractAllMetrics(
     customFailures.push(...reading.failures);
   }
 
+  // Everything that can mutate the project has now run -- the scripts AND the custom
+  // shell extractors, which are arbitrary commands -- and the read is next. Stamping
+  // here is what makes the sidecar describe the report that is about to be graded
+  // rather than some later state of it.
+  if (summariesBeforeScripts !== undefined) {
+    stampCoverageSummariesRewrittenDuringRun(summariesBeforeScripts, 'run');
+  }
+
   // Measured once each, and both halves of every reading kept together: the
   // metrics if it worked, the reason if it did not. Calling the public
   // `extract*Metrics` wrappers here instead would discard the reason, which is
@@ -1656,6 +1730,12 @@ export function extractAllMetrics(
   const coverage = measureCoverage({
     absentReportIsFailure: options.coverageAbsenceIsFailure ?? true,
   });
+
+  // Asked ONLY about the suites that produced a number, which is also the
+  // double-reporting guard -- see suitesWithNumbers. A suite whose report is missing
+  // or unparseable already carries a failure of its own, and a provenance verdict
+  // beside it would report one broken report twice.
+  const coverageProvenance = verifyCoverageProvenance(suitesWithNumbers(coverage.metrics));
 
   // Read through the failure-carrying variant. The public `extractSonarqubeMetrics`
   // still returns a bare value for its other callers, and using it HERE was the
@@ -1673,6 +1753,9 @@ export function extractAllMetrics(
     // Appended rather than prepended so the existing typescript-then-eslint
     // ordering that tests assert on is untouched.
     ...coverage.failures,
+    // Immediately after, so both halves of "what is wrong with the coverage reading"
+    // are together: what the report says, then which code it says it about.
+    ...coverageProvenanceFailures(coverageProvenance),
     ...customFailures,
     // Last, so the orderings the existing tests assert on are untouched. `--coverage-only`
     // yields no reading and therefore no failure, which is correct: the adopter asked
@@ -1681,15 +1764,18 @@ export function extractAllMetrics(
   ];
 
   return {
-    coverage: coverage.metrics,
-    typescript: typescript.ok ? typescript.value.metrics : undefined,
-    eslint: eslint.ok ? eslint.value.metrics : undefined,
-    sonarqube: sonarqube.metrics,
-    sonarqubeProvenance: sonarqube.provenance,
-    scripts,
-    sloc,
-    custom,
-    measurementFailures: measurementFailures.length > 0 ? measurementFailures : undefined,
+    metrics: {
+      coverage: coverage.metrics,
+      typescript: typescript.ok ? typescript.value.metrics : undefined,
+      eslint: eslint.ok ? eslint.value.metrics : undefined,
+      sonarqube: sonarqube.metrics,
+      sonarqubeProvenance: sonarqube.provenance,
+      scripts,
+      sloc,
+      custom,
+      measurementFailures: measurementFailures.length > 0 ? measurementFailures : undefined,
+    },
+    coverageProvenance,
   };
 }
 
@@ -1706,10 +1792,23 @@ export function extractAllMetrics(
  *
  * Returns `undefined` rather than an empty array so it disappears from JSON
  * output entirely when everything was measured.
+ *
+ * `numberReported` exists because one kind breaks the assumption the name of this
+ * function is built on. Every failure but `stale-report` arrives with
+ * `metrics: undefined` for its dimension, which is why "missing from this score" was
+ * a true sentence; a stale report parsed fine and `computeFitness` includes its
+ * number. A caller that prints one sentence for both says something false about one
+ * of them, so the distinction is carried in the data rather than left to each
+ * surface to rediscover from the kind.
  */
 export function describeUnmeasured(
   metrics: Metrics
-): readonly { readonly dimension: string; readonly kind: string; readonly why: string }[] | undefined {
+): readonly {
+  readonly dimension: string;
+  readonly kind: string;
+  readonly why: string;
+  readonly numberReported: boolean;
+}[] | undefined {
   const failures = metrics.measurementFailures ?? [];
   if (failures.length === 0) return undefined;
 
@@ -1717,6 +1816,7 @@ export function describeUnmeasured(
     dimension: failure.dimension,
     kind: failure.kind,
     why: failure.message,
+    numberReported: failure.kind === 'stale-report',
   }));
 }
 
@@ -1739,6 +1839,21 @@ export function describeUnmeasured(
 export async function extractAllMetricsAsync(
   options: MetricsExtractionOptions & { submittedAnalysis: SubmittedAnalysis }
 ): Promise<Metrics> {
+  return (await extractAllMetricsAsyncAndCoverageProvenance(options)).metrics;
+}
+
+/**
+ * The same extraction, with the coverage provenance verdicts kept.
+ *
+ * For the two surfaces that produce a VERDICT and can therefore write a cache entry:
+ * `runQualityGate` in cli.ts and `handleRun` in mcp/tools.ts. `score` and `suggest`
+ * take the Metrics-only variant on purpose -- they neither produce a verdict nor cache
+ * one, and the unverifiable branch is entirely about those two things. The STALE half
+ * still reaches them, through `metrics.measurementFailures`.
+ */
+export async function extractAllMetricsAsyncAndCoverageProvenance(
+  options: MetricsExtractionOptions & { submittedAnalysis: SubmittedAnalysis }
+): Promise<MetricsWithCoverageProvenance> {
   const config = getConfig();
 
   // Load and register custom dimensions if not already provided
@@ -1750,7 +1865,7 @@ export async function extractAllMetricsAsync(
     customDimensions = await registerCustomDimensions(config.projectRoot);
   }
 
-  return extractAllMetrics({
+  return extractAllMetricsAndCoverageProvenance({
     ...options,
     customDimensions,
   });

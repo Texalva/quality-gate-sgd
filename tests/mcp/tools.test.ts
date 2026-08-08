@@ -46,6 +46,19 @@ const metricsWithAFailedDimension: Metrics = {
   ],
 };
 
+/**
+ * BOTH extraction entry points are stubbed, and the second one is not optional.
+ *
+ * `handleRun` takes `extractAllMetricsAsyncAndCoverageProvenance` because it is the
+ * only surface here that produces a VERDICT and therefore needs to know which coverage
+ * reports the run can stand behind. Stubbing only the Metrics-only variant left
+ * `handleRun` running the real extraction against THIS repository -- it reported a
+ * missing `type-check` script and a 404 from SonarQube, which is a perfectly good
+ * measurement of the wrong subject, and the assertion below failed for a reason that
+ * had nothing to do with what it was testing.
+ */
+const provenanceOf = vi.fn(() => [] as unknown[]);
+
 vi.mock('../../src/metrics.js', async () => {
   const actual = await vi.importActual<typeof import('../../src/metrics.js')>(
     '../../src/metrics.js'
@@ -53,6 +66,10 @@ vi.mock('../../src/metrics.js', async () => {
   return {
     ...actual,
     extractAllMetricsAsync: vi.fn(async () => metricsWithAFailedDimension),
+    extractAllMetricsAsyncAndCoverageProvenance: vi.fn(async () => ({
+      metrics: metricsWithAFailedDimension,
+      coverageProvenance: provenanceOf(),
+    })),
   };
 });
 
@@ -109,6 +126,11 @@ describe('mcp handlers report what they could not measure', () => {
           dimension: 'eslint',
           kind: 'crashed',
           why: expect.stringContaining('exited 2'),
+          // Asserted rather than loosened away: `unmeasured` now carries one kind
+          // (`stale-report`) that DOES have a number in the same response, and an
+          // agent reading this list as "these are absent" would be wrong about it.
+          // A crashed linter has no number, so this is false here.
+          numberReported: false,
         },
       ]);
     });
@@ -123,5 +145,55 @@ describe('mcp handlers report what they could not measure', () => {
     expect(response.status).toBeDefined();
     expect(typeof response.fitnessScore).toBe('number');
     expect(response.unmeasured).toBeDefined();
+  });
+
+  /**
+   * The MCP half of coverage provenance, wired at the handler and asserted here
+   * because nothing else can see it: `evaluateRules` does not produce these entries
+   * (they cannot travel inside `Metrics`), so a handler that forgot to append them
+   * would serialise `unevaluatedRules: []` over a coverage floor graded against a
+   * report nothing ties to the code -- a clean bill of health for a check that proved
+   * nothing. The mocked ruleset grades `eslint.errors` only, so the entry also has to
+   * be absent when no rule reads coverage.
+   */
+  it('run reports a coverage report it cannot tie to the code', async () => {
+    provenanceOf.mockReturnValue([
+      {
+        kind: 'unverifiable',
+        suite: 'coverage.unit',
+        summaryPath: '/p/coverage/coverage-summary.json',
+        sidecarPath: '/p/coverage/.quality-gate-provenance.json',
+        why: 'no-sidecar',
+        detail: 'no .quality-gate-provenance.json beside the report',
+      },
+    ]);
+
+    const gradesCoverage = await responseOf(() => handleRun({}));
+    expect(gradesCoverage.unevaluatedRules).toEqual([]);
+
+    // `vi.clearAllMocks()` clears CALLS and not implementations, so both stubs are put
+    // back by hand rather than left to leak into whatever runs next.
+    const { loadRules } = await import('../../src/rules.js');
+    const gradesEslintOnly = vi.mocked(loadRules).getMockImplementation();
+    vi.mocked(loadRules).mockReturnValue({
+      version: '1.0.0',
+      description: 'test',
+      rules: { floors: { 'coverage.unit.statements': 50 } },
+    });
+
+    try {
+      const response = await responseOf(() => handleRun({}));
+      expect(response.unevaluatedRules).toEqual([
+        {
+          type: 'unverified-provenance',
+          rule: 'coverage.unit.provenance',
+          reason: 'provenance-unverifiable',
+          message: expect.stringContaining('coverage.unit.statements'),
+        },
+      ]);
+    } finally {
+      if (gradesEslintOnly) vi.mocked(loadRules).mockImplementation(gradesEslintOnly);
+      provenanceOf.mockReturnValue([]);
+    }
   });
 });

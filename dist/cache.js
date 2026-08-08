@@ -187,6 +187,154 @@ function isCodeFile(filePath) {
     return isInCodeDir && hasCodeExt;
 }
 /**
+ * The extensions the cache and the provenance sidecar both call "code".
+ *
+ * One list, because two lists is how a file becomes code for the key and not for
+ * provenance (or the reverse), and either direction is a report vouched for over a
+ * file one of them cannot see.
+ */
+const CODE_EXTENSIONS = ['.ts', '.tsx', '.js', '.jsx'];
+/**
+ * Untracked code files, resolved by asking GIT to apply the pathspecs.
+ *
+ * This deliberately does NOT reuse `isCodeFile` above, and the divergence is the
+ * whole point of the function existing. `isCodeFile` tests a LITERAL prefix
+ * (`filePath.startsWith(pathspec + '/')`), which is blind to every pathspec form
+ * git accepts and this tool documents. MEASURED on git 2.51 with an untracked
+ * `packages/a/src/new.ts` and a tracked edit to `packages/a/src/a.ts`:
+ *
+ *   pathspec                    git diff --name-only <C>   git ls-files --others   isCodeFile
+ *   'packages/*'                a.ts                       new.ts                  DROPS new.ts
+ *   'packages/*\/src/**'        a.ts                       new.ts                  DROPS new.ts
+ *   ':(glob)packages/*\/src/**' a.ts                       new.ts                  DROPS new.ts
+ *   '*.ts'                      a.ts                       new.ts                  DROPS new.ts
+ *   'packages/*\/src'           (empty)                    (empty)                 (empty)
+ *
+ * So git's two answers agree in every form -- including agreeing that
+ * `packages/*\/src` matches nothing -- while the literal prefix test disagrees with
+ * both in four of the five. A provenance check built on the prefix test would say
+ * VERIFIED after new source appeared beside a stamped report, on exactly the
+ * monorepo layouts an earlier freshness rule was rejected for no-oping on.
+ *
+ * `computeContentHash` keeps the prefix test. That is not an oversight either: its
+ * output IS the cache key, and sharpening it here would move the key for every
+ * glob-pathspec project -- discarding their entries and changing what the cache
+ * means -- for a fix that belongs to #40. The two are allowed to differ, provenance
+ * is the sharper of the two, and neither may be quietly aligned with the other
+ * without moving something a user can see.
+ */
+export function listUntrackedCodeFiles() {
+    const config = getConfig();
+    const listed = execSync(`git ls-files --others --exclude-standard ${getCodePathspec()}`, {
+        cwd: config.projectRoot,
+        encoding: 'utf-8',
+        maxBuffer: GIT_MAX_BUFFER,
+        stdio: ['ignore', 'pipe', 'pipe'],
+    }).trim();
+    if (listed.length === 0)
+        return [];
+    return listed
+        .split('\n')
+        .filter((file) => file.length > 0 && CODE_EXTENSIONS.some((ext) => file.endsWith(ext)))
+        .sort();
+}
+/**
+ * Refuse a layout where the answer would be a constant.
+ *
+ * Extracted so `computeContentHash` and `codeStateDigest` cannot end up with two
+ * different opinions -- or two differently-worded refusals -- about the one layout
+ * in which both of them are meaningless. The git call and the message are exactly
+ * what `computeContentHash` did inline, in the same position, because
+ * tests/cache.test.ts stubs `execSync` by call SEQUENCE.
+ */
+function assertTrackedCodeExists() {
+    const config = getConfig();
+    const tracked = execSync(`git ls-files ${getCodePathspec()}`, {
+        cwd: config.projectRoot,
+        encoding: 'utf-8',
+        maxBuffer: GIT_MAX_BUFFER,
+    }).trim();
+    if (tracked.length === 0) {
+        throw new Error(`No tracked files match ${config.codePathspecs.join(', ')}, so there is nothing to ` +
+            'hash and the cache key would be the same constant for every state of the working ' +
+            'tree -- which serves a stored verdict for code that was never measured. This tool ' +
+            'measures code under `src/`; if yours lives elsewhere, set QUALITY_CODE_PATHSPECS to ' +
+            'the paths that hold it. Refusing to run rather than caching against a hash of nothing.');
+    }
+}
+export function codeStateDigest(againstCommit) {
+    const config = getConfig();
+    // The commit-ish is interpolated into a shell command, and this function is
+    // EXPORTED -- so it is validated here rather than trusted to have been validated by
+    // whoever called it. `HEAD` or a hex object name covers every internal use (the
+    // provenance sidecar records a 40-hex commit and nothing else parses); a caller who
+    // wants a branch or tag resolves it with `git rev-parse` first, which is one call and
+    // removes the question.
+    if (!/^(HEAD|[0-9a-f]{7,40})$/.test(againstCommit)) {
+        return {
+            kind: 'git-failed',
+            message: `Refusing to ask git about ${JSON.stringify(againstCommit)}: this takes HEAD or a hex ` +
+                'object name, so a value from a file or an argument cannot reach a shell through it.',
+        };
+    }
+    try {
+        assertTrackedCodeExists();
+    }
+    catch (error) {
+        return {
+            kind: 'no-tracked-code',
+            message: error instanceof Error ? error.message : String(error),
+        };
+    }
+    try {
+        const trackedDiff = execSync(`git diff ${againstCommit} ${getCodePathspec()}`, {
+            cwd: config.projectRoot,
+            encoding: 'utf-8',
+            maxBuffer: GIT_MAX_BUFFER,
+            stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        const untracked = listUntrackedCodeFiles();
+        const untrackedContent = untracked
+            .map((file) => {
+            const fullPath = path.join(config.projectRoot, file);
+            let body = '';
+            try {
+                body = fs.statSync(fullPath).isFile()
+                    ? fs.readFileSync(fullPath, 'utf-8')
+                    : '[not a file]';
+            }
+            catch {
+                body = '[unreadable]';
+            }
+            return `\n@@@ untracked: ${file} @@@\n${body}`;
+        })
+            .join('');
+        return {
+            kind: 'digest',
+            digest: crypto
+                .createHash('sha256')
+                .update(trackedDiff + untrackedContent)
+                .digest('hex'),
+        };
+    }
+    catch (error) {
+        return {
+            kind: 'git-failed',
+            message: error instanceof Error ? error.message : String(error),
+        };
+    }
+}
+/**
+ * The digest a tree with NO code differences from the commit produces.
+ *
+ * Named rather than inlined because a caller comparing against it is asking a
+ * specific question -- "was the recorded stamp taken over a tree whose code matched
+ * its commit exactly" -- and `sha256('')` at a call site reads like an accident.
+ */
+export function digestOfUnchangedCodeState() {
+    return crypto.createHash('sha256').update('').digest('hex');
+}
+/**
  * Compute a stable content hash from git diff + untracked files
  * Only includes source code files that affect quality metrics.
  * Changes to docs, config, etc. won't invalidate the cache.
@@ -214,18 +362,11 @@ function computeContentHash() {
     // layout is the same class of silent mis-scope. The project says where its code is
     // (QUALITY_CODE_PATHSPECS, default `src/,tests/,scripts/`); if that is wrong, the
     // answer is to say so, not to grade something else.
-    const tracked = execSync(`git ls-files ${codePathspec}`, {
-        cwd: config.projectRoot,
-        encoding: 'utf-8',
-        maxBuffer: GIT_MAX_BUFFER,
-    }).trim();
-    if (tracked.length === 0) {
-        throw new Error(`No tracked files match ${config.codePathspecs.join(', ')}, so there is nothing to ` +
-            'hash and the cache key would be the same constant for every state of the working ' +
-            'tree -- which serves a stored verdict for code that was never measured. This tool ' +
-            'measures code under `src/`; if yours lives elsewhere, set QUALITY_CODE_PATHSPECS to ' +
-            'the paths that hold it. Refusing to run rather than caching against a hash of nothing.');
-    }
+    //
+    // The refusal itself lives in `assertTrackedCodeExists` so that `codeStateDigest`
+    // -- which is meaningless in exactly the same layout -- cannot grow a second copy
+    // of it that drifts.
+    assertTrackedCodeExists();
     // Get diff of code file changes only (staged + unstaged vs HEAD)
     const trackedDiff = execSync(`git diff HEAD ${codePathspec}`, {
         cwd: config.projectRoot,
@@ -292,6 +433,16 @@ function computeContentHash() {
  * for the pathspec blind spot -- that is #40's remaining half, which has to
  * classify what git reports rather than diffing a fixed set of paths -- but it is
  * the layout-independent part, and it costs nothing.
+ *
+ * The coverage-provenance sidecar inherits that blind spot exactly, and it is worth
+ * stating here because this is where the sharpness is set. The sidecar records a
+ * commit plus `codeStateDigest`, which asks the same two git questions this key
+ * does; in a layout whose real sources are outside `codePathspecs` the digest is a
+ * constant, so a sidecar written there reports VERIFIED for every future state of
+ * the working tree. Provenance is exactly as sharp as this key and never sharper.
+ * The one place it is deliberately sharper is the UNTRACKED half -- see
+ * `listUntrackedCodeFiles` for the measured reason and for why this function's own
+ * filter was left alone.
  *
  * Old `wip:<64 hex>` keys cannot collide with new `wip:<40 hex>:<64 hex>` ones, so
  * no stale entry is reachable under the new scheme and no schema bump is needed.

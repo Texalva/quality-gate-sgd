@@ -184,9 +184,28 @@ function measurementsBehind(metricPath) {
  *   failure `coverage.union` + floor `coverage.unit.branches`   -> NOT gated
  */
 export function isMeasurementUnderRule(rules, dimension) {
-    return ruledMetricPaths(rules)
-        .flatMap((metricPath) => measurementsBehind(metricPath))
-        .some((required) => sameSubtree(required, dimension));
+    return rulesReadingMeasurement(rules, dimension).length > 0;
+}
+/**
+ * WHICH ruled metric paths depend on the measurement of a dimension.
+ *
+ * The same matcher `isMeasurementUnderRule` asks for a boolean, asked for the list,
+ * so the two cannot disagree about what "grades this dimension" means -- including
+ * the derivation edge, which is easy to forget: a `coverage.union.statements` floor
+ * is a rule that reads `coverage.unit`.
+ *
+ * It exists because a boolean cannot be reported. The coverage-provenance advisory
+ * has to NAME the rules that were graded against numbers of unestablished origin --
+ * `evaluateAnalysisProvenance` needs the same thing for sonarqube -- and an adopter
+ * told "some rule reads this" cannot act on it. Lives here, next to
+ * `coverageAbsenceIsFailure`, so the CLI and the harness cannot re-derive it
+ * differently.
+ *
+ * Deduped and sorted, because the caller puts it in a sentence.
+ */
+export function rulesReadingMeasurement(rules, dimension) {
+    const reading = ruledMetricPaths(rules).filter((metricPath) => measurementsBehind(metricPath).some((required) => sameSubtree(required, dimension)));
+    return [...new Set(reading)].sort();
 }
 /** Every coverage suite, so a caller can ask a question about each of them. */
 const COVERAGE_SUITE_DIMENSIONS = ['coverage.unit', 'coverage.lambda'];
@@ -283,8 +302,15 @@ function evaluateMeasurements(rules, metrics) {
         .map((failure) => ({
         type: 'measurement',
         rule: `${failure.dimension}.measurement`,
-        message: `${failure.dimension} could not be measured (${failure.kind}): ${failure.message} ` +
-            describeEvidence(failure.evidence),
+        // "could not be measured" is true of every kind but one. `stale-report`
+        // arrives WITH a number -- the report parsed, `total` was valid, the suite has
+        // a value in `metrics` -- and what failed is the claim that the number
+        // describes this code. Printing "could not be measured" over a dimension the
+        // same output reports a percentage for is the kind of confidently-false
+        // sentence this file exists to remove.
+        message: `${failure.dimension} ${failure.kind === 'stale-report'
+            ? 'was measured, but nothing ties the number to this code'
+            : 'could not be measured'} (${failure.kind}): ${failure.message} ` + describeEvidence(failure.evidence),
     }));
 }
 /**

@@ -29,6 +29,24 @@ export declare function computeRulesHash(rules: QualityRules): string;
  */
 export declare function isMeasurementUnderRule(rules: QualityRules, dimension: string): boolean;
 /**
+ * WHICH ruled metric paths depend on the measurement of a dimension.
+ *
+ * The same matcher `isMeasurementUnderRule` asks for a boolean, asked for the list,
+ * so the two cannot disagree about what "grades this dimension" means -- including
+ * the derivation edge, which is easy to forget: a `coverage.union.statements` floor
+ * is a rule that reads `coverage.unit`.
+ *
+ * It exists because a boolean cannot be reported. The coverage-provenance advisory
+ * has to NAME the rules that were graded against numbers of unestablished origin --
+ * `evaluateAnalysisProvenance` needs the same thing for sonarqube -- and an adopter
+ * told "some rule reads this" cannot act on it. Lives here, next to
+ * `coverageAbsenceIsFailure`, so the CLI and the harness cannot re-derive it
+ * differently.
+ *
+ * Deduped and sorted, because the caller puts it in a sentence.
+ */
+export declare function rulesReadingMeasurement(rules: QualityRules, dimension: string): readonly string[];
+/**
  * Whether an absent coverage report should be reported as a failed measurement.
  *
  * `QUALITY_COVERAGE_REQUIRED=false` says "this project has no coverage report and

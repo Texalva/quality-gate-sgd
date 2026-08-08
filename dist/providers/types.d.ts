@@ -72,13 +72,32 @@ export type Result<T, E> = {
  * `include`/`reportsDirectory` problem. Collapsing them is how the original
  * defect stayed invisible.
  *
- * There is deliberately NO kind for "the report is older than the code". One was
- * added and removed: the rule behind it (compare the summary's mtime against the
- * newest file under `codePathspecs`) was inert on any project without a literal
- * top-level `src/` and false-failed mtime-preserving archive restores, branch
- * switches, clock skew and any bulk tree write longer than its tolerance. A
- * declared kind nothing can emit is a claim that the tool detects something it
- * does not, so the kind went with the rule. The open question is backlog #39.
+ * `stale-report` is the one kind that says a report on DISK describes something
+ * other than the code being graded, and it is worth stating exactly what it is not,
+ * because a kind meaning almost this was added here and removed. That one compared
+ * the summary's mtime against the newest file under `codePathspecs`: inert on any
+ * project without a literal top-level `src/`, and false-failing mtime-preserving
+ * archive restores (`actions/cache`), branch switches that rewrite identical
+ * content, clock skew, and any bulk tree write longer than its tolerance -- a
+ * constant sized from file COUNT when the real quantity is wall time. A declared
+ * kind nothing can honestly emit is a claim the tool cannot support, so the kind
+ * went with the rule.
+ *
+ * What replaced it (coverage-provenance.ts) is honest where that was not, and the
+ * difference is not one of degree: nothing is inferred from a timestamp. A sidecar
+ * beside the report records the commit the report was produced at plus a digest of
+ * the code against that commit, and verification RECOMPUTES that digest against the
+ * RECORDED commit and compares it exactly. There is no tolerance constant, no
+ * cross-clock arithmetic and no comparison against another file's age. Absence of a
+ * sidecar is not this kind -- it is an advisory that the origin is unestablished --
+ * so the kind is emitted only when the tool has positive evidence. MEASURED, on the
+ * two shapes that killed the mtime rule: stamping at a clean commit and then editing
+ * README.md, committing that edit, reverting a code change so content is identical,
+ * or switching to a branch with identical content all move the cache key and all
+ * recompute to the SAME digest -- verified, no failure. And `chmod +x src/index.ts`
+ * followed by a commit moves the digest while `git diff --raw` reports identical blob
+ * shas (`:100644 100755 cb0ff5c cb0ff5c M`), which is classified as no content change
+ * rather than as a stale report.
  *
  * `wrong-subject` is NOT that kind returning under a new name, and the difference is
  * worth stating because one of its two emitters does compare a SonarQube analysis's git
@@ -87,8 +106,11 @@ export type Result<T, E> = {
  * it: there is no tolerance window to tune, an mtime-preserving archive restore or a
  * branch switch does not change a commit hash, and clock skew cannot reach it. It is also
  * not inert, because the revision comes from the server's own response rather than from a
- * directory layout that may not exist. What stays true is that no kind here claims a
- * report on DISK is older than the code; #39 is still open.
+ * directory layout that may not exist. `stale-report` reaches the same standard by the
+ * same route -- an exact comparison of recorded identities -- one layer down, about a
+ * file rather than about a server's answer. Neither claims a report is OLDER than the
+ * code; both claim it describes a DIFFERENT one, which is a statement a comparison can
+ * actually support.
  *
  * `report-missing` was for a long time declared and never emitted. It is now
  * emitted for an absent coverage summary on the suite that requires one
@@ -99,6 +121,28 @@ export type Result<T, E> = {
  * because `evaluateFloors` is the only evaluator that reports a missing metric.
  */
 export type MeasurementFailureKind = 'tool-missing' | 'crashed' | 'timed-out' | 'output-truncated' | 'unparseable-output' | 'report-missing' | 'measured-nothing'
+/**
+ * The report parsed and yielded a number, and a sidecar beside it records that the
+ * number was produced from a DIFFERENT state of the code than the one being graded.
+ *
+ * Its own kind because the response it calls for is unlike every neighbour's: the
+ * measurement machinery is fine, the file is fine, the number is arithmetically
+ * honest -- what is wrong is which code it describes, and the remedy is to
+ * regenerate or re-stamp the report rather than to fix a tool.
+ *
+ * It is also the ONLY kind that arrives alongside a value for its dimension, which
+ * is why `evaluateMeasurements` and the `score`/`suggest` surfaces word it
+ * differently: "could not be measured" is false here, and printing it over a
+ * dimension the same output reports a percentage for would be exactly the
+ * confidently-wrong sentence this module exists to prevent.
+ *
+ * Emitted only from positive evidence -- a sidecar naming a commit, and a
+ * recomputed digest against that commit that differs, with a tracked file's content
+ * or an untracked source file to point at. Never from a timestamp, never against
+ * another file's mtime, never against another machine's clock, and with no tolerance
+ * constant. A report nobody stamped is not this; it is an advisory that says so.
+ */
+ | 'stale-report'
 /**
  * The service answered and REFUSED: 401 or 403 from a SonarQube endpoint.
  *
@@ -218,14 +262,27 @@ export interface ReportAttempt {
     /** null when nothing was read -- absent, an existence probe, or the read threw. */
     readonly bytesRead: number | null;
     /**
-     * mtimeMs. RECORDED, never judged -- by this provider or by any caller.
+     * mtimeMs. RECORDED here, and judged NOWHERE that reads this field.
      *
-     * For a report it is the only signal separating one written by this run from
-     * last week's, so it belongs in the evidence a human reads. Nothing in the tool
-     * compares it against anything: a caller did, briefly, and the comparison was
-     * wrong in both directions at once (see MeasurementFailureKind and backlog
-     * #39). Adding a threshold here would additionally be the provider vouching for
-     * its own freshness, which the note on MeasurementProvider below rules out.
+     * For a report it is the only signal separating one written by this run from last
+     * week's, so it belongs in the evidence a human reads. No threshold is applied to
+     * it here, and none may be: that would be the provider vouching for its own
+     * freshness, which the note on MeasurementProvider below rules out.
+     *
+     * There IS now exactly one place in the tool where a coverage summary's mtime is
+     * compared, and it is worth naming precisely because this comment used to say
+     * "nothing in the tool compares it against anything", which is no longer true.
+     * `coverage-provenance.ts` stats the summary itself before `runScripts` and again
+     * after, to answer one question: did THIS file get written during THIS process. Same
+     * file, same process, ONE clock, no tolerance constant. It is never persisted, never
+     * compared against another file's mtime, and never against another machine's --
+     * which is the whole difference from the rule that was removed for doing all three.
+     * It takes its own `statSync` and does not read this field, so nothing a provider
+     * records here can influence it.
+     *
+     * It is OR'd with a content hash there because a comment-only source edit can
+     * regenerate a byte-identical `coverage-summary.json`, and content alone would leave
+     * a correctly-regenerated report looking unstamped.
      *
      * Null for an existence probe, and that is not a lost signal: a shim path or a
      * manifest was never claimed to be a report this run produced, so there is no
@@ -366,8 +423,11 @@ export interface CoverageReportRead {
  * from without being handed a failure for it. targets/extract.ts is that caller:
  * it warns about a detail report it could not read findings from, which is a
  * degraded fix-advice problem rather than a failed measurement, so the provider
- * records what it saw and lets that layer decide. It is NOT a freshness channel;
- * nothing judges `attempt.modifiedMs`.
+ * records what it saw and lets that layer decide. It is still NOT a freshness
+ * channel: freshness is judged in coverage-provenance.ts, from a sidecar beside the
+ * report, and that module takes its own `statSync` rather than reading
+ * `attempt.modifiedMs`. So adding a consumer of this field for freshness would be a
+ * second, weaker answer to a question that already has one.
  */
 export interface CoverageReading {
     readonly metrics: AllCoverageMetrics;

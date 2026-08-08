@@ -452,6 +452,74 @@ const SABOTAGES = [
     fixtureProbe: (dir) => requireReportRewrittenByRun(dir),
   },
   {
+    name: "a report stamped for a different generation of the code",
+    stands_for:
+      "The #39 hole. A project that generates coverage OUTSIDE the gate was graded on whatever coverage-summary.json was on disk, with nothing tying it to the commit being graded. The planted 10% report SATISFIES the floor this case configures, so nothing else in the pipeline objects -- the recorded provenance is the only thing that can catch it. It also exercises the SHIPPED stamping and verification paths rather than the module, so a sidecar the real `stamp-coverage` writes has to be one the real `run` can read.",
+    dimension: "coverage.unit",
+    expectKind: "stale-report",
+    // A floor of 5, deliberately satisfied by the planted 10. A floor of 50 would fail
+    // on the NUMBER and the case would pass without provenance existing at all.
+    gateRules: {
+      floors: { "coverage.unit.statements": 5 },
+      ceilings: {},
+      requiredScripts: [],
+    },
+    scriptsToRun: [],
+    sabotage: (dir) => {
+      plantStaleCoverageReport(dir);
+
+      // `runGateAgainst` does NOT git-init its copy -- only `runCliAgainst` does -- and
+      // without a repository there is no commit to record, so the verdict would be
+      // "cannot establish the code state" (an advisory) rather than the stale claim
+      // this case is about.
+      const g = (...args) =>
+        spawnSync("git", args, { cwd: dir, encoding: "utf8", stdio: "pipe" });
+      g("init", "-q");
+      g("config", "user.email", "harness@example.com");
+      g("config", "user.name", "Harness");
+      g("config", "commit.gpgsign", "false");
+      g("add", "-A");
+      g("commit", "-q", "-m", "subject under test");
+
+      // Through the BINARY, so the case cannot pass against a stamping path that only
+      // exists in the library. `coverage/` is gitignored in the subject, so the sidecar
+      // is invisible to git and the tree stays clean.
+      const stamp = spawnSync(process.execPath, [join(TOOL, "dist", "cli.js"), "stamp-coverage"], {
+        cwd: dir,
+        env: hermeticEnv({ QUALITY_PROJECT_ROOT: dir }),
+        encoding: "utf8",
+      });
+      if (stamp.status !== 0) {
+        return `stamp-coverage exited ${stamp.status}: ${(stamp.stdout ?? "") + (stamp.stderr ?? "")}`;
+      }
+
+      // Now the code moves on, which is the whole condition. Committed rather than left
+      // uncommitted so the case also covers the commit boundary -- the shape that made
+      // a cache-key STRING comparison unable to distinguish "moved on" from "cannot
+      // recompute".
+      const orphan = join(dir, "src", "orphan.ts");
+      writeFileSync(orphan, readFileSync(orphan, "utf8") + "\nexport const movedOn = 1;\n");
+      g("commit", "-qam", "move the code on");
+    },
+    fixtureProbe: (dir) => {
+      // Without this the case could report the stale verdict over a fixture that was
+      // never stamped at all -- which would be the right answer for the wrong reason,
+      // and would keep passing if stamping broke completely.
+      const sidecar = join(dir, "coverage", ".quality-gate-provenance.json");
+      if (!existsSync(sidecar)) return `no sidecar at ${sidecar}: nothing was stamped`;
+      let parsed;
+      try {
+        parsed = JSON.parse(readFileSync(sidecar, "utf8"));
+      } catch (error) {
+        return `the sidecar is not JSON: ${String(error)}`;
+      }
+      if (!/^[0-9a-f]{40}$/.test(parsed.codeCommit ?? "")) {
+        return `the sidecar records no commit: ${JSON.stringify(parsed.codeCommit)}`;
+      }
+      return undefined;
+    },
+  },
+  {
     name: "a codebase with no branches at all",
     stands_for:
       "A declarations-and-re-exports package, or any module with no conditional in it: real statements, zero branches. istanbul renders 0/0 as 100 and the revision that refused to launder that DROPPED the dimension instead -- which reshaped the vacuous pass rather than closing it, since evaluateFloors then failed forever on a floor `init` had just written while evaluateCeilings and evaluateMonotonic silently skipped theirs.",
@@ -660,6 +728,76 @@ const SABOTAGES = [
       );
     },
     fixtureProbe: (dir, got) => requireBothRunsOnOneCacheKey(dir, got),
+  },
+  {
+    name: "a stamped report survives a commit that does not touch the code",
+    stands_for:
+      "The FALSE-FAIL direction of coverage provenance, which is what killed the previous two designs and which the unit tests cannot prove: they call the module directly, so a cli.ts wiring mistake -- the wrong local renamed, the advisory filter inverted, the block placed after an exit -- is invisible to them. Here the report is stamped by the shipped `stamp-coverage`, a commit that touches no code is made on top of it, and the shipped `run` has to come back green and silent. The earlier mtime rule failed exactly this: git restamps a file it rewrites even when the content ends up identical, so a branch switch or a commit invalidated a valid report.",
+    viaCli: true,
+    // Nothing about provenance may appear, in either channel: the stale claim is the
+    // false fail, and the unverifiable advisory would mean the sidecar written by the
+    // binary is not one the binary can read back.
+    expectCliPassWithout: /stale-report|could not be tied to the code being graded/,
+    sabotage: (dir) => {
+      plantStaleCoverageReport(dir);
+
+      // A ruleset that grades coverage with a floor the planted 10% SATISFIES, plus the
+      // build ceilings the subject's real 3 tsc / 2 eslint errors satisfy. So the only
+      // thing that can turn this run red is provenance. No monotonic rule, because a
+      // missing baseline would make the entry baseline-only for an unrelated reason.
+      writeFileSync(
+        join(dir, "rules.json"),
+        JSON.stringify(
+          {
+            version: "1.0.0",
+            description: "grades coverage with a floor the report already meets",
+            rules: { ...GATES_BUILD_ONLY, floors: { "coverage.unit.statements": 5 } },
+          },
+          null,
+          2
+        )
+      );
+
+      // The commit `stamp-coverage` records has to exist before it runs, so this case
+      // makes its own -- `runCliAgainst` commits AFTERWARDS, which is what produces the
+      // commit boundary this case is about.
+      const g = (...args) =>
+        spawnSync("git", args, { cwd: dir, encoding: "utf8", stdio: "pipe" });
+      g("init", "-q");
+      g("config", "user.email", "harness@example.com");
+      g("config", "user.name", "Harness");
+      g("config", "commit.gpgsign", "false");
+      g("add", "-A");
+      g("commit", "-q", "-m", "before stamping");
+
+      const stamp = spawnSync(process.execPath, [join(TOOL, "dist", "cli.js"), "stamp-coverage"], {
+        cwd: dir,
+        env: hermeticEnv({ QUALITY_PROJECT_ROOT: dir }),
+        encoding: "utf8",
+      });
+      if (stamp.status !== 0) {
+        return `stamp-coverage exited ${stamp.status}: ${(stamp.stdout ?? "") + (stamp.stderr ?? "")}`;
+      }
+
+      // A non-code file, which `runCliAgainst` will then commit. This moves the cache
+      // key and leaves every file under src/, tests/ and scripts/ byte-identical.
+      writeFileSync(join(dir, "NOTES.md"), "documentation only\n");
+    },
+    fixtureProbe: (dir) => {
+      const sidecar = join(dir, "coverage", ".quality-gate-provenance.json");
+      if (!existsSync(sidecar)) return `no sidecar at ${sidecar}: nothing was stamped`;
+      const recorded = JSON.parse(readFileSync(sidecar, "utf8")).codeCommit;
+      const head = spawnSync("git", ["rev-parse", "HEAD"], {
+        cwd: dir,
+        encoding: "utf8",
+      }).stdout?.trim();
+      // Without this the case could pass while HEAD never moved, which is the easy half
+      // and not the half that killed the previous design.
+      if (recorded === head) {
+        return `HEAD is still the stamped commit ${head}, so no commit boundary was crossed`;
+      }
+      return undefined;
+    },
   },
   {
     name: "custom extractor succeeds but prints no number",
@@ -1455,6 +1593,37 @@ for (const sabotage of SABOTAGES) {
         "  (or the subject it is built from) and run this again."
     );
     process.exit(2);
+  }
+
+  // The shipped binary, judged in the REVERSE direction: a state that must not be
+  // refused. Without a case in this direction, an implementation that called every
+  // coverage report stale would score perfectly on every case above -- which is how
+  // both previous attempts at this feature passed their own tests.
+  //
+  // Three assertions, and each one closes a different way of passing wrongly. Exit 0,
+  // or the refusal happened. The text absent, or the refusal happened in the advisory
+  // channel instead. And a real verdict printed rather than a cached one, because a
+  // cached pass reads neither the report nor the sidecar and would be evidence about
+  // nothing.
+  if (sabotage.expectCliPassWithout) {
+    const output = got.output ?? "";
+    const refused = sabotage.expectCliPassWithout.test(output);
+    const measured = /Quality gate PASSED/.test(output) && !/PASSED \(cached\)/.test(output);
+    const passed = got.status === 0 && !refused && measured;
+
+    results.push({
+      name: sabotage.name,
+      passed,
+      stands_for: sabotage.stands_for,
+      detail: passed
+        ? "the shipped binary measured, passed, and said nothing about provenance"
+        : refused
+          ? `the binary refused a valid report: ${output.slice(-800)}`
+          : got.status !== 0
+            ? `the binary exited ${got.status} on a state that must not fail: ${output.slice(-800)}`
+            : `expected a freshly measured PASS; got: ${output.slice(-800)}`,
+    });
+    continue;
   }
 
   // The shipped binary: judged on its exit status and what it printed, since

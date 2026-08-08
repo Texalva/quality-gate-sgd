@@ -93,6 +93,37 @@ export interface GeneratedConfig {
 export declare function scriptWritesCoverage(name: string, body: string): boolean;
 export declare function analyzeRepo(projectRoot: string): RepoAnalysis;
 /**
+ * Reads one line, returning EXACTLY what the user typed -- '' for a bare Enter.
+ *
+ * Separate from the default-substituting `askQuestion` below because conflating the
+ * two is what inverted every yes/no prompt: `askQuestion` returns the DISPLAY string
+ * when the input is empty, and for a no-default prompt that display string is
+ * `'y/N'`, which starts with `y`.
+ */
+export interface Prompter {
+    ask(prompt: string): Promise<string>;
+    close(): void;
+}
+/**
+ * ONE readline interface for the whole interview, and why that is the fix.
+ *
+ * A fresh `readline.Interface` per question is fine on a tty, where each one takes
+ * over cleanly. On any other stdin it is not: the first interface buffers or consumes
+ * what is left of the stream, and the next one is handed a stream that has already
+ * ended, so its `rl.question` callback never fires. OBSERVED driving the interview
+ * with `printf '\n\n\n\n' | node ...`: the first two prompts printed and consumed
+ * input, then the process HUNG -- node reporting "Detected unsettled top-level await"
+ * -- with no diagnostic and no fallback to defaults. A hang is the worst failure mode
+ * to debug remotely, and CI is where it happens.
+ *
+ * End-of-input is answered rather than waited on. A caller that closes stdin mid
+ * interview has stopped answering, and the honest response is to say so and stop --
+ * NOT to fill the remaining questions with defaults, which would write a
+ * configuration from questions nobody answered. That is the same shape as the
+ * `[y/N]`-answers-yes defect: a value the user never supplied, presented as theirs.
+ */
+export declare function createPrompter(input: NodeJS.ReadableStream): Prompter;
+/**
  * Which answer a typed line represents, or `undefined` for "the user did not say".
  *
  * A named function over a string rather than a branch inside the prompt, because the
@@ -119,7 +150,7 @@ export interface InterviewAnswers {
  * it differently.
  */
 export declare function reportTestCommandChoice(analysis: RepoAnalysis): void;
-export declare function conductInterview(analysis: RepoAnalysis, suggestion: GeometrySuggestion, options: InitOptions): Promise<InterviewAnswers>;
+export declare function conductInterview(analysis: RepoAnalysis, suggestion: GeometrySuggestion, options: InitOptions, prompter?: Prompter): Promise<InterviewAnswers>;
 /**
  * What running the project's own test script told us about coverage.
  *

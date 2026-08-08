@@ -15,11 +15,13 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs'
 import { join } from 'path'
+import { Readable } from 'stream'
 import {
   analyzeRepo,
   calibrateCoverageRules,
   classifyCoverageTotal,
   conductInterview,
+  createPrompter,
   generateConfig,
   interpretYesNo,
   scriptWritesCoverage,
@@ -314,6 +316,70 @@ describe('the non-coverage test-command warning', () => {
     })
 
     expect(errors.join('\n')).not.toContain('coverage report')
+  })
+
+  // #45. The prompt LOOP, driven for real over a scripted stream -- not the parsing
+  // under it, which `interpretYesNo` already covers. This is the wiring that had no
+  // test: which question takes which default, and that a bare Enter reaches
+  // `interpretYesNo(typed) ?? defaultYes` rather than the display string. #44 shipped
+  // an inverted default past a fully unit-tested interpreter for exactly that reason.
+  //
+  // It could not have been written before the fix. Driving the old per-question
+  // interfaces over a pipe HUNG after the second prompt -- node reporting "Detected
+  // unsettled top-level await" -- which is also what CI got, with no diagnostic.
+  describe('the interview loop, over a non-tty stream', () => {
+    const drive = async (lines: string[]) => {
+      const stream = Readable.from([lines.map((l) => `${l}\n`).join('')])
+      const prompter = createPrompter(stream)
+      return conductInterview(
+        ANALYSIS,
+        SUGGESTION,
+        { yes: false, noDocker: true, verbose: false },
+        prompter
+      )
+    }
+
+    it('reads each answer in order', async () => {
+      // noDocker skips the SonarQube question, so three remain.
+      await expect(drive(['75', 'ci:cov', 'y'])).resolves.toMatchObject({
+        coverageTarget: 75,
+        testCommand: 'ci:cov',
+        strictMode: true,
+      })
+    })
+
+    // The #44 property, end to end at last: a bare Enter must take the default the
+    // prompt PRINTED. `[y/N]` printed for strict mode, so Enter is no.
+    it('takes the printed default on a bare Enter', async () => {
+      await expect(drive(['', '', ''])).resolves.toMatchObject({
+        coverageTarget: SUGGESTION.coverageTarget,
+        testCommand: ANALYSIS.testCommand,
+        strictMode: false,
+      })
+    })
+
+    // Not a hang, and not a config assembled from questions nobody answered. The
+    // second is the more important half: filling the rest in from defaults would be
+    // the same defect as `[y/N]` answering yes -- a value the adopter never gave,
+    // written into the ruleset the gate will enforce from then on.
+    it('reports input that ends mid-interview instead of inventing the rest', async () => {
+      await expect(drive(['75'])).rejects.toThrow(/Input ended before the interview/)
+    })
+  })
+
+  // The other half of #45: a caller with no tty and no injected prompter is told what
+  // to run, rather than prompted into a void. Asserted on the message because "-y" is
+  // the entire actionable content of it.
+  it('refuses to interview a non-tty stdin and names the flag that works', async () => {
+    const isTTY = process.stdin.isTTY
+    try {
+      Object.defineProperty(process.stdin, 'isTTY', { value: false, configurable: true })
+      await expect(
+        conductInterview(ANALYSIS, SUGGESTION, { yes: false, noDocker: true, verbose: false })
+      ).rejects.toThrow(/not a tty.*-y/s)
+    } finally {
+      Object.defineProperty(process.stdin, 'isTTY', { value: isTTY, configurable: true })
+    }
   })
 
   it('explains the pick when a later-named script won on coverage', async () => {

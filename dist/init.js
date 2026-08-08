@@ -283,31 +283,92 @@ Respond with ONLY a JSON object (no markdown, no explanation outside JSON):
         recommendSonarQube: analysis.hasDocker && analysis.estimatedSloc > 500,
     };
 }
-// =============================================================================
-// Interactive Interview
-// =============================================================================
 /**
- * Reads one line, returning EXACTLY what the user typed -- '' for a bare Enter.
+ * ONE readline interface for the whole interview, and why that is the fix.
  *
- * Separate from the default-substituting `askQuestion` below because conflating the
- * two is what inverted every yes/no prompt: `askQuestion` returns the DISPLAY string
- * when the input is empty, and for a no-default prompt that display string is
- * `'y/N'`, which starts with `y`.
+ * A fresh `readline.Interface` per question is fine on a tty, where each one takes
+ * over cleanly. On any other stdin it is not: the first interface buffers or consumes
+ * what is left of the stream, and the next one is handed a stream that has already
+ * ended, so its `rl.question` callback never fires. OBSERVED driving the interview
+ * with `printf '\n\n\n\n' | node ...`: the first two prompts printed and consumed
+ * input, then the process HUNG -- node reporting "Detected unsettled top-level await"
+ * -- with no diagnostic and no fallback to defaults. A hang is the worst failure mode
+ * to debug remotely, and CI is where it happens.
+ *
+ * End-of-input is answered rather than waited on. A caller that closes stdin mid
+ * interview has stopped answering, and the honest response is to say so and stop --
+ * NOT to fill the remaining questions with defaults, which would write a
+ * configuration from questions nobody answered. That is the same shape as the
+ * `[y/N]`-answers-yes defect: a value the user never supplied, presented as theirs.
  */
-async function promptForLine(prompt) {
-    const rl = readline.createInterface({
-        input: process.stdin,
-        output: process.stderr,
+export function createPrompter(input) {
+    const rl = readline.createInterface({ input, output: process.stderr });
+    // Lines are QUEUED as they arrive rather than claimed one `rl.question` at a time,
+    // and that is the second half of the fix. MEASURED with three answers piped into
+    // three questions: readline drains a non-tty stream as fast as it is delivered, so
+    // it had emitted every `line` event before question two was even asked -- the
+    // unclaimed ones were dropped on the floor and the interview then waited for input
+    // that had already gone past. Serving from a queue makes arrival order the only
+    // thing that matters, which is true on a tty as well, where lines arrive one at a
+    // time and the queue is simply always empty.
+    const queued = [];
+    let waiting;
+    let ended = false;
+    rl.on('line', (line) => {
+        if (waiting) {
+            const resolve = waiting;
+            waiting = undefined;
+            resolve(line);
+        }
+        else {
+            queued.push(line);
+        }
     });
-    return new Promise((resolve) => {
-        rl.question(prompt, (answer) => {
+    const pendingRejects = [];
+    rl.on('close', () => {
+        ended = true;
+        waiting = undefined;
+        for (const reject of pendingRejects.splice(0))
+            reject(new Error(INPUT_ENDED));
+    });
+    // Through the interface while it is open, so a tty gets its line editing and echo;
+    // straight to stderr once it is closed, because `rl.prompt` throws
+    // ERR_USE_AFTER_CLOSE and a question still being answered from the queue should
+    // still appear in the transcript.
+    const showPrompt = (prompt) => {
+        if (ended) {
+            process.stderr.write(prompt);
+            return;
+        }
+        rl.setPrompt(prompt);
+        rl.prompt();
+    };
+    return {
+        ask(prompt) {
+            showPrompt(prompt);
+            // Queued input is served even after close. A stream that delivered every answer
+            // and then ended has answered the interview; rejecting on `ended` alone would
+            // fail a caller that did everything right -- and `Readable.from` on a small
+            // string closes the interface before the first question is even asked.
+            const buffered = queued.shift();
+            if (buffered !== undefined)
+                return Promise.resolve(buffered.trim());
+            if (ended)
+                return Promise.reject(new Error(INPUT_ENDED));
+            return new Promise((resolve, reject) => {
+                waiting = (line) => resolve(line.trim());
+                pendingRejects.push(reject);
+            });
+        },
+        close() {
             rl.close();
-            resolve(answer.trim());
-        });
-    });
+        },
+    };
 }
-async function askQuestion(question, defaultAnswer) {
-    const typed = await promptForLine(`${question} [${defaultAnswer}]: `);
+const INPUT_ENDED = 'Input ended before the interview finished. Re-run with -y to accept every ' +
+    'default without being asked, rather than having some of them answered for you.';
+async function askQuestion(prompter, question, defaultAnswer) {
+    const typed = await prompter.ask(`${question} [${defaultAnswer}]: `);
     return typed || defaultAnswer;
 }
 /**
@@ -360,8 +421,8 @@ const NO_ANSWERS = new Set(['n', 'no']);
  * default is printed on the same line, so falling back to it is the answer the user
  * can already see, rather than a guess at what they meant.
  */
-async function askYesNo(question, defaultYes) {
-    const typed = await promptForLine(`${question} [${defaultYes ? 'Y/n' : 'y/N'}]: `);
+async function askYesNo(prompter, question, defaultYes) {
+    const typed = await prompter.ask(`${question} [${defaultYes ? 'Y/n' : 'y/N'}]: `);
     return interpretYesNo(typed) ?? defaultYes;
 }
 /**
@@ -404,7 +465,31 @@ export function reportTestCommandChoice(analysis) {
             'be generated. Add e.g. "test:coverage": "vitest run --coverage" and re-run init.');
     }
 }
-export async function conductInterview(analysis, suggestion, options) {
+/**
+ * Refuses to interview a caller that cannot answer, instead of prompting into a void.
+ *
+ * `isTTY` is the right predicate here even though it is a coarse one, because the
+ * question being asked is exactly "is there a human at the other end of this stream".
+ * A pipe or a redirect answers no, and the two things that can follow are: prompt
+ * anyway and hope (which is what hung), or say what to run instead.
+ *
+ * It points at `-y` rather than silently BEHAVING like `-y`. Those differ in the one
+ * way that matters -- `-y` is the adopter choosing the defaults, and this would be the
+ * tool choosing them and attributing the choice to the adopter. `init` writes a
+ * ruleset that decides what the gate enforces from then on; a config nobody agreed to
+ * is worth less than an error message.
+ */
+function refuseNonInteractiveInterview() {
+    throw new Error('init needs an interactive terminal for its interview, and stdin is not a tty. ' +
+        'Re-run with -y to accept every suggested default without being asked ' +
+        '(this is the CI path), or run init from a terminal to answer the questions.');
+}
+export async function conductInterview(analysis, suggestion, options, 
+// Injectable so the prompt LOOP is testable, not just the parsing under it. Without
+// this the wiring -- which question takes which default, and that four questions are
+// asked in order -- was covered by typechecking and reading only, which is how #44's
+// inverted default reached a release with `interpretYesNo` fully unit-tested.
+prompter) {
     reportTestCommandChoice(analysis);
     if (options.yes) {
         // Accept all defaults
@@ -415,16 +500,28 @@ export async function conductInterview(analysis, suggestion, options) {
             strictMode: false,
         };
     }
+    if (!prompter && !process.stdin.isTTY) {
+        refuseNonInteractiveInterview();
+    }
     console.error('\n--- Quality Gate Configuration ---\n');
     console.error(`LLM Analysis: ${suggestion.rationale}\n`);
-    const useSonarQube = options.noDocker
-        ? false
-        : await askYesNo(`Use SonarQube for deep analysis? (requires Docker)`, suggestion.recommendSonarQube && analysis.hasDocker);
-    const coverageInput = await askQuestion(`Target branch coverage percentage`, String(suggestion.coverageTarget));
-    const coverageTarget = parseInt(coverageInput, 10) || suggestion.coverageTarget;
-    const testCommand = await askQuestion(`Test command (npm script name)`, analysis.testCommand || 'test');
-    const strictMode = await askYesNo(`Enable strict mode? (zero tolerance for type/lint errors)`, false);
-    return { useSonarQube, coverageTarget, testCommand, strictMode };
+    const session = prompter ?? createPrompter(process.stdin);
+    try {
+        const useSonarQube = options.noDocker
+            ? false
+            : await askYesNo(session, `Use SonarQube for deep analysis? (requires Docker)`, suggestion.recommendSonarQube && analysis.hasDocker);
+        const coverageInput = await askQuestion(session, `Target branch coverage percentage`, String(suggestion.coverageTarget));
+        const coverageTarget = parseInt(coverageInput, 10) || suggestion.coverageTarget;
+        const testCommand = await askQuestion(session, `Test command (npm script name)`, analysis.testCommand || 'test');
+        const strictMode = await askYesNo(session, `Enable strict mode? (zero tolerance for type/lint errors)`, false);
+        return { useSonarQube, coverageTarget, testCommand, strictMode };
+    }
+    finally {
+        // In a `finally` because the interface holds the process open. An interview that
+        // threw would otherwise hang on exit -- the same symptom as the bug being fixed,
+        // reached from the error path.
+        session.close();
+    }
 }
 /** The four dimensions an istanbul `total` reports, in report order. */
 const COVERAGE_DIMENSIONS = ['statements', 'branches', 'functions', 'lines'];

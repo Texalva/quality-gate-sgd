@@ -66,6 +66,19 @@ export function createAgentHarness(options) {
             const extracted = await extractLocatedIssues({
                 coverageDir: metricsProvider.getProjectRoot(),
             });
+            // An experiment that ranked no targets because nothing could be READ is not the
+            // same result as one that ranked none because the code is clean, and downstream
+            // both become `getSuggestion() -> null`. Said out loud rather than gated on,
+            // because an experiment run is a measurement of the EXPERIMENT and refusing to
+            // proceed would discard the run; what it must not do is record the null as a
+            // clean sweep.
+            if (extracted.measurementFailures.length > 0) {
+                console.error(`[harness] ${extracted.measurementFailures.length} issue source(s) could not ` +
+                    'be read, so the target list below is incomplete: ' +
+                    extracted.measurementFailures
+                        .map((f) => `${f.dimension} (${f.kind})`)
+                        .join(', '));
+            }
             // Combine all issues into a single array
             const allIssues = [
                 ...extracted.coverage,

@@ -17,10 +17,11 @@ import type {
 } from './types.js';
 import { mapLocationToSymbol } from '../symbols/mapper.js';
 import type { SymbolTable, CodeSymbol } from '../symbols/types.js';
+import type { MeasurementFailure } from '../providers/types.js';
 import { eslintLintProvider } from '../providers/eslint.js';
 import { typescriptTypecheckProvider } from '../providers/typescript.js';
 import { createIstanbulCoverageProvider } from '../providers/coverage.js';
-import { DEFAULT_MEASUREMENT_LIMITS } from '../providers/result.js';
+import { DEFAULT_MEASUREMENT_LIMITS, measurementFailure } from '../providers/result.js';
 
 /**
  * See the identical constant in ../metrics.ts. spawnSync's 1 MiB default
@@ -28,6 +29,19 @@ import { DEFAULT_MEASUREMENT_LIMITS } from '../providers/result.js';
  * then report zero issues instead of failing, so a noisy codebase looks clean.
  */
 const SUBPROCESS_MAX_BUFFER = 64 * 1024 * 1024;
+
+/**
+ * Findings, plus the reason there might be none.
+ *
+ * Each `read*Issues` below returns this and each `extract*Issues` unwraps it to the
+ * bare array. Two functions rather than one changed signature because the bare array
+ * is the shape every existing caller and test already asks for, and widening the
+ * contract everywhere to reach one new consumer is churn that hides the change.
+ */
+interface IssueReading {
+  issues: LocatedIssue[];
+  failures: MeasurementFailure[];
+}
 
 // =============================================================================
 // Coverage Issue Extraction
@@ -47,6 +61,10 @@ const SUBPROCESS_MAX_BUFFER = 64 * 1024 * 1024;
  * directory still comes from config.
  */
 export function extractCoverageIssues(coverageDir?: string): LocatedIssue[] {
+  return readCoverageIssues(coverageDir).issues;
+}
+
+function readCoverageIssues(coverageDir?: string): IssueReading {
   const config = getConfig();
 
   const reading = createIstanbulCoverageProvider({
@@ -65,7 +83,7 @@ export function extractCoverageIssues(coverageDir?: string): LocatedIssue[] {
     console.error(
       `Warning: Could not parse coverage reports: ${reading.error.message}`
     );
-    return [];
+    return { issues: [], failures: [reading.error] };
   }
 
   // The warning belongs HERE, not in the provider: this is the layer that
@@ -84,20 +102,44 @@ export function extractCoverageIssues(coverageDir?: string): LocatedIssue[] {
   // function's point of view they cost the same thing: a report that parsed but
   // is not the shape findings come from yields none, exactly as an unparseable
   // one does.
+  // The provider's own `failures` are the SUMMARY-level ones, which the gate already
+  // grades on. What this loop adds is the detail reports: `coverage-final.json` is
+  // where the line-level findings come from, and the provider deliberately does not
+  // promote a broken one to a gate failure because the verdict's numbers come from
+  // the summary and stay sound. For fix ADVICE the cost is the whole point -- those
+  // findings are exactly what is missing -- so they become failures here, on the
+  // channel that carries advice.
+  const failures: MeasurementFailure[] = [...reading.value.failures];
+
   for (const read of reading.value.reads) {
     const unreadable = read.attempt.outcome !== 'read' && read.attempt.outcome !== 'absent';
     if (!unreadable && read.shape === 'expected') continue;
     const reason = unreadable ? read.attempt.outcome : 'not a coverage report';
     console.error(`Warning: Could not parse ${read.attempt.path}: ${reason}`);
+
+    // Only the detail reports. A summary in the same state is already in
+    // `reading.value.failures` above, and listing it twice would have the CLI
+    // report one broken file as two broken dimensions.
+    if (read.kind !== 'final') continue;
+
+    failures.push(
+      measurementFailure(
+        'unparseable-output',
+        read.suite,
+        `${read.attempt.path} could not be read for findings (${reason}), so the ` +
+          `located issues for ${read.suite} are incomplete. The gate's coverage ` +
+          'numbers are unaffected -- they come from the summary report.',
+        {
+          via: 'report',
+          command: `read ${read.attempt.path}`,
+          elapsedMs: 0,
+          attempts: [read.attempt],
+        }
+      )
+    );
   }
 
-  // Still [] when a report was unreadable, and still wrong for the same reason
-  // extractTypescriptIssues is: fix advice that says "nothing to fix" when it
-  // should say "could not look". The GATE VERDICT is safe -- extractAllMetrics
-  // carries the coverage MeasurementFailure through to evaluateRules -- so what
-  // survives here is degraded advice, not a vacuous pass. Closing it means
-  // giving ExtractedIssues a failure channel of its own.
-  return [...reading.value.issues];
+  return { issues: [...reading.value.issues], failures };
 }
 
 // =============================================================================
@@ -111,6 +153,10 @@ export function extractCoverageIssues(coverageDir?: string): LocatedIssue[] {
  * lives in src/providers/typescript.ts, unchanged.
  */
 export function extractTypescriptIssues(): LocatedIssue[] {
+  return readTypescriptIssues().issues;
+}
+
+function readTypescriptIssues(): IssueReading {
   const config = getConfig();
 
   const reading = typescriptTypecheckProvider.measure({
@@ -121,15 +167,47 @@ export function extractTypescriptIssues(): LocatedIssue[] {
     typecheckScript: config.typecheckScript,
   });
 
-  // Still [] on failure, and still wrong for the same reason: a type-check that
-  // never ran is indistinguishable here from a project with no type errors.
-  //
-  // Not fixed in this pass, deliberately. The GATE VERDICT reads metrics, not
-  // issues, and extractAllMetrics now carries the MeasurementFailure through to
-  // evaluateRules -- so the vacuous PASS is closed. What survives is that the
-  // fix ADVICE says "nothing to fix" when it should say "could not look".
-  // Closing that means giving ExtractedIssues a failure channel of its own.
-  return reading.ok ? [...reading.value.issues] : [];
+  // The empty list is still returned -- there are no findings to report -- but it no
+  // longer travels alone. A type-check that never ran and a project with no type
+  // errors are the same `[]` here, and the failure beside it is the only thing that
+  // tells them apart.
+  if (!reading.ok) return { issues: [], failures: [reading.error] };
+
+  const issues = [...reading.value.issues];
+
+  // A SUCCESSFUL reading can still be short on findings, and the provider says so on
+  // purpose: the error TOTAL is `max(strictly parsed, loose 'error TSnnnn' matches)`
+  // because tsc emits global diagnostics with no file:line prefix (TS18003 "No inputs
+  // were found" is one), and `--pretty` puts the location on its own line in a shape
+  // the located regex cannot read. Those are real errors the issue list cannot
+  // represent -- `metrics.errors === 1` with `issues.length === 0` is a tested,
+  // intended combination -- and fix advice that reports only the list would say zero
+  // TypeScript errors while the gate counts one. The count is not wrong and the list
+  // is not wrong; what was wrong was letting the advice channel see only the list.
+  const unlocated = reading.value.metrics.errors - issues.length;
+  if (unlocated > 0) {
+    return {
+      issues,
+      failures: [
+        measurementFailure(
+          'unparseable-output',
+          'typescript',
+          `${unlocated} of ${reading.value.metrics.errors} type error(s) carry no ` +
+            'file and line, so they cannot be ranked as targets. Global diagnostics ' +
+            '(TS18003 and friends) and --pretty output both do this. Run the ' +
+            'typecheck script directly to see them.',
+          {
+            via: 'report',
+            command: 'typecheck output had diagnostics with no location',
+            elapsedMs: 0,
+            attempts: [],
+          }
+        ),
+      ],
+    };
+  }
+
+  return { issues, failures: [] };
 }
 
 // =============================================================================
@@ -143,6 +221,10 @@ export function extractTypescriptIssues(): LocatedIssue[] {
  * lives in src/providers/eslint.ts, unchanged.
  */
 export function extractEslintIssues(): LocatedIssue[] {
+  return readEslintIssues().issues;
+}
+
+function readEslintIssues(): IssueReading {
   const config = getConfig();
 
   const reading = eslintLintProvider.measure({
@@ -153,9 +235,10 @@ export function extractEslintIssues(): LocatedIssue[] {
     typecheckScript: config.typecheckScript,
   });
 
-  // See extractTypescriptIssues: advisory-only, so still [] on failure while
-  // the gate verdict is protected through extractAllMetrics.
-  return reading.ok ? [...reading.value.issues] : [];
+  // See readTypescriptIssues.
+  return reading.ok
+    ? { issues: [...reading.value.issues], failures: [] }
+    : { issues: [], failures: [reading.error] };
 }
 
 // =============================================================================
@@ -375,10 +458,22 @@ function enrichIssuesWithSymbols(
 export function extractLocatedIssues(
   options: ExtractLocatedIssuesOptions = {}
 ): ExtractedIssues {
-  const coverage = extractCoverageIssues(options.coverageDir);
-  const typescript = options.skipTypescript ? [] : extractTypescriptIssues();
-  const eslint = options.skipEslint ? [] : extractEslintIssues();
+  const empty: IssueReading = { issues: [], failures: [] };
+
+  const coverageReading = readCoverageIssues(options.coverageDir);
+  const typescriptReading = options.skipTypescript ? empty : readTypescriptIssues();
+  const eslintReading = options.skipEslint ? empty : readEslintIssues();
+
+  // sonarqube has no failure channel at all -- `extractSonarqubeIssues` returns []
+  // from a bare catch, exactly as `extractSonarqubeMetrics` returns undefined. That
+  // is #23/#42 and it is not closed here: this step gives the CHANNEL somewhere to
+  // arrive, and sonarqube still has nothing to put on it. A skipped dimension is
+  // deliberately not a failure either -- `--coverage-only` asked for it.
   const sonarqube = options.skipSonarQube ? [] : extractSonarqubeIssues();
+
+  const coverage = coverageReading.issues;
+  const typescript = typescriptReading.issues;
+  const eslint = eslintReading.issues;
 
   // Enrich issues with symbol information if symbol table provided
   if (options.symbolTable) {
@@ -400,5 +495,10 @@ export function extractLocatedIssues(
       eslint: eslint.length,
       sonarqube: sonarqube.length,
     },
+    measurementFailures: [
+      ...coverageReading.failures,
+      ...typescriptReading.failures,
+      ...eslintReading.failures,
+    ],
   };
 }

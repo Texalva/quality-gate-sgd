@@ -73,6 +73,7 @@ import {
   formatSymbolIssuesList,
   formatSymbolIssuesForJson,
   type TargetGranularity,
+  type ExtractedIssues,
 } from './targets/index.js';
 import {
   extractSymbols,
@@ -117,6 +118,28 @@ function formatFailures(
   failures: Array<{ type: string; rule: string; message: string }>
 ): string {
   return failures.map((f) => `  - [${f.type}] ${f.message}`).join('\n');
+}
+
+/**
+ * Names the sources whose findings are missing, next to the counts of the ones that
+ * are not.
+ *
+ * Printed right under the per-source summary, because that summary is where the wrong
+ * conclusion gets drawn: `TypeScript: 0 errors` reads as a clean dimension whether the
+ * type-checker found nothing or never ran. `suggest` and `list-issues` exist to answer
+ * "what should I fix next", and the honest answer for an unreadable dimension is "I
+ * could not look", not silence.
+ */
+function formatUnreadableSources(extracted: ExtractedIssues): string {
+  if (extracted.measurementFailures.length === 0) return '';
+
+  return (
+    `\n${extracted.measurementFailures.length} source(s) could not be read, so the ` +
+    'counts above are not the whole picture:\n' +
+    extracted.measurementFailures
+      .map((f) => `  ${f.dimension} (${f.kind}): ${f.message}`)
+      .join('\n')
+  );
 }
 
 function formatSonarIssues(issues: SonarIssue[]): string {
@@ -914,7 +937,15 @@ async function runSuggest(args: string[]): Promise<void> {
     log(`Current Fitness: ${formatFitnessScore(currentScore)}\n`);
 
     if (suggestions.length === 0) {
-      log('No suggestions - all dimensions are optimal!');
+      // "Optimal" is a claim about every dimension, and `unmeasured` is the list of
+      // dimensions nobody looked at. Making the claim anyway is the same vacuous
+      // advice the failure channel exists to prevent, one layer up from the gate.
+      log(
+        unmeasured && unmeasured.length > 0
+          ? 'No suggestions from the dimensions that were measured. This is NOT a clean ' +
+              'bill of health -- the unmeasured dimensions above are not ranked here.'
+          : 'No suggestions - all dimensions are optimal!'
+      );
       return;
     }
 
@@ -970,8 +1001,9 @@ async function runSuggest(args: string[]): Promise<void> {
       log(`  Coverage: ${extractedIssues.summary.coverage} uncovered branches/functions`);
       log(`  TypeScript: ${extractedIssues.summary.typescript} errors`);
       log(`  ESLint: ${extractedIssues.summary.eslint} issues`);
-      log(`  SonarQube: ${extractedIssues.summary.sonarqube} issues\n`);
-      log(`${formatAddressFitness(addressFitness)}\n`);
+      log(`  SonarQube: ${extractedIssues.summary.sonarqube} issues`);
+      log(formatUnreadableSources(extractedIssues));
+      log(`\n${formatAddressFitness(addressFitness)}\n`);
     }
 
     // Aggregate to unified symbol representation
@@ -998,6 +1030,11 @@ async function runSuggest(args: string[]): Promise<void> {
         mode: 'unified-symbols',
         currentScore,
         unmeasured,
+        // Distinct from `unmeasured`, which describes the METRICS reading. This is
+        // about the FINDINGS: a source can yield numbers and no locations (a summary
+        // that parsed while the detail report did not), and a machine consumer
+        // ranking these targets needs to know its list is short for that reason.
+        unreadableSources: extractedIssues.measurementFailures,
         fixabilityEstimated: estimateFixability,
         addressFitness,
         ...formatSymbolIssuesForJson(symbolIssues),
@@ -1008,7 +1045,12 @@ async function runSuggest(args: string[]): Promise<void> {
     log(`Current Fitness: ${formatFitnessScore(currentScore)}\n`);
 
     if (symbolIssues.length === 0) {
-      log('No symbols with issues found. All code is optimal!');
+      log(
+        extractedIssues.measurementFailures.length > 0
+          ? 'No symbols with issues found among the sources that could be read. This is ' +
+              'NOT a clean bill of health -- see the unreadable sources above.'
+          : 'No symbols with issues found. All code is optimal!'
+      );
       return;
     }
 
@@ -1035,7 +1077,9 @@ async function runSuggest(args: string[]): Promise<void> {
     log(`  Coverage: ${extractedIssues.summary.coverage} uncovered branches/functions`);
     log(`  TypeScript: ${extractedIssues.summary.typescript} errors`);
     log(`  ESLint: ${extractedIssues.summary.eslint} issues`);
-    log(`  SonarQube: ${extractedIssues.summary.sonarqube} issues\n`);
+    log(`  SonarQube: ${extractedIssues.summary.sonarqube} issues`);
+    log(formatUnreadableSources(extractedIssues));
+    log('');
   }
 
   // Aggregate to optimization targets
@@ -1050,6 +1094,7 @@ async function runSuggest(args: string[]): Promise<void> {
       mode: granularity,
       currentScore,
       unmeasured,
+      unreadableSources: extractedIssues.measurementFailures,
       ...formatTargetsForJson(targets),
     }, null, 2));
     return;
@@ -1058,7 +1103,12 @@ async function runSuggest(args: string[]): Promise<void> {
   log(`Current Fitness: ${formatFitnessScore(currentScore)}\n`);
 
   if (targets.length === 0) {
-    log('No optimization targets found. All metrics are optimal!');
+    log(
+      extractedIssues.measurementFailures.length > 0
+        ? 'No optimization targets found among the sources that could be read. This is ' +
+            'NOT a clean bill of health -- see the unreadable sources above.'
+        : 'No optimization targets found. All metrics are optimal!'
+    );
     return;
   }
 

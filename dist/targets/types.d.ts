@@ -173,6 +173,22 @@ export interface ExtractedIssues {
         eslint: number;
         sonarqube: number;
     };
+    /**
+     * Sources that could not be read, so an empty list is not read as "nothing to fix".
+     *
+     * The counts above cannot express the difference. A type-check that crashed and a
+     * project with no type errors both arrive here as `typescript: []`, and every
+     * consumer -- `suggest`, the target ranking, the MCP fix-advice tool -- then reports
+     * a clean dimension. That is not a vacuous gate PASS: the VERDICT reads
+     * `Metrics`, and `extractAllMetrics` carries the same failures through to
+     * `evaluateRules`, which is why this was left for last. It is a vacuous piece of
+     * ADVICE, which is its own cost -- an adopter told there is nothing to fix in a
+     * dimension the tool could not look at.
+     *
+     * REQUIRED rather than optional, for the reason `EvaluationResult.unevaluated` is:
+     * a field that may be omitted is a field a new extraction path will omit.
+     */
+    measurementFailures: import('../providers/types.js').MeasurementFailure[];
 }
 /** Granularity for aggregating issues into targets */
 export type TargetGranularity = 'file' | 'symbol';

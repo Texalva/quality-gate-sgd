@@ -818,6 +818,76 @@ describe('extractLocatedIssues', () => {
     expect(result).toHaveProperty('totalCount')
   })
 
+  // #25. A dead type-checker and a clean project are the same `typescript: []` here,
+  // and every consumer -- `suggest`, the target ranking, the MCP fix-advice tool --
+  // reported the second when it had the first. Not a vacuous gate PASS (the verdict
+  // reads Metrics, and extractAllMetrics carries the same failure to evaluateRules),
+  // but vacuous ADVICE: "nothing to fix" for a dimension nobody could look at.
+  //
+  // The pair matters. Asserting only the failure is satisfiable by reporting one
+  // always, which would make every clean run look broken and train adopters to ignore
+  // the channel -- the exact cost that kept measurement failures rule-scoped.
+  it('reports a source it could not read, and stays quiet when it could', async () => {
+    const { spawnSync } = await import('child_process')
+
+    vi.mocked(fs.existsSync).mockReturnValue(false)
+
+    const typecheck = (result: Partial<ReturnType<typeof spawnSync>>) => {
+      vi.mocked(spawnSync).mockImplementation((cmd, args) => {
+        const base = { pid: 123, signal: null, output: [], stderr: '' }
+        if (String(args).includes('type-check')) {
+          return { status: 0, stdout: '', ...base, ...result } as ReturnType<typeof spawnSync>
+        }
+        return { status: 0, stdout: '[]', ...base } as ReturnType<typeof spawnSync>
+      })
+    }
+
+    // ENOENT from the spawn itself: the type-checker did not run at all.
+    typecheck({ error: Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT' }) })
+    const broken = extractLocatedIssues({ skipSonarQube: true })
+
+    expect(broken.typescript).toEqual([])
+    expect(broken.measurementFailures.map((f) => f.dimension)).toContain('typescript')
+
+    // The control: the same empty findings from a type-checker that ran and found
+    // nothing must carry no failure.
+    typecheck({ status: 0, stdout: '' })
+    const clean = extractLocatedIssues({ skipSonarQube: true })
+
+    expect(clean.typescript).toEqual([])
+    expect(clean.measurementFailures.map((f) => f.dimension)).not.toContain('typescript')
+  })
+
+  // Found by adversarial review. A SUCCESSFUL typecheck reading can still be short on
+  // findings: the provider takes the error TOTAL as `max(strictly parsed, loose
+  // 'error TSnnnn' matches)` because tsc emits global diagnostics with no file:line
+  // prefix, so `metrics.errors === 1` with `issues.length === 0` is a tested, intended
+  // combination. Treating every `ok` reading as complete meant the advice channel
+  // reported zero TypeScript errors while the gate counted one.
+  it('reports type errors that carry no location, on an otherwise successful reading', async () => {
+    const { spawnSync } = await import('child_process')
+
+    vi.mocked(fs.existsSync).mockReturnValue(false)
+    vi.mocked(spawnSync).mockImplementation((cmd, args) => {
+      const base = { pid: 123, signal: null, output: [], stderr: '' }
+      if (String(args).includes('type-check')) {
+        // TS18003 has no file and no line, so no LocatedIssue can be built from it.
+        return {
+          status: 2,
+          stdout: "error TS18003: No inputs were found in config file 'tsconfig.json'.",
+          ...base,
+        } as ReturnType<typeof spawnSync>
+      }
+      return { status: 0, stdout: '[]', ...base } as ReturnType<typeof spawnSync>
+    })
+
+    const result = extractLocatedIssues({ skipSonarQube: true })
+
+    expect(result.typescript).toEqual([])
+    const failure = result.measurementFailures.find((f) => f.dimension === 'typescript')
+    expect(failure?.message).toMatch(/carry no file and line/)
+  })
+
   it('respects skipSonarQube option', async () => {
     const { spawnSync, execSync } = await import('child_process')
 

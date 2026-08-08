@@ -240,6 +240,14 @@ export async function handleSuggest(args) {
                 eslint: extractedIssues.summary.eslint,
                 sonarqube: extractedIssues.summary.sonarqube,
             },
+            // The counts above cannot say "0 because there are none" apart from "0 because
+            // the source would not read". An agent handed the first reading of the second
+            // marks a dimension done and moves on.
+            unreadableSources: extractedIssues.measurementFailures.map(f => ({
+                dimension: f.dimension,
+                kind: f.kind,
+                message: f.message,
+            })),
             ...formatTargetsForJson(targets),
         };
         return {

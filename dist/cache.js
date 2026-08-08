@@ -496,7 +496,16 @@ function usableBaseline(entry) {
     // same field. `isCacheValid` asks "may this entry be served as a verdict"; this asks
     // "are these numbers comparable to the ones I just took". For `monotonicEvaluated`
     // those questions have different answers -- an unevaluated entry is still an honest
-    // reading of its commit, so it makes a fine baseline. For the package manager they
+    // reading of its commit, so it makes a fine baseline.
+    //
+    // "An honest reading of its commit" holds for every dimension EXCEPT an unbound
+    // sonarqube one, and that exception is handled per-metric in `evaluateMonotonic`
+    // (reason `baseline-unbound`) rather than here: an entry whose sonarqube provenance was
+    // never confirmed is still an honest reading of its typescript, eslint and coverage,
+    // and refusing the whole entry would deadlock every commit on a server that can never
+    // confirm one. See that check for the two-commit laundering path it closes.
+    //
+    // For the package manager the two questions
     // have the SAME answer, because numbers from two toolchains cannot be differenced:
     //
     //   parent measured under npm: typescript.errors = 10

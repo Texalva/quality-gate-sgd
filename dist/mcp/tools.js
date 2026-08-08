@@ -100,9 +100,18 @@ export async function handleRun(args) {
         const requiredScripts = rules.rules.requiredScripts || ['quality'];
         // Async variant: it is the only one that loads custom dimensions, and this
         // handler produces a gate verdict. See extractAllMetricsAsync.
+        //
+        // `not-scanned`, and that is a pre-existing hole this change makes VISIBLE rather
+        // than closes: this handler produces a verdict without ever calling
+        // `runSonarqubeScan`, so its sonarqube numbers are whatever the server currently
+        // holds -- an analysis of unknown vintage, possibly of a different commit -- and the
+        // response now carries an `unbound-provenance` entry in `unevaluatedRules` saying so
+        // whenever a rule grades sonarqube. Making MCP scan is a separate decision; what
+        // changes here is that the response stops looking complete.
         const metrics = await extractAllMetricsAsync({
             scriptsToRun: requiredScripts,
             skipSonarQube,
+            submittedAnalysis: { kind: 'not-scanned' },
         });
         const cache = loadCache();
         const { isWIP } = getCacheKey();
@@ -157,6 +166,7 @@ export async function handleScore(args) {
         const metrics = await extractAllMetricsAsync({
             scriptsToRun: requiredScripts,
             skipSonarQube,
+            submittedAnalysis: { kind: 'not-scanned' },
         });
         const score = computeFitness(metrics);
         const gradient = computeGradient(metrics);
@@ -195,6 +205,7 @@ export async function handleSuggest(args) {
         const metrics = await extractAllMetricsAsync({
             scriptsToRun: requiredScripts,
             skipSonarQube,
+            submittedAnalysis: { kind: 'not-scanned' },
         });
         const currentScore = computeFitness(metrics);
         const unmeasured = describeUnmeasured(metrics);

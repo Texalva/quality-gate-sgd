@@ -29,6 +29,7 @@ export type {
   TypescriptMetrics,
   EslintMetrics,
   SonarqubeMetrics,
+  SonarqubeAnalysisProvenance,
   BundleMetrics,
 
   // Root-cause analysis types
@@ -105,6 +106,13 @@ export {
   type SonarqubeReading,
   isSonarqubeAvailable,
   runSonarqubeScan,
+  // Not tidiness: `declaration: true` means tsc has to be able to NAME
+  // `runSonarqubeScan`'s return type and `readSonarqubeMetrics`'s parameter in the
+  // emitted .d.ts, and an external caller threading a scan into an extraction needs
+  // both.
+  type SonarqubeScanOutcome,
+  type SubmittedAnalysis,
+  type SubmittedAnalysisFromScan,
   getTopSonarIssues,
   type SonarIssue,
 

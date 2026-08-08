@@ -8,6 +8,10 @@ import * as path from 'path';
 import { getConfig, redactUrlCredentials, sonarAuthArgs } from './config.js';
 import { extractAllCustomMetrics, registerCustomDimensions, } from './dimensions/index.js';
 import { manifestDefinesScript, scriptCommand } from './runner.js';
+// The commit being graded, for the revision half of the provenance check. cache.ts
+// imports rules.ts, config.ts, runner.ts and measurement-inputs.ts and none of those
+// imports this module, so this edge adds no cycle.
+import { getCurrentCommitHash } from './cache.js';
 import { eslintLintProvider } from './providers/eslint.js';
 import { typescriptTypecheckProvider } from './providers/typescript.js';
 import { DEFAULT_MEASUREMENT_LIMITS, measurementFailure } from './providers/result.js';
@@ -250,6 +254,17 @@ function sonarEvidence(pathAndQuery, response) {
         stderrBytes: 0,
     };
 }
+/**
+ * The reading a run told not to measure sonarqube has: no metrics, no failure, and no
+ * provenance.
+ *
+ * Named rather than written `{} as SonarqubeReading` at the call site, which is what
+ * stood there: the cast asserted a shape instead of describing one, and the shape it
+ * asserted now has a third field whose absence is load-bearing. No provenance is what
+ * makes `--coverage-only` produce the pre-existing `skipped-dimension` advisory rather
+ * than a provenance advisory about numbers nobody read.
+ */
+const SONARQUBE_NOT_MEASURED = {};
 export function extractSonarqubeMetrics() {
     return readSonarqubeMetrics().metrics;
 }
@@ -285,7 +300,7 @@ const SONAR_MEASURES = [
     { key: 'minor_violations', field: 'minor', required: true },
     { key: 'info_violations', field: 'info', required: true },
 ];
-export function readSonarqubeMetrics() {
+export function readSonarqubeMetrics(submitted = { kind: 'not-scanned' }) {
     const config = getConfig();
     const sonarUrl = redactUrlCredentials(config.sonarqube.url);
     const projectKey = config.sonarqube.projectKey;
@@ -379,24 +394,317 @@ export function readSonarqubeMetrics() {
     // rather than a substitution. It exists because the check that establishes that is
     // a length test on a separate array, which the type system cannot follow.
     const required = (field) => readings[field] ?? 0;
-    return {
-        metrics: {
-            bugs: required('bugs'),
-            vulnerabilities: required('vulnerabilities'),
-            codeSmells: required('codeSmells'),
-            // The two conditional measures, left absent rather than zeroed when SonarQube
-            // did not send them: a floor on either then fails as "not available" instead
-            // of reading as 0% coverage, and a project that imports no coverage report
-            // into its scan is not told its coverage is nil.
-            coverage: readings.coverage,
-            duplications: readings.duplications,
-            blocker: required('blocker'),
-            critical: required('critical'),
-            major: required('major'),
-            minor: required('minor'),
-            info: required('info'),
-        },
+    const readMetrics = {
+        bugs: required('bugs'),
+        vulnerabilities: required('vulnerabilities'),
+        codeSmells: required('codeSmells'),
+        // The two conditional measures, left absent rather than zeroed when SonarQube
+        // did not send them: a floor on either then fails as "not available" instead
+        // of reading as 0% coverage, and a project that imports no coverage report
+        // into its scan is not told its coverage is nil.
+        coverage: readings.coverage,
+        duplications: readings.duplications,
+        blocker: required('blocker'),
+        critical: required('critical'),
+        major: required('major'),
+        minor: required('minor'),
+        info: required('info'),
     };
+    // LAST, after a complete reading exists. See bindReadingToAnalysis for why the
+    // ordering is load-bearing in both directions.
+    return bindReadingToAnalysis(readMetrics, submitted);
+}
+/** How long a git sha is, so a value that is not one is not compared as if it were. */
+const GIT_SHA_PATTERN = /^[0-9a-f]{40}$/;
+/**
+ * Tie a complete sonarqube reading to the analysis this run submitted, or state why it
+ * could not be.
+ *
+ * WHAT WAS WRONG. `waitForSonarTask` reduced the CE task to a boolean and
+ * `/api/measures/component?component=<key>&metricKeys=...` has no analysis, task or
+ * revision parameter -- its only parameters are `component`, `metricKeys`, `branch` and
+ * `pullRequest` -- so it answers with the LIVE measures: whatever the most recently
+ * PROCESSED analysis of that key left in the table. A second publisher for the same
+ * project key between SUCCESS and this read replaces them and nothing in the response
+ * says which analysis it described. The gate confirmed analysis A and graded analysis B.
+ * The code path was read directly; the exploitability is unmeasured, because
+ * reproducing it needs a live server with two concurrent scanners.
+ *
+ * WHY THIS RUNS LAST, twice over. Every classification in `readSonarqubeMetrics`
+ * (unreachable / access-denied / project-404 / redirect / non-JSON / empty / partial /
+ * malformed) is individually tested and must keep firing FIRST, so none of them is
+ * pre-empted by a provenance answer -- and by the time control arrives here the host has
+ * already proved it speaks JSON, which is why an unparseable body from THIS call is
+ * treated as "cannot tell" rather than as a second refusal. Verify-AFTER is also the
+ * only sound ordering: live measures only move forward, so "the current analysis was
+ * still mine when I finished reading" implies the read got mine. Verify-BEFORE would
+ * leave a false-PASS window (publish lands between the check and the read), and a false
+ * pass is the defect this repository exists to prevent, where the ~100ms false-fail
+ * window verify-after leaves costs a retry.
+ *
+ * THE RULE THAT ASSIGNS THE THREE ANSWERS, stated once so nobody re-derives it:
+ *
+ *   server named a DIFFERENT current analysis and recognises ours -> FAIL
+ *     (`wrong-subject` on the sonarqube dimension, which fails the gate via
+ *      rule-scoped gating in evaluateMeasurements)
+ *   server REFUSED to discuss provenance: unreachable, 401/403, 3xx, 5xx -> FAIL
+ *   server ANSWERED and told us nothing usable: either 404 flavour, empty list, no
+ *     `analyses[].key`, non-JSON 200 -> UNVERIFIABLE (advisory)
+ *   never named the analysis (`unnamed`), or nothing was scanned -> UNVERIFIABLE
+ *
+ * WHY `/api/project_analyses/search` AND NOT `/api/ce/component`, whose `current`
+ * carries `analysisId` directly: `current` is the last EXECUTED task for the component
+ * INCLUDING pull requests. Observed on next.sonarqube.com: `current` was a task with
+ * `"pullRequest":"601"` while `project_analyses/search` named the main-branch analysis.
+ * The graded read passes no `branch`, so it reads the main branch -- `project_analyses`
+ * is the endpoint scoped to the same thing as the read being verified.
+ *
+ * WHY NOT `/api/measures/search_history` pinned to the analysis date, which would be an
+ * at-analysis read rather than a latest-check: it does not REPLACE this call (this is
+ * the only endpoint mapping an analysis key to its date, so it would be an addition);
+ * it is keyed to a second-granularity timestamp, so two analyses in one second are
+ * indistinguishable where an id comparison has no such limit; it requires "Browse"
+ * where `measures/component` also accepts "Execute Analysis" since 2025.2, so it would
+ * narrow the permission needed for the PRIMARY graded read and turn a failed
+ * verification into "the measures cannot be read at all"; and it expresses absence as an
+ * empty `history` array rather than a missing metric, which would force a rewrite of the
+ * completeness parse above -- the loop whose comment records the original vacuous-pass
+ * reproduction.
+ *
+ * WHY `project_status` IS A SAFE CORROBORATOR on a mismatch: it accepts Administer
+ * System OR project Administer OR Browse OR Execute Analysis (SCAN since 9.5), strictly
+ * wider than the call above, and `getSnapshotThenProject` calls
+ * `checkFoundWithOptional("Analysis with id '%s' is not found")` BEFORE `checkPermission`
+ * -- so its 404-vs-not-404 answer is truthful even for a narrow token.
+ *
+ * WHAT WAS PROBED, rather than inferred, on 2026-08-08 against SonarQube Server
+ * Community 26.6.0.123539 (sonarqube.ow2.org) and SonarQube Cloud 8.0.0.100793:
+ *
+ *   project_analyses/search?project=ASM:asm&ps=1
+ *     -> analyses[0].key = "4bf5c7a8-eb72-43cc-9c8f-bde3d1477722",
+ *        .date, .revision = "2f73cdd24936f5bdd872d6a09d0fa2d5ec7f869d" (a full git sha)
+ *   ce/component?component=ASM:asm
+ *     -> current.analysisId = "4bf5c7a8-eb72-43cc-9c8f-bde3d1477722", BYTE-IDENTICAL.
+ *        `current` is formatted by the same `TaskFormatter.formatActivity` that serves
+ *        /api/ce/task, so ce/task's analysisId and project_analyses' key are ONE
+ *        identifier space -- observed, not inferred. This is the fact the whole design
+ *        rests on.
+ *   qualitygates/project_status?analysisId=<that key>            -> HTTP 200
+ *   qualitygates/project_status?analysisId=<well-formed bogus>   -> HTTP 404
+ *        "Analysis with id '...' is not found" -- on BOTH Server and Cloud, so the
+ *        corroborator is not a Server-only parameter.
+ *   project_analyses/no_such_action -> 404 {"errors":[{"msg":"Unknown url : ..."}]}
+ *   project_analyses/search?project=<absent> -> 404 "Component key '...' not found"
+ *
+ * WHY A MISMATCH STANDS UNLESS `project_status` 404s, rather than the other way round.
+ * The inverted rule -- fail only when the probe POSITIVELY confirms our id -- was
+ * considered and rejected on the probe evidence above: the scenario it protects against
+ * is "ce/task ids are not project_analyses keys on some platform, so every run
+ * mismatches and every run fails unresolvably", and the two platforms that exist were
+ * measured to share the id space and to answer this probe. Under the inverted rule a
+ * REAL race whose probe is merely blocked (an SSO proxy in front of /api/qualitygates, a
+ * CE answering 503) becomes exit 0, which is the direction this repository does not
+ * accept. The message says what the corroborator answered, so an adopter is never told
+ * the id was recognised when it was not.
+ *
+ * WHY BOTH 404 FLAVOURS ARE ADVISORY and the body text only picks a WORD: matching the
+ * server-side English literal `Unknown url` is exactly the check that rots across
+ * versions, so a wrong guess must cost a word in a message and must never pick a
+ * verdict. The project-not-found flavour is not a contradiction even though the measures
+ * read for the same key just succeeded: `project_analyses/search` resolves a project or
+ * application while `measures/component` resolves ANY component, so a key naming a
+ * module, directory or file answers one and not the other. Deliberately not retried with
+ * the task's `componentKey` -- a provenance check keyed to something other than the
+ * graded component is not a check of the graded component.
+ *
+ * KNOWN IMPRECISION, in both directions. `project_analyses/search` orders by the
+ * analysis DATE (scanner-supplied: `sonar.projectDate`, else scan start) while the live
+ * measures follow PROCESSING order. A foreign analysis dated earlier but processed later
+ * leaves the list naming ours and the measures being theirs -- a false PASS this check
+ * cannot see -- and the reverse produces a false fail. SonarQube's CE is understood to
+ * reject an analysis dated before the last known one for a project, which would force
+ * the two orders to agree, but that was NOT verified here and neither direction is
+ * claimed closed.
+ */
+function bindReadingToAnalysis(metrics, submitted) {
+    const config = getConfig();
+    const sonarUrl = redactUrlCredentials(config.sonarqube.url);
+    const projectKey = config.sonarqube.projectKey;
+    // Both helpers scrub BY CONSTRUCTION, because every message below interpolates a
+    // server-supplied string (`analyses[0].key`, `.date`, `.revision`) and the advisory
+    // travels as far as the failure does: `evaluateAnalysisProvenance` copies `why` into
+    // an `UnevaluatedRule.message`, which the CLI prints and the MCP server serialises.
+    const unconfirmed = (why) => ({
+        metrics,
+        provenance: { kind: 'unconfirmed', why: scrubCredential(why) },
+    });
+    if (submitted.kind === 'not-scanned') {
+        // No HTTP call: there is no analysis of ours to compare against, so there is
+        // nothing to ask. `score`, `suggest` and the MCP handlers pay nothing for a
+        // verification they could not use.
+        return unconfirmed(`no analysis was submitted by this process, so these are whatever numbers ` +
+            `SonarQube currently holds for "${projectKey}" -- from an analysis of unknown ` +
+            'vintage, possibly of a different commit.');
+    }
+    const query = `/api/project_analyses/search?project=${projectKey}&ps=1`;
+    const response = sonarGet(query);
+    const fail = (kind, message) => ({
+        failure: measurementFailure(kind, 'sonarqube', scrubCredential(message), 
+        // The evidence reproduces THIS call, not the measures call: an evidence command
+        // that reproduces a call which succeeded is worse than none.
+        sonarEvidence(query, response)),
+    });
+    if (response.kind === 'unreachable') {
+        return fail('tool-missing', `The measures for "${projectKey}" were read, but SonarQube at ${sonarUrl} did not ` +
+            `answer when asked which analysis they came from (${response.reason}). Refusing ` +
+            'to grade numbers whose provenance the server would not state -- they may be a ' +
+            'concurrent scan\'s. Retry, or drop the sonarqube rules and use --coverage-only.');
+    }
+    if (response.status === 401 || response.status === 403) {
+        return fail('access-denied', `SonarQube refused to say which analysis the measures of "${projectKey}" came from ` +
+            `(HTTP ${response.status}). /api/project_analyses/search requires "Browse": ` +
+            '"Execute Analysis" alone is enough to run the scan and read the measures (since ' +
+            '2025.2) but not to list the analyses, and no endpoint that names the current ' +
+            'analysis accepts it -- api/ce/activity requires Administer and api/ce/component ' +
+            'requires Browse. Grant "Browse" to SONARQUBE_TOKEN, or use --coverage-only.');
+    }
+    if (response.status === 404) {
+        return unconfirmed(response.body.includes('Unknown url')
+            ? `/api/project_analyses/search does not exist on this server (HTTP 404), so ` +
+                `there is no way to ask which analysis the measures of "${projectKey}" came ` +
+                'from. The numbers were read and are being graded unverified.'
+            : `SonarQube answered HTTP 404 for the analysis list of "${projectKey}": it does ` +
+                'not resolve that key to a project (the measures read did resolve it, so the ' +
+                'key most likely names a module, directory or file inside one). There is no ' +
+                'analysis list to check these numbers against.');
+    }
+    if (response.status !== 200) {
+        return fail('crashed', `SonarQube answered HTTP ${response.status} when asked which analysis the measures ` +
+            `of "${projectKey}" came from, ` +
+            (response.status >= 300 && response.status < 400
+                ? 'a redirect. A 3xx body is not an answer about provenance even when it is ' +
+                    'JSON of the right shape -- SONARQUBE_URL is probably missing a path prefix, ' +
+                    'or an SSO proxy is intercepting the request.'
+                : 'which is not an answer. Only 200 carries an analysis list.'));
+    }
+    let parsed;
+    try {
+        parsed = JSON.parse(response.body);
+    }
+    catch {
+        return unconfirmed(`SonarQube's analysis list for "${projectKey}" came back as a body that is not JSON ` +
+            `(${response.body.length} bytes), so the provenance of these numbers could not be ` +
+            'read. The measures themselves parsed, so this is one endpoint answering oddly ' +
+            'rather than a proxy in front of the whole API.');
+    }
+    const current = parsed.analyses?.[0];
+    const currentKey = typeof current?.key === 'string' && current.key.length > 0
+        ? current.key
+        : undefined;
+    if (currentKey === undefined) {
+        return unconfirmed(`SonarQube's analysis list for "${projectKey}" named no current analysis (HTTP 200, ` +
+            `${response.body.length} bytes), so there is nothing to compare these numbers ` +
+            'against. An empty list, or a shape carrying no analysis key, says only that the ' +
+            'question could not be answered -- it is not evidence that the numbers are ' +
+            "somebody else's.");
+    }
+    // The `unnamed` half of the check: the server would not name OUR analysis, so its id
+    // cannot be compared -- but the current analysis's REVISION can be compared against the
+    // commit being graded, which catches the larger and likelier hazard (these numbers are
+    // a different COMMIT's) on the call already made. Complementary and not a substitute:
+    // a revision match cannot distinguish two concurrent scans of the same commit, which
+    // is what an id comparison is for, so a match is still only `unconfirmed`.
+    if (submitted.kind === 'unnamed') {
+        const revision = typeof current?.revision === 'string' ? current.revision : undefined;
+        const graded = gradedRevision();
+        if (revision !== undefined &&
+            graded !== undefined &&
+            GIT_SHA_PATTERN.test(revision) &&
+            revision !== graded) {
+            return fail('wrong-subject', `SonarQube confirmed analysis task ${submitted.taskId} as SUCCESS but reported no ` +
+                `"analysisId" for it, and the analysis it considers current for "${projectKey}" ` +
+                `(${currentKey}) is of revision ${revision}, not the ${graded} being graded. ` +
+                'The measures endpoint has no analysis parameter, so the numbers just read are ' +
+                "that other commit's. Check that the scan reaches the server and publishes for " +
+                'this project key, or drop the sonarqube rules and use --coverage-only.');
+        }
+        return unconfirmed(`SonarQube confirmed analysis task ${submitted.taskId} as SUCCESS but its response ` +
+            `carried no "analysisId", so there is no identifier to check these numbers ` +
+            `against. ${sonarUrl} may be an edition or version that omits the field. ` +
+            (revision === undefined
+                ? 'The current analysis names no revision either (SCM detection off, or ' +
+                    'sonar.scm.disabled), so nothing about these numbers could be corroborated.'
+                : graded === undefined
+                    ? `The current analysis is of revision ${revision}, which could not be ` +
+                        'compared against anything because the commit being graded could not be read.'
+                    : `Its current analysis is of revision ${revision}, which IS the commit being ` +
+                        'graded -- so these numbers describe this commit, but not provably this ' +
+                        "run's analysis of it."));
+    }
+    if (currentKey === submitted.analysisId) {
+        return { metrics, provenance: { kind: 'confirmed', analysisId: currentKey } };
+    }
+    // A mismatch does not fail on its own evidence. If ce/task's `analysisId` and
+    // project_analyses' `key` were ever different identifier spaces -- an edition nobody
+    // probed -- every run would mismatch, and failing on that would be a refusal the
+    // adopter cannot resolve, which is what killed two earlier designs for this check.
+    // A 404 here means the server does not recognise the id it just gave us, so the
+    // difference is not evidence of anything.
+    const probeQuery = `/api/qualitygates/project_status?analysisId=${submitted.analysisId}`;
+    const probe = sonarGet(probeQuery);
+    if (probe.kind === 'ok' && probe.status === 404) {
+        return unconfirmed(`SonarQube says the current analysis of "${projectKey}" is ${currentKey}, not the ` +
+            `${submitted.analysisId} it reported for task ${submitted.taskId} -- and it does ` +
+            `not recognise ${submitted.analysisId} as an analysis id at all (HTTP 404 from ` +
+            '/api/qualitygates/project_status). The task API and the analysis list are not ' +
+            'naming the same thing on this server, so the difference is not evidence that ' +
+            "these numbers are somebody else's.");
+    }
+    const corroboration = probe.kind === 'unreachable'
+        ? ` (the server did not answer when asked whether ${submitted.analysisId} exists: ` +
+            `${probe.reason}, so the mismatch stands uncorroborated)`
+        : probe.status === 200
+            ? ` (it does recognise ${submitted.analysisId} as an analysis, so the two are ` +
+                'naming the same kind of thing)'
+            : ` (asked whether ${submitted.analysisId} exists, it answered HTTP ` +
+                `${probe.status}, so the mismatch stands uncorroborated)`;
+    return fail('wrong-subject', `The analysis this run submitted (${submitted.analysisId}, task ${submitted.taskId}) ` +
+        `is not the one SonarQube considers current for "${projectKey}": that is ` +
+        `${currentKey}` +
+        (typeof current?.date === 'string' ? ` from ${current.date}` : '') +
+        (typeof current?.revision === 'string' ? ` at revision ${current.revision}` : '') +
+        `${corroboration}. The measures endpoint has no analysis parameter, so the numbers ` +
+        `just read are ${currentKey}'s, not this commit's. ` +
+        (submitted.pullRequest !== undefined
+            ? `This run's analysis was of pull request ${submitted.pullRequest} and the ` +
+                'measures read is the project\'s default branch -- the two can never agree. ' +
+                'This gate has no branch option: point the scan at the default branch, or use ' +
+                '--coverage-only.'
+            : submitted.branch !== undefined
+                ? `This run's analysis was of branch "${submitted.branch}" and the measures read ` +
+                    'is the project\'s default branch -- they agree only when that IS the default ' +
+                    'branch. This gate has no branch option: point the scan at the default branch, ' +
+                    'or use --coverage-only.'
+                : 'Another job most likely published for the same project key while this run was ' +
+                    'waiting. Serialise the scans on this project key (or give each one its own ' +
+                    'key), or drop the sonarqube rules and use --coverage-only.'));
+}
+/**
+ * The commit whose code is being graded, or `undefined` if git will not say.
+ *
+ * Read here rather than threaded in from the caller because it is a property of the
+ * SUBJECT, like `projectKey` two lines up, not of what the scan submitted -- and because
+ * an optional parameter for it would be a quiet path: a call site that forgot it would
+ * silently downgrade a refusal to an advisory. `undefined` degrades to the advisory
+ * honestly and says so in the message.
+ */
+function gradedRevision() {
+    try {
+        return getCurrentCommitHash();
+    }
+    catch {
+        return undefined;
+    }
 }
 /**
  * Whether there is a SonarQube server here at all.
@@ -460,7 +768,33 @@ function waitForSonarTask(taskId, timeoutMs = 120000) {
                     };
                 }
                 if (status === 'SUCCESS') {
-                    return { success: true };
+                    // The analysis identity is carried OUT of here, because this response is the
+                    // only place it exists. It is the same string `/api/project_analyses/search`
+                    // returns as `analyses[].key` -- both are `analysisMetadataHolder.getUuid()`,
+                    // and the equality was observed rather than assumed: on SonarQube Community
+                    // 26.6.0, `/api/ce/component?component=ASM:asm` reported
+                    // `current.analysisId = "4bf5c7a8-eb72-43cc-9c8f-bde3d1477722"` and
+                    // `/api/project_analyses/search?project=ASM:asm&ps=1` reported the same string
+                    // as `analyses[0].key`; `current` is formatted by the same
+                    // `TaskFormatter.formatActivity` that serves this endpoint.
+                    //
+                    // An EMPTY string is not an identity: some protobuf-to-JSON renderings emit
+                    // one for an unset optional, and treating it as named would compare "" against
+                    // a real key and refuse a healthy run.
+                    const analysisId = parsed.task?.analysisId;
+                    if (analysisId === undefined || analysisId.length === 0) {
+                        return { success: true, submitted: { kind: 'unnamed', taskId } };
+                    }
+                    return {
+                        success: true,
+                        submitted: {
+                            kind: 'named',
+                            taskId,
+                            analysisId,
+                            branch: parsed.task?.branch,
+                            pullRequest: parsed.task?.pullRequest,
+                        },
+                    };
                 }
                 if (status === 'FAILED') {
                     return {
@@ -822,6 +1156,11 @@ export function extractAllMetrics(scriptsToRunOrOptions = ['quality']) {
     // `JSON.stringify` equality and does not sort keys: moving `scripts:` up
     // inside the literal would reject the frozen baseline for a pure
     // serialization change, with no number different anywhere.
+    //
+    // `sonarqubeProvenance` was ADDED to that literal, immediately after `sonarqube`,
+    // and it leaves golden-A.json byte-identical: capture.mjs runs with
+    // `skipSonarQube: true`, so the value is `undefined` and `JSON.stringify` omits the
+    // key entirely.
     // ---------------------------------------------------------------------------
     // First: this is the step that MUTATES the project.
     const scripts = runScripts(scriptsToRun);
@@ -849,7 +1188,9 @@ export function extractAllMetrics(scriptsToRunOrOptions = ['quality']) {
     // still returns a bare value for its other callers, and using it HERE was the
     // defect: it discards the reason, and the reason is the only thing that turns a
     // vanished dimension into a failed rule.
-    const sonarqube = skipSonarQube ? {} : readSonarqubeMetrics();
+    const sonarqube = skipSonarQube
+        ? SONARQUBE_NOT_MEASURED
+        : readSonarqubeMetrics(options.submittedAnalysis ?? { kind: 'not-scanned' });
     const sloc = extractSloc();
     const measurementFailures = [
         ...[typescript, eslint]
@@ -869,6 +1210,7 @@ export function extractAllMetrics(scriptsToRunOrOptions = ['quality']) {
         typescript: typescript.ok ? typescript.value.metrics : undefined,
         eslint: eslint.ok ? eslint.value.metrics : undefined,
         sonarqube: sonarqube.metrics,
+        sonarqubeProvenance: sonarqube.provenance,
         scripts,
         sloc,
         custom,
@@ -909,8 +1251,13 @@ export function describeUnmeasured(metrics) {
  * ran, `metrics.custom` was always absent, and `evaluateCeilings` skipped every
  * configured `custom.*` ceiling in silence. The dimensions were not merely
  * unmeasured -- the rules written against them were never enforced at all.
+ *
+ * `submittedAnalysis` is REQUIRED here and optional on `extractAllMetrics` for that
+ * same history: this is the verdict path, and the divergence above is what an optional
+ * field at a module boundary produced last time. A caller that publishes nothing has to
+ * write `{ kind: 'not-scanned' }` and be visible doing it.
  */
-export async function extractAllMetricsAsync(options = {}) {
+export async function extractAllMetricsAsync(options) {
     const config = getConfig();
     // Load and register custom dimensions if not already provided
     let customDimensions = options.customDimensions;

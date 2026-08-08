@@ -49,8 +49,9 @@ export type Result<T, E> =
 // =============================================================================
 
 /**
- * How a measurement can fail. Every member corresponds to a failure actually
- * observed against a real subject, not a hypothetical:
+ * How a measurement can fail. Every member but one corresponds to a failure actually
+ * observed against a real subject, not a hypothetical; `wrong-subject` is the
+ * exception and says so in its own paragraph:
  *
  * - `tool-missing`       apollo-client ships a `typecheck` script; the tool
  *                        shells `npm run type-check` and got nothing back. Also
@@ -90,6 +91,16 @@ export type Result<T, E> =
  * declared kind nothing can emit is a claim that the tool detects something it
  * does not, so the kind went with the rule. The open question is backlog #39.
  *
+ * `wrong-subject` is NOT that kind returning under a new name, and the difference is
+ * worth stating because one of its two emitters does compare a SonarQube analysis's git
+ * revision against the commit being graded. That comparison is exact -- two 40-character
+ * shas, equal or not -- so none of the three reasons the mtime rule was cut applies to
+ * it: there is no tolerance window to tune, an mtime-preserving archive restore or a
+ * branch switch does not change a commit hash, and clock skew cannot reach it. It is also
+ * not inert, because the revision comes from the server's own response rather than from a
+ * directory layout that may not exist. What stays true is that no kind here claims a
+ * report on DISK is older than the code; #39 is still open.
+ *
  * `report-missing` was for a long time declared and never emitted. It is now
  * emitted for an absent coverage summary on the suite that requires one
  * (providers/coverage.ts readFailure), which is precisely "the run succeeded and
@@ -115,7 +126,30 @@ export type MeasurementFailureKind =
    * file. It is also the likeliest sonarqube failure in practice -- a rotated
    * SONARQUBE_TOKEN needs no change to anything else to arrive.
    */
-  | 'access-denied';
+  | 'access-denied'
+  /**
+   * The measurement succeeded and describes something other than what was asked about:
+   * SonarQube named a DIFFERENT analysis as current for this project key than the one
+   * the CE task confirmed, so the numbers just parsed are that analysis's.
+   *
+   * Its own kind because the response it calls for is neither of its neighbours'.
+   * `tool-missing` says fix the URL, `access-denied` says rotate the token, and this
+   * says serialise the scans on this project key or give each job its own key --
+   * folding it into `crashed` would send the adopter looking for a broken subject when
+   * the subject is fine and the SUBJECT IDENTITY is what went wrong.
+   *
+   * The honest caveat, since the sentence above this list makes a claim about every
+   * member: this is the one kind whose failure was read in the code path rather than
+   * reproduced against a live subject. Confirming it needs a SonarQube with two
+   * concurrent publishers on one project key, which was not reproducible here. What IS
+   * measured is every fact the detection rests on, probed against SonarQube Server
+   * Community 26.6.0 and SonarQube Cloud 8.0.0 -- see the WHY block above
+   * `bindReadingToAnalysis` in metrics.ts. The emitter reports a definite contradiction
+   * from the server (this analysis, not that one), never an inference from silence:
+   * every "cannot tell" answer routes to `SonarqubeAnalysisProvenance.unconfirmed`
+   * instead, which is an advisory and fails nothing.
+   */
+  | 'wrong-subject';
 
 /**
  * What a failed measurement was measuring.

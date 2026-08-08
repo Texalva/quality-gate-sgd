@@ -1519,6 +1519,32 @@ function answerCurl(response: SpawnResult): void {
         ) ?? spawnSyncShape(''))) as never)
 }
 
+/**
+ * Answer curl per URL, because the provenance check makes two or three calls.
+ *
+ * `answerCurl` above answers EVERY curl invocation with one canned response, which is
+ * exactly right for a test aimed at a single endpoint and useless once a code path asks
+ * two questions -- the measures response would be handed to the analysis-list parser as
+ * well. Dispatch is on the LAST argv element, which is always the URL in `sonarGet`'s
+ * argv.
+ *
+ * `answerCurl` is deliberately left as it is: every existing sonar test relies on it, and
+ * the default `not-scanned` provenance makes exactly one call, so none of them changes.
+ */
+function answerCurlByUrl(reply: (url: string) => SpawnResult): void {
+  const existing = vi.mocked(spawnSync).getMockImplementation()
+  vi.mocked(spawnSync).mockImplementation(((cmd: string, ...rest: unknown[]) => {
+    if (cmd !== 'curl') {
+      return (
+        (existing as ((...a: unknown[]) => SpawnResult) | undefined)?.(cmd, ...rest) ??
+        spawnSyncShape('')
+      )
+    }
+    const argv = rest[0] as string[]
+    return reply(argv[argv.length - 1])
+  }) as never)
+}
+
 describe('SonarQube Metrics', () => {
   beforeEach(() => {
     vi.clearAllMocks()
@@ -2656,7 +2682,10 @@ describe('extractAllMetricsAsync', () => {
     })
     answerCurl(curlSays(200, { component: { measures: [] } }))
 
-    const result = await extractAllMetricsAsync()
+    // `submittedAnalysis` is REQUIRED on this signature, which is the point of it: a
+    // verdict path that scanned has to hand over the analysis it submitted, and one that
+    // did not has to say so out loud.
+    const result = await extractAllMetricsAsync({ submittedAnalysis: { kind: 'not-scanned' } })
 
     expect(result.coverage).toBeDefined()
     expect(result.typescript).toBeDefined()
@@ -2679,6 +2708,7 @@ describe('extractAllMetricsAsync', () => {
 
     const result = await extractAllMetricsAsync({
       customDimensions: [],
+      submittedAnalysis: { kind: 'not-scanned' },
     })
 
     expect(result.custom).toBeUndefined()
@@ -2700,8 +2730,609 @@ describe('extractAllMetricsAsync', () => {
 
     const result = await extractAllMetricsAsync({
       skipCustomDimensions: true,
+      submittedAnalysis: { kind: 'not-scanned' },
     })
 
     expect(result.custom).toBeUndefined()
+  })
+})
+
+/**
+ * #48 -- binding the confirmed analysis task to the metrics actually graded.
+ *
+ * `waitForSonarTask` reduced the CE task to a boolean, and
+ * `/api/measures/component?component=<key>&metricKeys=...` has no analysis, task or
+ * revision parameter: its only parameters are `component`, `metricKeys`, `branch` and
+ * `pullRequest`, so it answers with the LIVE measures -- whatever the most recently
+ * PROCESSED analysis of that key left in the table. A second publisher for the same key
+ * between SUCCESS and the read replaces them, and nothing in the response says which
+ * analysis it described. The gate confirmed analysis A and graded analysis B.
+ */
+describe('binding a sonarqube reading to the analysis that produced it', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  /** The scanner exited 0 and wrote a task id that is not last run's. */
+  const aScanThatSubmitted = (taskId: string): void => {
+    vi.mocked(spawnSync).mockReturnValue({
+      status: 0,
+      stdout: 'Scan completed',
+      stderr: '',
+      pid: 123,
+      signal: null,
+      output: [],
+    } as never)
+    vi.mocked(fs.existsSync).mockReturnValue(true)
+    vi.mocked(fs.readFileSync).mockReturnValueOnce('ceTaskId=previous-run')
+    vi.mocked(fs.readFileSync).mockReturnValue(`ceTaskId=${taskId}`)
+  }
+
+  const measuresOk = (): SpawnResult =>
+    curlSays(200, { component: { measures: allMeasures() } })
+
+  describe('carrying the identity out of the task payload', () => {
+    // D1: the identity exists in exactly one response and used to be thrown away.
+    it('carries the analysis id out of a confirmed task', () => {
+      aScanThatSubmitted('task-mine')
+      answerCurl(
+        curlSays(200, { task: { id: 'task-mine', status: 'SUCCESS', analysisId: 'AN-1' } })
+      )
+
+      const result = runSonarqubeScan()
+
+      expect(result.success).toBe(true)
+      expect(result.success && result.submitted).toEqual({
+        kind: 'named',
+        taskId: 'task-mine',
+        analysisId: 'AN-1',
+        branch: undefined,
+        pullRequest: undefined,
+      })
+    })
+
+    // D3's first half: an edition that omits the field must not break the scan.
+    it('treats a SUCCESS with no analysisId as unnamed, not as a scan failure', () => {
+      aScanThatSubmitted('task-mine')
+      answerCurl(curlSays(200, { task: { id: 'task-mine', status: 'SUCCESS' } }))
+
+      const result = runSonarqubeScan()
+
+      expect(result.success).toBe(true)
+      expect(result.success && result.submitted.kind).toBe('unnamed')
+    })
+
+    // Some protobuf-to-JSON renderings emit "" for an unset optional. Comparing "" to a
+    // real analysis key would refuse a perfectly healthy run.
+    it('does not treat an empty-string analysisId as an identity', () => {
+      aScanThatSubmitted('task-mine')
+      answerCurl(
+        curlSays(200, { task: { id: 'task-mine', status: 'SUCCESS', analysisId: '' } })
+      )
+
+      const result = runSonarqubeScan()
+
+      expect(result.success && result.submitted.kind).toBe('unnamed')
+    })
+  })
+
+  describe('verifying it against the analysis SonarQube considers current', () => {
+    // D2, happy path.
+    it('confirms the reading when the current analysis is the one submitted', () => {
+      answerCurlByUrl((url) =>
+        url.includes('/api/project_analyses/search')
+          ? curlSays(200, {
+              paging: { pageIndex: 1, pageSize: 1, total: 7 },
+              analyses: [{ key: 'AN-1', date: '2026-08-08T10:00:00+0000' }],
+            })
+          : measuresOk()
+      )
+
+      const reading = readSonarqubeMetrics({
+        kind: 'named',
+        taskId: 't1',
+        analysisId: 'AN-1',
+      })
+
+      expect(reading.failure).toBeUndefined()
+      expect(reading.metrics?.bugs).toBe(3)
+      expect(reading.provenance).toEqual({ kind: 'confirmed', analysisId: 'AN-1' })
+    })
+
+    // The whole of #48: a definite contradiction from the server, corroborated.
+    it('refuses the reading when SonarQube names a different current analysis', () => {
+      answerCurlByUrl((url) =>
+        url.includes('/api/project_analyses/search')
+          ? curlSays(200, {
+              analyses: [
+                {
+                  key: 'AN-OTHER',
+                  date: '2026-08-08T10:00:00+0000',
+                  revision: 'deadbeefcafe',
+                },
+              ],
+            })
+          : url.includes('/api/qualitygates/project_status')
+            ? curlSays(200, { projectStatus: { status: 'OK' } })
+            : measuresOk()
+      )
+
+      const reading = readSonarqubeMetrics({
+        kind: 'named',
+        taskId: 't1',
+        analysisId: 'AN-1',
+      })
+
+      expect(reading.metrics).toBeUndefined()
+      expect(reading.failure?.kind).toBe('wrong-subject')
+      expect(reading.failure?.dimension).toBe('sonarqube')
+      expect(reading.failure?.message).toContain('AN-1')
+      expect(reading.failure?.message).toContain('AN-OTHER')
+      expect(reading.failure?.message).toContain('deadbeefcafe')
+      expect(reading.failure?.message).toMatch(/Serialise|--coverage-only/)
+    })
+
+    // Diagnosable for the branch/PR CI shape rather than reading as a mystery race --
+    // and the remedy clause has to be the one that can actually work there, which
+    // "serialise the scans" is not.
+    it('names the pull request when the confirmed analysis was of one', () => {
+      answerCurlByUrl((url) =>
+        url.includes('/api/project_analyses/search')
+          ? curlSays(200, { analyses: [{ key: 'AN-MAIN' }] })
+          : url.includes('/api/qualitygates/project_status')
+            ? curlSays(200, { projectStatus: { status: 'OK' } })
+            : measuresOk()
+      )
+
+      const reading = readSonarqubeMetrics({
+        kind: 'named',
+        taskId: 't1',
+        analysisId: 'AN-PR',
+        pullRequest: '601',
+      })
+
+      expect(reading.failure?.kind).toBe('wrong-subject')
+      expect(reading.failure?.message).toContain('pull request 601')
+      expect(reading.failure?.message).toContain('default branch')
+      expect(reading.failure?.message).not.toContain('Serialise the scans')
+    })
+
+    // THE false-fail closer. If ce/task's analysisId and project_analyses' key were ever
+    // different identifier spaces, every run would mismatch -- and failing there is a
+    // refusal the adopter cannot resolve, which is what killed two earlier designs.
+    it('does not refuse when the server does not recognise the id it just gave us', () => {
+      answerCurlByUrl((url) =>
+        url.includes('/api/project_analyses/search')
+          ? curlSays(200, { analyses: [{ key: 'AN-OTHER' }] })
+          : url.includes('/api/qualitygates/project_status')
+            ? curlSays(404, { errors: [{ msg: "Analysis with id 'AN-1' is not found" }] })
+            : measuresOk()
+      )
+
+      const reading = readSonarqubeMetrics({
+        kind: 'named',
+        taskId: 't1',
+        analysisId: 'AN-1',
+      })
+
+      expect(reading.failure).toBeUndefined()
+      expect(reading.metrics?.bugs).toBe(3)
+      expect(reading.provenance?.kind).toBe('unconfirmed')
+      expect(
+        reading.provenance?.kind === 'unconfirmed' ? reading.provenance.why : ''
+      ).toContain('not naming the same thing')
+    })
+
+    // A corroborator that could not answer does not turn the mismatch into an advisory
+    // -- both platforms that exist were measured to share the id space and to answer
+    // this probe -- but the message must not claim the id WAS recognised.
+    it('still refuses when the corroborating probe cannot answer, and says so', () => {
+      answerCurlByUrl((url) =>
+        url.includes('/api/project_analyses/search')
+          ? curlSays(200, { analyses: [{ key: 'AN-OTHER' }] })
+          : url.includes('/api/qualitygates/project_status')
+            ? curlSays(503, { errors: [{ msg: 'busy' }] })
+            : measuresOk()
+      )
+
+      const reading = readSonarqubeMetrics({
+        kind: 'named',
+        taskId: 't1',
+        analysisId: 'AN-1',
+      })
+
+      expect(reading.failure?.kind).toBe('wrong-subject')
+      expect(reading.failure?.message).toContain('HTTP 503')
+      expect(reading.failure?.message).toContain('uncorroborated')
+    })
+  })
+
+  describe('when the verification call itself fails', () => {
+    // D4: it is not acceptable to grade numbers whose provenance the server refused to
+    // discuss -- and the remedy has to be nameable, because this DOES break a token that
+    // holds "Execute Analysis" and not "Browse".
+    it('is a failed measurement naming Browse when the call is refused', () => {
+      answerCurlByUrl((url) =>
+        url.includes('/api/project_analyses/search')
+          ? curlSays(401, { errors: [{ msg: 'Insufficient privileges' }] })
+          : measuresOk()
+      )
+
+      const reading = readSonarqubeMetrics({
+        kind: 'named',
+        taskId: 't1',
+        analysisId: 'AN-1',
+      })
+
+      expect(reading.metrics).toBeUndefined()
+      expect(reading.failure?.kind).toBe('access-denied')
+      expect(reading.failure?.message).toContain('Browse')
+      expect(reading.failure?.message).toContain('Execute Analysis')
+    })
+
+    it('is a failed measurement when the endpoint is unreachable', () => {
+      answerCurlByUrl((url) =>
+        url.includes('/api/project_analyses/search')
+          ? spawnSyncShape('\n000', 7)
+          : measuresOk()
+      )
+
+      const reading = readSonarqubeMetrics({
+        kind: 'named',
+        taskId: 't1',
+        analysisId: 'AN-1',
+      })
+
+      expect(reading.failure?.kind).toBe('tool-missing')
+      expect(reading.failure?.message).toContain('did not answer when asked which analysis')
+    })
+
+    // Symmetry with the measures read's redirect refusal: a 3xx body is not an answer
+    // about provenance even when it happens to be JSON of the right shape.
+    it('is a failed measurement when the endpoint answers a redirect', () => {
+      answerCurlByUrl((url) =>
+        url.includes('/api/project_analyses/search')
+          ? curlSays(302, { analyses: [{ key: 'AN-1' }] })
+          : measuresOk()
+      )
+
+      const reading = readSonarqubeMetrics({
+        kind: 'named',
+        taskId: 't1',
+        analysisId: 'AN-1',
+      })
+
+      expect(reading.failure?.kind).toBe('crashed')
+      expect(reading.failure?.message).toContain('redirect')
+    })
+
+    // The evidence has to reproduce the call that FAILED. A command built from the
+    // measures query would print a reproduction of a call that succeeded.
+    it('reproduces the call that actually failed, not the measures call', () => {
+      answerCurlByUrl((url) =>
+        url.includes('/api/project_analyses/search')
+          ? curlSays(401, { errors: [{ msg: 'no' }] })
+          : measuresOk()
+      )
+
+      const reading = readSonarqubeMetrics({
+        kind: 'named',
+        taskId: 't1',
+        analysisId: 'AN-1',
+      })
+
+      expect(reading.failure?.evidence.command).toContain('/api/project_analyses/search')
+      expect(reading.failure?.evidence.command).not.toContain('metricKeys')
+    })
+
+    // D4's second half: an endpoint that does not exist in this edition is a "cannot
+    // tell", not a refusal.
+    it('is an advisory when the endpoint does not exist', () => {
+      answerCurlByUrl((url) =>
+        url.includes('/api/project_analyses/search')
+          ? curlSays(404, {
+              errors: [{ msg: 'Unknown url : /api/project_analyses/search' }],
+            })
+          : measuresOk()
+      )
+
+      const reading = readSonarqubeMetrics({
+        kind: 'named',
+        taskId: 't1',
+        analysisId: 'AN-1',
+      })
+
+      expect(reading.failure).toBeUndefined()
+      expect(reading.metrics?.bugs).toBe(3)
+      expect(
+        reading.provenance?.kind === 'unconfirmed' ? reading.provenance.why : ''
+      ).toContain('does not exist on this server')
+    })
+
+    // The 404 ambiguity is resolved in the MESSAGE and never in the verdict, so the
+    // brittle match on the server's English literal cannot change a gate result.
+    it('says the component instead when the 404 is about the key, still advisory', () => {
+      answerCurlByUrl((url) =>
+        url.includes('/api/project_analyses/search')
+          ? curlSays(404, { errors: [{ msg: "Component key 'test-project' not found" }] })
+          : measuresOk()
+      )
+
+      const reading = readSonarqubeMetrics({
+        kind: 'named',
+        taskId: 't1',
+        analysisId: 'AN-1',
+      })
+
+      expect(reading.failure).toBeUndefined()
+      expect(
+        reading.provenance?.kind === 'unconfirmed' ? reading.provenance.why : ''
+      ).toContain('module, directory or file')
+    })
+
+    // An empty list, or a shape with no key, must not be compared against `undefined`
+    // and read as a mismatch.
+    it('is an advisory when the analysis list names nothing', () => {
+      answerCurlByUrl((url) =>
+        url.includes('/api/project_analyses/search')
+          ? curlSays(200, { paging: { pageIndex: 1, pageSize: 1, total: 0 }, analyses: [] })
+          : measuresOk()
+      )
+
+      const reading = readSonarqubeMetrics({
+        kind: 'named',
+        taskId: 't1',
+        analysisId: 'AN-1',
+      })
+
+      expect(reading.failure).toBeUndefined()
+      expect(
+        reading.provenance?.kind === 'unconfirmed' ? reading.provenance.why : ''
+      ).toContain('named no current analysis')
+    })
+
+    // A key that is not a string -- a proxy rewriting the body, a shape change -- is the
+    // same "cannot tell" and must not be compared as if it were an identifier.
+    it('is an advisory when the analysis key is not a string', () => {
+      answerCurlByUrl((url) =>
+        url.includes('/api/project_analyses/search')
+          ? curlSays(200, { analyses: [{ key: 12345 }] })
+          : measuresOk()
+      )
+
+      const reading = readSonarqubeMetrics({
+        kind: 'named',
+        taskId: 't1',
+        analysisId: 'AN-1',
+      })
+
+      expect(reading.failure).toBeUndefined()
+      expect(
+        reading.provenance?.kind === 'unconfirmed' ? reading.provenance.why : ''
+      ).toContain('named no current analysis')
+    })
+
+    // The host has already proved it speaks JSON by answering the measures call, so an
+    // unparseable body from this ONE endpoint is a "cannot tell" rather than a second
+    // refusal.
+    it('is an advisory when the analysis list is not JSON', () => {
+      answerCurlByUrl((url) =>
+        url.includes('/api/project_analyses/search')
+          ? curlSays(200, '<html>login</html>')
+          : measuresOk()
+      )
+
+      const reading = readSonarqubeMetrics({
+        kind: 'named',
+        taskId: 't1',
+        analysisId: 'AN-1',
+      })
+
+      expect(reading.failure).toBeUndefined()
+      expect(
+        reading.provenance?.kind === 'unconfirmed' ? reading.provenance.why : ''
+      ).toContain('not JSON')
+    })
+  })
+
+  describe('the credential never reaches a provenance message', () => {
+    // The hard constraint, on the one new path where a SERVER-supplied string reaches a
+    // message. Both channels are tested: the failure and the advisory. The advisory
+    // travels as far as the failure does -- into an UnevaluatedRule.message, which the
+    // CLI prints and the MCP server serialises.
+    const withToken = async (): Promise<void> => {
+      const { sonarAuthArgs } = await import('../src/config.js')
+      vi.mocked(sonarAuthArgs).mockReturnValue(['-u', 'squ_secrettoken:'])
+    }
+
+    it('scrubs it out of a wrong-subject failure', async () => {
+      await withToken()
+      answerCurlByUrl((url) =>
+        url.includes('/api/project_analyses/search')
+          ? curlSays(200, { analyses: [{ key: 'squ_secrettoken' }] })
+          : url.includes('/api/qualitygates/project_status')
+            ? curlSays(200, { projectStatus: { status: 'OK' } })
+            : measuresOk()
+      )
+
+      const reading = readSonarqubeMetrics({
+        kind: 'named',
+        taskId: 't1',
+        analysisId: 'AN-1',
+      })
+
+      expect(reading.failure?.message).not.toContain('squ_secrettoken')
+      expect(reading.failure?.message).toContain('<redacted>')
+    })
+
+    it('scrubs it out of an advisory too', async () => {
+      await withToken()
+      answerCurlByUrl((url) =>
+        url.includes('/api/project_analyses/search')
+          ? curlSays(200, { analyses: [{ key: 'squ_secrettoken' }] })
+          : url.includes('/api/qualitygates/project_status')
+            ? curlSays(404, { errors: [{ msg: 'not found' }] })
+            : measuresOk()
+      )
+
+      const reading = readSonarqubeMetrics({
+        kind: 'named',
+        taskId: 't1',
+        analysisId: 'AN-1',
+      })
+
+      const why = reading.provenance?.kind === 'unconfirmed' ? reading.provenance.why : ''
+      expect(why).not.toContain('squ_secrettoken')
+      expect(why).toContain('<redacted>')
+    })
+  })
+
+  describe('when the server never named the analysis', () => {
+    // D3's second half: the advisory. The false-pass a hurried implementer writes here is
+    // `provenance: {kind:'confirmed', analysisId: taskId}` -- a task id is not an
+    // analysis id, and nothing was checked.
+    it('is an advisory naming the missing field', () => {
+      answerCurlByUrl((url) =>
+        url.includes('/api/project_analyses/search')
+          ? curlSays(200, { analyses: [{ key: 'AN-CURRENT' }] })
+          : measuresOk()
+      )
+
+      const reading = readSonarqubeMetrics({ kind: 'unnamed', taskId: 't1' })
+
+      expect(reading.failure).toBeUndefined()
+      expect(reading.metrics?.bugs).toBe(3)
+      expect(
+        reading.provenance?.kind === 'unconfirmed' ? reading.provenance.why : ''
+      ).toContain('analysisId')
+    })
+
+    // What that population gets INSTEAD of an id comparison. Without it the branch the
+    // design justifies at greatest length verifies nothing at all -- the same
+    // structurally-inert shape as the mtime rule that was built and removed.
+    it('refuses when the current analysis is of another commit', async () => {
+      const { execSync } = await import('child_process')
+      vi.mocked(execSync).mockReturnValue(
+        'a'.repeat(40) + '\n' as never
+      )
+      answerCurlByUrl((url) =>
+        url.includes('/api/project_analyses/search')
+          ? curlSays(200, { analyses: [{ key: 'AN-CURRENT', revision: 'b'.repeat(40) }] })
+          : measuresOk()
+      )
+
+      const reading = readSonarqubeMetrics({ kind: 'unnamed', taskId: 't1' })
+
+      expect(reading.failure?.kind).toBe('wrong-subject')
+      expect(reading.failure?.message).toContain('b'.repeat(40))
+      expect(reading.failure?.message).toContain('a'.repeat(40))
+    })
+
+    // A revision match is NOT confirmation: it cannot distinguish two concurrent scans of
+    // the same commit, which is what the id comparison is for.
+    it('stays an advisory when the revision matches', async () => {
+      const { execSync } = await import('child_process')
+      vi.mocked(execSync).mockReturnValue(('c'.repeat(40) + '\n') as never)
+      answerCurlByUrl((url) =>
+        url.includes('/api/project_analyses/search')
+          ? curlSays(200, { analyses: [{ key: 'AN-CURRENT', revision: 'c'.repeat(40) }] })
+          : measuresOk()
+      )
+
+      const reading = readSonarqubeMetrics({ kind: 'unnamed', taskId: 't1' })
+
+      expect(reading.failure).toBeUndefined()
+      expect(
+        reading.provenance?.kind === 'unconfirmed' ? reading.provenance.why : ''
+      ).toContain('IS the commit being graded')
+    })
+
+    // SCM detection off (`sonar.scm.disabled`) leaves no revision, and a value that is
+    // not a git sha is not compared as if it were one.
+    it('stays an advisory when there is no revision to compare', () => {
+      answerCurlByUrl((url) =>
+        url.includes('/api/project_analyses/search')
+          ? curlSays(200, { analyses: [{ key: 'AN-CURRENT' }] })
+          : measuresOk()
+      )
+
+      const reading = readSonarqubeMetrics({ kind: 'unnamed', taskId: 't1' })
+
+      expect(reading.failure).toBeUndefined()
+      expect(
+        reading.provenance?.kind === 'unconfirmed' ? reading.provenance.why : ''
+      ).toContain('names no revision')
+    })
+  })
+
+  describe('what a caller that scanned nothing pays for this', () => {
+    // `score`, `suggest` and the MCP handlers pay NOTHING -- and, load-bearingly, no
+    // existing test's single-response mock is consumed twice.
+    it('makes no second call when nothing was scanned', () => {
+      answerCurl(measuresOk())
+
+      const reading = readSonarqubeMetrics()
+
+      expect(reading.provenance?.kind).toBe('unconfirmed')
+      expect(
+        reading.provenance?.kind === 'unconfirmed' ? reading.provenance.why : ''
+      ).toContain('no analysis was submitted by this process')
+      expect(
+        vi.mocked(spawnSync).mock.calls.filter(([cmd]) => cmd === 'curl')
+      ).toHaveLength(1)
+    })
+  })
+
+  describe('the plumbing from the scan to the verdict', () => {
+    it('carries the provenance onto the metrics the gate evaluates', () => {
+      answerCurlByUrl((url) =>
+        url.includes('/api/project_analyses/search')
+          ? curlSays(200, { analyses: [{ key: 'AN-1' }] })
+          : measuresOk()
+      )
+
+      const metrics = extractAllMetrics({
+        scriptsToRun: [],
+        submittedAnalysis: { kind: 'named', taskId: 't', analysisId: 'AN-1' },
+      })
+
+      expect(metrics.sonarqubeProvenance).toEqual({ kind: 'confirmed', analysisId: 'AN-1' })
+    })
+
+    // The skip path is untouched: no provenance, no HTTP call, so a coverage-only run
+    // gets the pre-existing `skipped-dimension` advisory and not a provenance one.
+    it('claims no provenance and reads nothing under --coverage-only', () => {
+      vi.mocked(fs.existsSync).mockReturnValue(false)
+
+      const metrics = extractAllMetrics({ scriptsToRun: [], skipSonarQube: true })
+
+      expect(metrics.sonarqubeProvenance).toBeUndefined()
+      expect(vi.mocked(spawnSync).mock.calls.filter(([cmd]) => cmd === 'curl')).toHaveLength(0)
+    })
+
+    // End to end through the library: a `wrong-subject` failure on the sonarqube
+    // dimension becomes a failed RULE via rule-scoped gating.
+    it('turns a mismatch into a failed rule for a project that grades sonarqube', () => {
+      answerCurlByUrl((url) =>
+        url.includes('/api/project_analyses/search')
+          ? curlSays(200, { analyses: [{ key: 'AN-OTHER' }] })
+          : url.includes('/api/qualitygates/project_status')
+            ? curlSays(200, { projectStatus: { status: 'OK' } })
+            : measuresOk()
+      )
+
+      const metrics = extractAllMetrics({
+        scriptsToRun: [],
+        submittedAnalysis: { kind: 'named', taskId: 't', analysisId: 'AN-1' },
+      })
+
+      const verdict = evaluateRules(
+        { version: '1.0.0', rules: { ceilings: { 'sonarqube.blocker': 0 } } },
+        metrics
+      )
+
+      expect(verdict.status).toBe('fail')
+      expect(verdict.failedRules.map((f) => f.rule)).toContain('sonarqube.measurement')
+    })
   })
 })

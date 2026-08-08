@@ -102,6 +102,21 @@ import type { PackageManager } from './runner.js';
  *   the tree: the content hash folds in `git ls-files`, `git diff HEAD` and the untracked
  *   listing, so an unchanged commit re-gated after an upgrade hits the stored entry.
  *
+ *   Version 7 carries a SECOND change to what a pass means, landed in the same
+ *   unreleased version rather than as an eighth bump because no build with one and not
+ *   the other was ever published: a sonarqube reading is now BOUND to the analysis this
+ *   run submitted (`Metrics.sonarqubeProvenance`). A version-6 entry -- and an entry
+ *   from an intermediate build of version 7 -- can hold a PASS whose `sonarqube.*`
+ *   ceilings were satisfied by an analysis a second publisher for the same project key
+ *   replaced between `waitForSonarTask` returning SUCCESS and the measures read.
+ *   `/api/measures/component` takes a component and a metric list and nothing else, so
+ *   nothing in that response said which analysis it described and nothing compared the
+ *   two; the entry is stamped `monotonicEvaluated: true` because no rule was recorded
+ *   as unapplied. `isCacheValid` refuses such an entry explicitly -- see the
+ *   provenance check there -- because the schema counter alone cannot catch an entry
+ *   written by an intermediate revision of the same version, which is the same
+ *   allowance version 3 records for cache suppression.
+ *
  *   The cost is the standing cost of every bump and it was accepted at 3, 4, 5 and 6:
  *   one re-measurement, and one commit's worth of baseline-missing ratchets, which are
  *   reported as rules that did not run and resolve against the entry that run writes.
@@ -190,11 +205,51 @@ export interface CacheEntry {
      */
     measurementInputsHash?: string;
 }
+/**
+ * Whether the sonarqube numbers in a reading can be tied to a known analysis.
+ *
+ * `/api/measures/component` takes a component and a metric list and NOTHING else --
+ * no analysis, no task, no revision -- so it answers with the LIVE measures: whatever
+ * the most recently processed analysis of that project key left in the table. A second
+ * publisher for the same key between `waitForSonarTask` returning SUCCESS and that read
+ * replaces them, and nothing in the response says which analysis it described. The gate
+ * confirmed analysis A and graded analysis B, with a `sonarqube.blocker: 0` ceiling
+ * satisfied by a scan of code nobody in this run wrote. That is why the binding has to
+ * travel alongside the numbers instead of being read out of them.
+ *
+ * `confirmed` means SonarQube itself named this analysis as the current one for the
+ * project key AFTER the measures had been read. `unconfirmed` carries the reason it
+ * could not be established, which is not the same as evidence against it -- a server
+ * that will not discuss provenance is refused where a server that cannot is reported.
+ */
+export type SonarqubeAnalysisProvenance = {
+    readonly kind: 'confirmed';
+    readonly analysisId: string;
+} | {
+    readonly kind: 'unconfirmed';
+    readonly why: string;
+};
 export interface Metrics {
     coverage?: AllCoverageMetrics;
     typescript?: TypescriptMetrics;
     eslint?: EslintMetrics;
     sonarqube?: SonarqubeMetrics;
+    /**
+     * Whether `sonarqube` above describes the analysis this run submitted.
+     *
+     * Travels with the data for the same reason `measurementFailures` does: a fourth
+     * parameter to `evaluateRules` would have to be threaded through six call sites and
+     * the one that got missed would be a silent hole of exactly the kind this field
+     * exists to close.
+     *
+     * ABSENT means no sonarqube reading was taken at all -- the dimension was skipped
+     * (`--coverage-only`), or the read failed and there is a `MeasurementFailure`
+     * instead. It never means "confirmed": a reader that treats absence as confirmation
+     * re-opens the hole for every entry written before this field existed, which is why
+     * `isCacheValid` and `evaluateMonotonic` both test for `kind === 'confirmed'`
+     * explicitly rather than for the absence of `'unconfirmed'`.
+     */
+    sonarqubeProvenance?: SonarqubeAnalysisProvenance;
     bundle?: BundleMetrics;
     scripts: Record<string, 'pass' | 'fail'>;
     sloc?: number;
@@ -369,10 +424,10 @@ export interface EvaluationResult {
      *
      * A third outcome, distinct from both lists above, and it exists because the
      * second list cannot express it. This tool's thesis is that a passing check is
-     * evidence only if it was capable of failing; a rule that never ran produced no
-     * evidence either way, and folding that into `status: 'pass'` with an empty
-     * `failedRules` is exactly the vacuous pass everything else here is built to
-     * prevent.
+     * evidence only if it was capable of failing; a rule that never ran, or that ran
+     * against numbers whose origin could not be established, produced no evidence
+     * either way, and folding that into `status: 'pass'` with an empty `failedRules` is
+     * exactly the vacuous pass everything else here is built to prevent.
      *
      * Reported rather than failed, deliberately: failing here would break every fresh
      * clone and every commit that adds a ratchet, which is a policy change adopters
@@ -388,10 +443,17 @@ export interface EvaluationResult {
     unevaluated: UnevaluatedRule[];
 }
 /**
- * A configured rule that could not be applied, and why.
+ * A rule that could not be applied AS WRITTEN, and why.
+ *
+ * "Configured" was accurate until `unbound-provenance` arrived, and it is now accurate
+ * for every member but that one: `sonarqube.provenance` is SYNTHETIC, named for a
+ * condition rather than for a line in rules.json, in the same way
+ * `evaluateMeasurements` synthesises `${dimension}.measurement`. It stands for the set
+ * of configured rules listed in its message.
  *
  * `rule` uses the same identity string as `FailedRule.rule` for the same rule
- * (`${direction}:${metricPath}` for monotonic), so a reader can match the two.
+ * (`${direction}:${metricPath}` for monotonic), so a reader can match the two -- again
+ * excepting the synthetic entry, which has no counterpart in `failedRules` by design.
  */
 export interface UnevaluatedRule {
     /**
@@ -403,8 +465,13 @@ export interface UnevaluatedRule {
      * `evaluateCeilings` and the run reports a clean pass on rules nothing checked.
      * Reported rather than failed, because the adopter asked for the skip -- but
      * recorded, so the entry cannot later be served to a run that did NOT skip it.
+     *
+     * `unbound-provenance`: the dimension WAS measured and the threshold WAS compared.
+     * Distinct from `skipped-dimension`, whose whole claim is that there is no value:
+     * here there is a value, and what is missing is the evidence that it describes this
+     * commit's scan.
      */
-    type: 'monotonic' | 'skipped-dimension';
+    type: 'monotonic' | 'skipped-dimension' | 'unbound-provenance';
     rule: string;
     metricPath: string;
     /**
@@ -428,8 +495,20 @@ export interface UnevaluatedRule {
      *
      * `dimension-skipped`: the run was told not to measure the dimension this rule
      * grades, so there is no value to compare against the threshold.
+     *
+     * `provenance-unconfirmed`: the rule was applied to numbers that could not be tied
+     * to a known analysis. Reported rather than failed because refusing every adopter
+     * whose server will not name the current analysis would block them over a hazard the
+     * tool cannot even detect there; what it buys is that the run is not servable as a
+     * verdict.
+     *
+     * `baseline-unbound`: the BASELINE's numbers for this metric could not be tied to a
+     * known analysis, so differencing this run's number against them proves nothing. The
+     * quiet half of the same problem: an unconfirmed run is only baseline-only, and a
+     * later run that ratchets against it is stamped fully evaluated and cached as a
+     * verdict -- so the unbound numbers become the floor without ever being graded.
      */
-    reason: 'no-baseline' | 'baseline-missing' | 'current-missing' | 'no-metrics' | 'dimension-skipped';
+    reason: 'no-baseline' | 'baseline-missing' | 'current-missing' | 'no-metrics' | 'dimension-skipped' | 'provenance-unconfirmed' | 'baseline-unbound';
     message: string;
 }
 export interface FailedRule {

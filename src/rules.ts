@@ -491,6 +491,70 @@ function evaluateCeilings(
 }
 
 /**
+ * Whether a rule on this metric path reads the sonarqube dimension, directly or through
+ * a dimension derived from it.
+ *
+ * The same question `isMeasurementUnderRule` asks about a whole ruleset, asked about one
+ * path, so the ceiling/floor/ratchet surfaces and the provenance surfaces cannot drift
+ * apart on what "grades sonarqube" means.
+ */
+function gradesSonarqube(metricPath: string): boolean {
+  return measurementsBehind(metricPath).some((required) => sameSubtree(required, 'sonarqube'));
+}
+
+/**
+ * A rule applied to sonarqube numbers that could not be tied to a known analysis.
+ *
+ * ONE entry, not one per rule, and the message lists the rules it stands for. The
+ * sentence is identical for all eight sonarqube ceilings a default ruleset ships, and
+ * noise in the loud channel is what trains adopters to stop reading it -- the same
+ * reasoning that makes the CLI drop `no-baseline` entries from the list it prints.
+ *
+ * GATED on some rule actually reading sonarqube, because the cost of reporting lands on
+ * the cache: an entry with any unevaluated rule is written `monotonicEvaluated: false`,
+ * which `isCacheValid` refuses as a VERDICT while `findBaselineEntry` still accepts it as
+ * a BASELINE. Without the gate, a project that measures sonarqube and grades none of it
+ * would be baseline-only forever and would re-scan on every run, over a provenance
+ * nothing grades against.
+ *
+ * REPORTED rather than failed (D3): some editions may not expose the analysis identity
+ * at all, and failing there would block every adopter on such a server over a hazard the
+ * tool cannot even detect for them. What reporting buys is that the run is not servable
+ * as a verdict.
+ *
+ * Where it buys NOTHING, stated because the sentence above oversells it: in ephemeral CI
+ * the cache file is absent or gitignored, so the entry this advisory marks is discarded
+ * when the job ends and the exit code -- the only thing CI reads -- is unchanged. The
+ * advisory is then exactly what it says it is, an advisory. The cache tier bites only for
+ * adopters who persist the cache file, which is what the tool already tells them to do.
+ */
+function evaluateAnalysisProvenance(
+  rules: QualityRules,
+  metrics: Metrics
+): UnevaluatedRule[] {
+  const provenance = metrics.sonarqubeProvenance;
+  if (provenance === undefined || provenance.kind === 'confirmed') return [];
+
+  const graded = [...new Set(ruledMetricPaths(rules).filter(gradesSonarqube))].sort();
+
+  if (graded.length === 0) return [];
+
+  return [
+    {
+      type: 'unbound-provenance',
+      rule: 'sonarqube.provenance',
+      metricPath: 'sonarqube',
+      reason: 'provenance-unconfirmed',
+      message:
+        `${graded.length} sonarqube rule(s) (${graded.join(', ')}) were applied to numbers ` +
+        `that could not be tied to a known analysis: ${provenance.why} The thresholds were ` +
+        'compared, so this is not an unmeasured dimension -- what is unproven is that the ' +
+        "numbers describe this commit's scan.",
+    },
+  ];
+}
+
+/**
  * The dimension names a metric path could belong to, longest first.
  *
  * `coverage.unit.lines` is measured by `coverage.unit`, not by `coverage`, and
@@ -612,6 +676,48 @@ function evaluateMonotonic(
         continue;
       }
 
+      // The BASELINE half of the analysis-provenance check, and the quieter half.
+      //
+      // An unconfirmed run is only marked baseline-only: `isCacheValid` will not serve
+      // it as a verdict, but `usableBaseline` accepts it and this function then reads
+      // its numbers as the floor. CONSTRUCTED path, no adversarial input: commit C1
+      // reads `sonarqube.major = 120` from a foreign analysis and lands on an
+      // unconfirmed branch (project key names a module -> 404 advisory; the id-space
+      // probe 404s; the edition omits analysisId), so the entry is written with the
+      // ungraded 120 in it. Commit C2 measures a real 118 -- a regression from C1's true
+      // 90 -- confirms its own provenance, differences 118 against 120, reports no
+      // violation, is stamped `monotonicEvaluated: true` and IS cached as a verdict. The
+      // ratchet was laundered through the baseline channel by the entry the provenance
+      // check itself wrote. Same arithmetic as the package-manager case in
+      // `usableBaseline` (10 -> 5 passing where 4 -> 5 should fail).
+      //
+      // Reported here rather than refused in `usableBaseline`, because refusing the
+      // whole entry would re-create the deadlock for any server that is permanently
+      // unconfirmable: every commit would have no baseline, forever. This is the
+      // per-metric precedent schema version 5 established for a metric absent from the
+      // baseline.
+      //
+      // `!== 'confirmed'` rather than `=== 'unconfirmed'`: an entry written before the
+      // field existed carries a sonarqube reading and no provenance, and for those the
+      // absence means "never checked", not "fine".
+      if (
+        gradesSonarqube(metricPath) &&
+        baselineMetrics?.sonarqubeProvenance?.kind !== 'confirmed'
+      ) {
+        unevaluated.push({
+          type: 'monotonic',
+          rule: `${rule.direction}:${metricPath}`,
+          metricPath,
+          reason: 'baseline-unbound',
+          message:
+            `the baseline's ${metricPath} (${baselineValue}) could not be tied to a known ` +
+            `SonarQube analysis, so the '${rule.direction}' ratchet on it did not run -- ` +
+            `differencing this run's ${currentValue} against a number of unproven origin ` +
+            'would report a pass the comparison did not earn',
+        });
+        continue;
+      }
+
       const isViolation =
         rule.direction === 'up'
           ? currentValue < baselineValue
@@ -694,15 +800,23 @@ export function evaluateRules(
   ];
 
   return {
-    // `unevaluated` deliberately does NOT feed this. A rule that did not run has
-    // produced no evidence of a violation, and inventing one would fail the gate on
-    // every fresh clone and every commit that adds a ratchet. The consequence is
-    // carried on the CACHE instead -- see `unevaluated`'s doc comment and the
-    // `monotonicEvaluated` write in cli.ts -- so a pass with an unevaluated rule
-    // cannot be inherited by a later run as `PASSED (cached)`.
+    // `unevaluated` deliberately does NOT feed this. A rule that did not run, or that
+    // ran against numbers whose origin is unproven, has produced no evidence of a
+    // violation, and inventing one would fail the gate on every fresh clone, every
+    // commit that adds a ratchet, and every adopter whose server will not name the
+    // current analysis. The consequence is carried on the CACHE instead -- see
+    // `unevaluated`'s doc comment and the `monotonicEvaluated` write in cli.ts -- so a
+    // pass with an unevaluated rule cannot be inherited by a later run as
+    // `PASSED (cached)`.
     status: allFailures.length === 0 ? 'pass' : 'fail',
     failedRules: allFailures,
-    unevaluated: [...monotonic.unevaluated, ...ceilings.unevaluated],
+    // The provenance advisory is appended LAST, which keeps the orderings existing
+    // tests assert on untouched.
+    unevaluated: [
+      ...monotonic.unevaluated,
+      ...ceilings.unevaluated,
+      ...evaluateAnalysisProvenance(rules, currentMetrics),
+    ],
   };
 }
 
@@ -759,6 +873,29 @@ export function isCacheValid(entry: CacheEntry, rules: QualityRules): boolean {
   // `!== false` rather than `=== true`: entries written before the field existed
   // carry no value, and for them "evaluated" is what the absence meant.
   if (entry.monotonicEvaluated === false) {
+    return false;
+  }
+
+  // An entry whose sonarqube numbers were never tied to a known analysis is not a
+  // verdict about them, and this version's own runs are already marked
+  // `monotonicEvaluated: false` when that happens -- so this check exists for the entry
+  // the counter above cannot catch: one written by an INTERMEDIATE revision of this
+  // schema version, before the binding existed. Such an entry carries a sonarqube
+  // reading, no provenance and no unevaluated rule, so it looks fully earned. Version 3
+  // records the same allowance for cache suppression; see QualityGateCache.
+  //
+  // Scoped to rulesets that actually grade sonarqube, for the reason
+  // `evaluateAnalysisProvenance` is scoped the same way: refusing it unconditionally
+  // would make every project that measures sonarqube and grades none of it re-measure on
+  // every run over a provenance nothing reads.
+  //
+  // `!== 'confirmed'` and not `=== 'unconfirmed'`: absence is the pre-binding state,
+  // which is exactly the state this refuses.
+  if (
+    entry.metrics.sonarqube !== undefined &&
+    entry.metrics.sonarqubeProvenance?.kind !== 'confirmed' &&
+    isMeasurementUnderRule(rules, 'sonarqube')
+  ) {
     return false;
   }
 

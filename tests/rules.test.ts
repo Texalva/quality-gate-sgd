@@ -1987,3 +1987,339 @@ describe('a ceiling whose metric was never measured', () => {
     expect(result.status).toBe('pass')
   })
 })
+
+/**
+ * #48. `/api/measures/component` has no analysis parameter, so it answers with the LIVE
+ * measures of a project key -- whatever the most recently processed analysis left in the
+ * table. A second publisher for the same key between `waitForSonarTask` returning
+ * SUCCESS and that read replaces them, and nothing in the response says which analysis
+ * it described: the gate confirmed analysis A and graded analysis B. `readSonarqubeMetrics`
+ * now states whether the numbers could be tied to the analysis this run submitted, and
+ * these are the two things the gate does with that answer.
+ */
+describe('a sonarqube rule applied to numbers of unproven origin', () => {
+  const ceilingRules = (ceilings: Record<string, number>): QualityRules => ({
+    version: '1.0.0',
+    rules: { ceilings },
+  })
+
+  const sonarqube = {
+    bugs: 0,
+    vulnerabilities: 0,
+    codeSmells: 4,
+    blocker: 0,
+    critical: 0,
+    major: 7,
+    minor: 2,
+    info: 1,
+  }
+
+  const unbound: Metrics = {
+    scripts: {},
+    sonarqube,
+    sonarqubeProvenance: { kind: 'unconfirmed', why: 'because X' },
+  }
+
+  // D3, and the shape of it: reported, not failed. Some editions may not expose the
+  // analysis identity at all, and failing there would block every adopter on such a
+  // server over a hazard the tool cannot even detect for them.
+  it('is reported once, naming the rules and the reason', () => {
+    const result = evaluateRules(ceilingRules({ 'sonarqube.blocker': 0 }), unbound)
+
+    expect(result.status).toBe('pass')
+    expect(result.failedRules).toHaveLength(0)
+    expect(result.unevaluated).toHaveLength(1)
+    expect(result.unevaluated[0]).toMatchObject({
+      type: 'unbound-provenance',
+      rule: 'sonarqube.provenance',
+      reason: 'provenance-unconfirmed',
+    })
+    expect(result.unevaluated[0].message).toContain('sonarqube.blocker')
+    expect(result.unevaluated[0].message).toContain('because X')
+  })
+
+  // ONE entry, not one per rule. The sentence is identical for all eight sonarqube
+  // ceilings a default ruleset ships, and noise in the loud channel is what trains
+  // adopters to stop reading it.
+  it('says it once for eight ceilings, not eight times', () => {
+    const result = evaluateRules(
+      ceilingRules({
+        'sonarqube.bugs': 0,
+        'sonarqube.vulnerabilities': 0,
+        'sonarqube.blocker': 0,
+        'sonarqube.critical': 0,
+        'sonarqube.major': 10,
+      }),
+      unbound
+    )
+
+    expect(result.unevaluated.filter((u) => u.type === 'unbound-provenance')).toHaveLength(1)
+    expect(result.unevaluated[0].message).toContain('5 sonarqube rule(s)')
+  })
+
+  // The consequence that actually matters, reusing the existing two-tier machinery with
+  // no new cache field: `cli.ts` turns a nonempty `unevaluated` into
+  // `monotonicEvaluated: false`, `isCacheValid` refuses that as a VERDICT, and
+  // `findBaselineEntry` still accepts it as a BASELINE.
+  it('leaves that run uncacheable as a verdict', () => {
+    const rules = ceilingRules({ 'sonarqube.blocker': 0 })
+    const result = evaluateRules(rules, unbound)
+
+    const entry = {
+      timestamp: 1,
+      rulesVersion: '1.0.0',
+      rulesHash: computeRulesHash(rules),
+      evaluation: { status: 'pass' as const, failedRules: [] },
+      metrics: unbound,
+      monotonicEvaluated: result.unevaluated.length === 0,
+    }
+
+    expect(isCacheValid(entry, rules)).toBe(false)
+  })
+
+  // A normal run must not become permanently baseline-only -- that cost would land on
+  // every adopter and destroy `PASSED (cached)` for all of them.
+  it('says nothing when the provenance is confirmed', () => {
+    const bound: Metrics = {
+      ...unbound,
+      sonarqubeProvenance: { kind: 'confirmed', analysisId: 'AN-1' },
+    }
+
+    const result = evaluateRules(ceilingRules({ 'sonarqube.blocker': 0 }), bound)
+
+    expect(result.unevaluated.filter((u) => u.type === 'unbound-provenance')).toHaveLength(0)
+  })
+
+  // Gated on some rule reading sonarqube. Without the gate a project that measures
+  // sonarqube and grades none of it would be baseline-only forever and re-scan every
+  // run, over a provenance nothing grades against.
+  it('says nothing when no rule grades sonarqube', () => {
+    const alsoTypescript: Metrics = {
+      ...unbound,
+      typescript: { errors: 0, warnings: 0, rootCauses: 0 },
+    }
+
+    const result = evaluateRules(ceilingRules({ 'typescript.errors': 0 }), alsoTypescript)
+
+    expect(result.unevaluated.filter((u) => u.type === 'unbound-provenance')).toHaveLength(0)
+  })
+
+  // The gate reads floors, ceilings AND monotonic rules, so a project that ratchets
+  // `sonarqube.major` and sets no ceiling is not silently exempt.
+  it('counts a ratchet on sonarqube as grading it', () => {
+    const rules: QualityRules = {
+      version: '1.0.0',
+      rules: { monotonic: [{ direction: 'down', metrics: ['sonarqube.major'] }] },
+    }
+
+    const result = evaluateRules(rules, unbound)
+    const provenance = result.unevaluated.filter((u) => u.type === 'unbound-provenance')
+
+    expect(provenance).toHaveLength(1)
+    expect(provenance[0].message).toContain('sonarqube.major')
+  })
+})
+
+/**
+ * #48, the quiet half. An unconfirmed run is only marked baseline-only, so its numbers
+ * are still accepted as the ratchet FLOOR for the next commit -- and that next run
+ * confirms its own provenance, is stamped fully evaluated, and IS cached as a verdict.
+ * The regression the ratchet exists to catch is laundered through the baseline channel by
+ * the entry the provenance check itself wrote.
+ */
+describe('a ratchet whose baseline sonarqube numbers were never bound', () => {
+  const ratchet: QualityRules = {
+    version: '1.0.0',
+    rules: { monotonic: [{ direction: 'down', metrics: ['sonarqube.major'] }] },
+  }
+
+  const sonarqubeWith = (major: number) => ({
+    bugs: 0,
+    vulnerabilities: 0,
+    codeSmells: 0,
+    blocker: 0,
+    critical: 0,
+    major,
+    minor: 0,
+    info: 0,
+  })
+
+  const baselineEntryWith = (metrics: Metrics): CacheEntry => ({
+    timestamp: 1,
+    rulesVersion: '1.0.0',
+    rulesHash: computeRulesHash(ratchet),
+    evaluation: { status: 'pass', failedRules: [] },
+    metrics,
+  })
+
+  // The two-commit sequence, as constructed. C1 read 120 from a foreign analysis and was
+  // never able to bind it; C2 measures a real 118, which is a REGRESSION from C1's true
+  // 90 and passes a naive 118 <= 120 comparison.
+  const c1: Metrics = {
+    scripts: {},
+    sonarqube: sonarqubeWith(120),
+    sonarqubeProvenance: { kind: 'unconfirmed', why: 'the project key names a module' },
+  }
+  const c2: Metrics = {
+    scripts: {},
+    sonarqube: sonarqubeWith(118),
+    sonarqubeProvenance: { kind: 'confirmed', analysisId: 'AN-2' },
+  }
+
+  it('does not run, and says which number it refused to difference against', () => {
+    const result = evaluateRules(ratchet, c2, baselineEntryWith(c1))
+
+    expect(result.unevaluated).toHaveLength(1)
+    expect(result.unevaluated[0]).toMatchObject({
+      type: 'monotonic',
+      rule: 'down:sonarqube.major',
+      reason: 'baseline-unbound',
+    })
+    expect(result.unevaluated[0].message).toContain('120')
+  })
+
+  // And therefore C2 is not cacheable as a verdict either, which is what stops the
+  // laundering: without this, C2 is stamped `monotonicEvaluated: true` and served.
+  it('leaves the inheriting run uncacheable as a verdict', () => {
+    const result = evaluateRules(ratchet, c2, baselineEntryWith(c1))
+
+    expect(
+      isCacheValid(
+        {
+          timestamp: 2,
+          rulesVersion: '1.0.0',
+          rulesHash: computeRulesHash(ratchet),
+          evaluation: { status: 'pass', failedRules: [] },
+          metrics: c2,
+          monotonicEvaluated: result.unevaluated.length === 0,
+        },
+        ratchet
+      )
+    ).toBe(false)
+  })
+
+  // An entry written before the field existed carries a sonarqube reading and no
+  // provenance, which means "never checked" and not "fine".
+  it('treats an absent baseline provenance the same as an unconfirmed one', () => {
+    const preFix: Metrics = { scripts: {}, sonarqube: sonarqubeWith(120) }
+
+    const result = evaluateRules(ratchet, c2, baselineEntryWith(preFix))
+
+    expect(result.unevaluated[0]).toMatchObject({ reason: 'baseline-unbound' })
+  })
+
+  // The ordinary case must still ratchet, or this check has disabled the feature.
+  it('runs normally when the baseline was bound', () => {
+    const boundBaseline: Metrics = {
+      ...c1,
+      sonarqubeProvenance: { kind: 'confirmed', analysisId: 'AN-1' },
+    }
+
+    const passing = evaluateRules(ratchet, c2, baselineEntryWith(boundBaseline))
+    expect(passing.unevaluated).toHaveLength(0)
+    expect(passing.status).toBe('pass')
+
+    const regressed: Metrics = { ...c2, sonarqube: sonarqubeWith(121) }
+    const failing = evaluateRules(ratchet, regressed, baselineEntryWith(boundBaseline))
+    expect(failing.status).toBe('fail')
+    expect(failing.failedRules[0].rule).toBe('down:sonarqube.major')
+  })
+
+  // A ratchet on a dimension that is not sonarqube is untouched by any of this.
+  it('does not interfere with a ratchet on another dimension', () => {
+    const tsRatchet: QualityRules = {
+      version: '1.0.0',
+      rules: { monotonic: [{ direction: 'down', metrics: ['typescript.errors'] }] },
+    }
+    const before: Metrics = {
+      ...c1,
+      typescript: { errors: 5, warnings: 0, rootCauses: 0 },
+    }
+    const after: Metrics = {
+      ...c2,
+      typescript: { errors: 5, warnings: 0, rootCauses: 0 },
+    }
+
+    const result = evaluateRules(tsRatchet, after, baselineEntryWith(before))
+
+    expect(result.unevaluated).toHaveLength(0)
+    expect(result.status).toBe('pass')
+  })
+})
+
+/**
+ * #48, the entry the schema counter cannot catch: one written by an INTERMEDIATE
+ * revision of schema version 7, before sonarqube readings were bound to an analysis. It
+ * carries a sonarqube reading, no provenance and no unevaluated rule, so it looks fully
+ * earned -- and `cli.ts` exits 0 on a cached pass before contacting the server.
+ */
+describe('a cached entry whose sonarqube numbers were never bound', () => {
+  const entryWith = (metrics: Metrics, rules: QualityRules): CacheEntry => ({
+    timestamp: 1,
+    rulesVersion: rules.version,
+    rulesHash: computeRulesHash(rules),
+    evaluation: { status: 'pass', failedRules: [] },
+    metrics,
+    monotonicEvaluated: true,
+    packageManager: 'npm',
+    measurementInputsHash: measurementInputsHash(),
+  })
+
+  const sonarqube = {
+    bugs: 0,
+    vulnerabilities: 0,
+    codeSmells: 0,
+    blocker: 0,
+    critical: 0,
+    major: 0,
+    minor: 0,
+    info: 0,
+  }
+
+  const sonarRules: QualityRules = {
+    version: '1.0.0',
+    rules: { ceilings: { 'sonarqube.blocker': 0 } },
+  }
+
+  it('is not served as a verdict when a rule grades sonarqube', () => {
+    const entry = entryWith({ scripts: {}, sonarqube }, sonarRules)
+
+    expect(isCacheValid(entry, sonarRules)).toBe(false)
+  })
+
+  it('is served when the provenance was confirmed', () => {
+    const entry = entryWith(
+      {
+        scripts: {},
+        sonarqube,
+        sonarqubeProvenance: { kind: 'confirmed', analysisId: 'AN-1' },
+      },
+      sonarRules
+    )
+
+    expect(isCacheValid(entry, sonarRules)).toBe(true)
+  })
+
+  // Scoped to rulesets that grade sonarqube, for the same reason the advisory is: a
+  // project that measures sonarqube and grades none of it must not re-measure forever.
+  it('is served when no rule grades sonarqube', () => {
+    const tsRules: QualityRules = {
+      version: '1.0.0',
+      rules: { ceilings: { 'typescript.errors': 0 } },
+    }
+    const entry = entryWith(
+      { scripts: {}, sonarqube, typescript: { errors: 0, warnings: 0, rootCauses: 0 } },
+      tsRules
+    )
+
+    expect(isCacheValid(entry, tsRules)).toBe(true)
+  })
+
+  // `--coverage-only` writes no sonarqube reading at all, so there is nothing to bind
+  // and the pre-existing `skipped-dimension` advisory is what covers it.
+  it('is served when the entry has no sonarqube reading at all', () => {
+    const entry = entryWith({ scripts: {} }, sonarRules)
+
+    expect(isCacheValid(entry, sonarRules)).toBe(true)
+  })
+})

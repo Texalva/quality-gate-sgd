@@ -23,6 +23,7 @@ import {
   runSonarqubeScan,
   getTopSonarIssues,
   type SonarIssue,
+  type SubmittedAnalysisFromScan,
 } from './metrics.js';
 import {
   loadRules,
@@ -245,6 +246,41 @@ function describeMissingBaseline(): string {
       } -- run the gate on that commit, or commit the cache file, to enable monotonic rules`;
 }
 
+/**
+ * Scan, or exit -- and hand back WHICH analysis was submitted.
+ *
+ * Extracted from `runQualityGate` so the identity has a single typed exit rather than a
+ * variable assigned inside an `if`. The return value is the whole point: it is the only
+ * evidence that ties the measures read later to this scan, and
+ * `SubmittedAnalysisFromScan` cannot express "no scan ran", so a caller of this function
+ * cannot lose the binding by forgetting a field.
+ */
+function runSonarqubeScanOrExit(): SubmittedAnalysisFromScan {
+  const config = getConfig();
+
+  log('\nChecking SonarQube...');
+  if (!isSonarqubeAvailable()) {
+    log(`ERROR: SonarQube is not running at ${config.sonarqube.url}`);
+    log('Start it with: npm run sonar:start');
+    log('Or use --coverage-only to skip SonarQube');
+    process.exit(1);
+  }
+  log('  SonarQube is available');
+
+  // Run SonarQube scan to get fresh metrics
+  log('\nRunning SonarQube scan...');
+  const scanResult = runSonarqubeScan();
+  if (!scanResult.success) {
+    log('ERROR: SonarQube scan failed');
+    if (scanResult.error) {
+      log(`  ${scanResult.error}`);
+    }
+    process.exit(1);
+  }
+  log('  SonarQube scan completed');
+  return scanResult.submitted;
+}
+
 async function runQualityGate(options: RunOptions = { skipSonarQube: false }): Promise<void> {
   log('Quality Gate SGD v0.1.0');
   log('=======================');
@@ -358,31 +394,17 @@ async function runQualityGate(options: RunOptions = { skipSonarQube: false }): P
   }
 
   // No cache hit - run full quality gate
-  const config = getConfig();
 
-  // Check SonarQube availability (skip in coverage-only mode)
-  if (!options.skipSonarQube) {
-    log('\nChecking SonarQube...');
-    if (!isSonarqubeAvailable()) {
-      log(`ERROR: SonarQube is not running at ${config.sonarqube.url}`);
-      log('Start it with: npm run sonar:start');
-      log('Or use --coverage-only to skip SonarQube');
-      process.exit(1);
-    }
-    log('  SonarQube is available');
+  // A `const` from a ternary rather than a conditionally-assigned `let`. A `let` that
+  // stays undefined -- because someone reorders this, or adds an early return above it --
+  // degrades silently to `not-scanned`, which is the QUIET path: the measures are still
+  // read, still graded, and the only trace is an advisory. That is the exact shape of
+  // hole this file exists to close.
+  const submittedAnalysis = options.skipSonarQube
+    ? ({ kind: 'not-scanned' } as const)
+    : runSonarqubeScanOrExit();
 
-    // Run SonarQube scan to get fresh metrics
-    log('\nRunning SonarQube scan...');
-    const scanResult = runSonarqubeScan();
-    if (!scanResult.success) {
-      log('ERROR: SonarQube scan failed');
-      if (scanResult.error) {
-        log(`  ${scanResult.error}`);
-      }
-      process.exit(1);
-    }
-    log('  SonarQube scan completed');
-  } else {
+  if (options.skipSonarQube) {
     log('\nSkipping SonarQube (coverage-only mode)');
   }
 
@@ -422,6 +444,7 @@ async function runQualityGate(options: RunOptions = { skipSonarQube: false }): P
     scriptsToRun: requiredScripts,
     skipSonarQube: options.skipSonarQube,
     coverageAbsenceIsFailure: coverageAbsenceIsFailure(rules),
+    submittedAnalysis,
   });
 
   // Log extracted metrics.
@@ -583,15 +606,20 @@ async function runQualityGate(options: RunOptions = { skipSonarQube: false }): P
   const worthListing = result.unevaluated.filter((u) => u.reason !== 'no-baseline');
 
   if (worthListing.length > 0) {
+    // "could not be evaluated" was false for one member and had to change: an
+    // `unbound-provenance` entry reports rules that DID run -- their thresholds were
+    // compared -- against numbers whose origin is unproven. "Not applied as written"
+    // covers both that and the rules that never ran at all.
     log(
-      `\n${worthListing.length} configured rule(s) could not be evaluated this run:`
+      `\n${worthListing.length} configured rule(s) were not applied as written this run:`
     );
     for (const skipped of worthListing) {
       log(`  ${skipped.rule}: ${skipped.message}`);
     }
     log(
       '  Not failing the gate on these -- a rule that did not run is not evidence of a ' +
-        'violation. This run is cached as a BASELINE only, so no later run can inherit ' +
+        'violation, and a rule applied to numbers of unproven origin is not evidence ' +
+        'either. This run is cached as a BASELINE only, so no later run can inherit ' +
         'it as a verdict. A baseline-missing ratchet resolves itself on the next commit, ' +
         'which compares against the entry this run is about to write.'
     );
@@ -621,7 +649,7 @@ async function runQualityGate(options: RunOptions = { skipSonarQube: false }): P
       const why =
         baselineEntry === undefined
           ? 'its monotonic rules had nothing to compare against'
-          : `${worthListing.length} of its rules could not be evaluated`;
+          : `${worthListing.length} of its rules could not be applied as written`;
       log(
         `\nCaching this run as a BASELINE only -- ${why}, so it is not servable as a ` +
           'verdict and the next run on this commit will re-measure. The commit after ' +
@@ -790,9 +818,14 @@ async function runScore(args: string[]): Promise<void> {
   // Async: a fitness score computed over the configured dimensions minus the
   // custom ones is a confident number about a smaller quality space than the
   // user defined. See extractAllMetricsAsync.
+  //
+  // `not-scanned` said out loud: `score` publishes no analysis, so its sonarqube numbers
+  // are whatever the server currently holds and the reading says so in its provenance.
+  // Not a verdict path, so nothing can fail on it.
   const metrics = await extractAllMetricsAsync({
     scriptsToRun: requiredScripts,
     skipSonarQube,
+    submittedAnalysis: { kind: 'not-scanned' },
   });
 
   // Compute fitness
@@ -892,10 +925,12 @@ async function runSuggest(args: string[]): Promise<void> {
   const rules = loadRules({ coverageOnly: skipSonarQube });
   const requiredScripts = rules.rules.requiredScripts || ['quality'];
   // Async, for the same reason as runScore: suggestions ranked over a partial
-  // dimension set quietly recommend against the wrong things.
+  // dimension set quietly recommend against the wrong things. `not-scanned` for the
+  // reason given there.
   const metrics = await extractAllMetricsAsync({
     scriptsToRun: requiredScripts,
     skipSonarQube,
+    submittedAnalysis: { kind: 'not-scanned' },
   });
 
   // Compute current score

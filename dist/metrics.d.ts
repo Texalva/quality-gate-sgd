@@ -2,7 +2,7 @@
  * Metrics Extraction Module
  * Extracts quality metrics from various sources
  */
-import type { Metrics, CoverageMetrics, AllCoverageMetrics, SonarqubeMetrics, EslintMetrics, TypescriptMetrics } from './types.js';
+import type { Metrics, CoverageMetrics, AllCoverageMetrics, SonarqubeAnalysisProvenance, SonarqubeMetrics, EslintMetrics, TypescriptMetrics } from './types.js';
 import { type CustomDimensionConfig } from './dimensions/index.js';
 import type { MeasurementFailure } from './providers/types.js';
 /**
@@ -60,16 +60,78 @@ export declare function getTopSonarIssues(limit?: number): SonarIssue[];
  * configured sonarqube ceilings never evaluated and nothing said about any of them;
  * the second run printed `PASSED (cached)`.
  *
- * Four outcomes, four kinds, because each sends the adopter somewhere different:
- * the URL is wrong, the token is wrong, the project key was never provisioned, or
- * the analysis genuinely published no measures.
+ * A kind per outcome, because each sends the adopter somewhere different: the URL is
+ * wrong (`tool-missing`), the token is wrong (`access-denied`), the project key was
+ * never provisioned (`report-missing`), the analysis genuinely published no measures or
+ * only some of them (`measured-nothing`), the body is not a reading at all
+ * (`unparseable-output`), the status is not 200 (`crashed`), or the numbers belong to
+ * an analysis nobody here submitted (`wrong-subject`). The list is enumerated in
+ * providers/types.ts and it grows; what must not happen is this comment naming a fixed
+ * count, which it did -- "four outcomes, four kinds" survived two kinds arriving.
+ *
+ * `provenance` is a third FIELD rather than an eighth kind because it answers a
+ * question neither of the other two can: the reading is COMPLETE and its origin is
+ * unproven. Present exactly when `metrics` is -- a failure has no provenance to state
+ * -- and `evaluateRules` turns an unconfirmed one into an `unevaluated` entry, never
+ * into a failed rule.
  */
 export interface SonarqubeReading {
     readonly metrics?: SonarqubeMetrics;
     readonly failure?: MeasurementFailure;
+    readonly provenance?: SonarqubeAnalysisProvenance;
 }
 export declare function extractSonarqubeMetrics(): SonarqubeMetrics | undefined;
-export declare function readSonarqubeMetrics(): SonarqubeReading;
+/**
+ * What a scan actually submitted, as the CE task described it.
+ *
+ * `not-scanned` is deliberately OUTSIDE this union and inside `SubmittedAnalysis`
+ * below, so a caller that ran a scan cannot express "no scan ran": the gate path
+ * receives one of these two and physically cannot lose the binding by forgetting a
+ * field.
+ *
+ * `branch` and `pullRequest` are carried for the failure MESSAGE and are never read by
+ * any branch of the logic. `TaskFormatter.setBranchOrPullRequest` fills them from the CE
+ * task's characteristics, so an explicit `-Dsonar.branch.name=main` sets `branch` for
+ * what IS the default branch; branching on their presence would false-fail those
+ * projects catastrophically while looking like a refinement.
+ */
+export type SubmittedAnalysisFromScan = {
+    readonly kind: 'named';
+    readonly taskId: string;
+    readonly analysisId: string;
+    readonly branch?: string;
+    readonly pullRequest?: string;
+} | {
+    readonly kind: 'unnamed';
+    readonly taskId: string;
+};
+/**
+ * What a reading knows about where its numbers came from.
+ *
+ * `not-scanned` is the honest description of `score`, `suggest` and the MCP handlers:
+ * they read the project's current numbers without publishing anything, so there is no
+ * analysis of theirs to check against.
+ */
+export type SubmittedAnalysis = SubmittedAnalysisFromScan | {
+    readonly kind: 'not-scanned';
+};
+/**
+ * The result of running a scan: the analysis it submitted, or why it did not.
+ *
+ * `error?: undefined` on the success branch exists so the union can be read for its
+ * error without narrowing, which is how every existing caller and test reads it.
+ * `submitted` gets no such escape hatch on the failure branch, because reading it
+ * without narrowing is exactly the confusion this type prevents.
+ */
+export type SonarqubeScanOutcome = {
+    readonly success: true;
+    readonly submitted: SubmittedAnalysisFromScan;
+    readonly error?: undefined;
+} | {
+    readonly success: false;
+    readonly error: string;
+};
+export declare function readSonarqubeMetrics(submitted?: SubmittedAnalysis): SonarqubeReading;
 /**
  * Whether there is a SonarQube server here at all.
  *
@@ -86,10 +148,7 @@ export declare function readSonarqubeMetrics(): SonarqubeReading;
  * which endpoint refused and why.
  */
 export declare function isSonarqubeAvailable(): boolean;
-export declare function runSonarqubeScan(): {
-    success: boolean;
-    error?: string;
-};
+export declare function runSonarqubeScan(): SonarqubeScanOutcome;
 /**
  * Type-check totals, or `undefined` when the type-check could not be run.
  *
@@ -143,6 +202,23 @@ interface MetricsExtractionOptions {
      * `coverageAbsenceIsFailure` in cli.ts.
      */
     coverageAbsenceIsFailure?: boolean;
+    /**
+     * Which analysis this run submitted, so the sonarqube measures can be tied to it.
+     *
+     * The CALLER resolves it, following the `coverageAbsenceIsFailure` precedent, because
+     * `runSonarqubeScan` is called from cli.ts and not from here -- the identity can only
+     * reach the measures read by being threaded through.
+     *
+     * Optional on THIS signature and REQUIRED on `extractAllMetricsAsync`, which is the
+     * verdict path. Absence means `not-scanned`, which is the honest description of
+     * `score`, `suggest` and the refactor harness: they read the project's current numbers
+     * without publishing anything. It is not an honest description of a gate run, and this
+     * repository has already lost enforcement once at exactly this boundary --
+     * `extractAllMetricsAsync` was exported and never called, so no custom extractor ever
+     * ran and every `custom.*` ceiling was silently skipped. A required parameter is the
+     * only thing that makes a future call site say `not-scanned` out loud.
+     */
+    submittedAnalysis?: SubmittedAnalysis;
 }
 export declare function extractAllMetrics(scriptsToRunOrOptions?: string[] | MetricsExtractionOptions): Metrics;
 /**
@@ -174,7 +250,14 @@ export declare function describeUnmeasured(metrics: Metrics): readonly {
  * ran, `metrics.custom` was always absent, and `evaluateCeilings` skipped every
  * configured `custom.*` ceiling in silence. The dimensions were not merely
  * unmeasured -- the rules written against them were never enforced at all.
+ *
+ * `submittedAnalysis` is REQUIRED here and optional on `extractAllMetrics` for that
+ * same history: this is the verdict path, and the divergence above is what an optional
+ * field at a module boundary produced last time. A caller that publishes nothing has to
+ * write `{ kind: 'not-scanned' }` and be visible doing it.
  */
-export declare function extractAllMetricsAsync(options?: MetricsExtractionOptions): Promise<Metrics>;
+export declare function extractAllMetricsAsync(options: MetricsExtractionOptions & {
+    submittedAnalysis: SubmittedAnalysis;
+}): Promise<Metrics>;
 export {};
 //# sourceMappingURL=metrics.d.ts.map

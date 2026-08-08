@@ -2,6 +2,8 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 import * as fs from 'fs'
 import { spawnSync } from 'child_process'
 import { evaluateRules } from '../src/rules.js'
+import { binaryInvocation } from '../src/runner.js'
+import type { RunnerSelection } from '../src/runner.js'
 import type { Metrics } from '../src/types.js'
 import {
   measureCoverage,
@@ -40,18 +42,40 @@ vi.mock('child_process', () => ({
 }))
 
 /**
- * Only `manifestDefinesScript` is stubbed, and only because `fs` is mocked above:
- * the runner reads package.json through the same `existsSync`/`readFileSync` these
- * tests control for coverage reports, so every script would read as undefined and
- * `runScript` would short-circuit to `fail` before spawning anything.
+ * Two runner functions are stubbed, both only because `fs` is mocked above -- the runner
+ * settles existence through the same `existsSync`/`readFileSync` these tests aim at
+ * coverage reports.
  *
- * Stubbed to TRUE, which is the premise of the tests below -- "the script exists,
- * here is what running it does". The function's real behaviour is covered against real
- * files in tests/runner.test.ts, including the bun `.bin` fall-through it exists for.
+ * `manifestDefinesScript`: without it every script reads as undefined and `runScript`
+ * short-circuits to `fail` before spawning anything.
+ *
+ * `binaryInvocation`: without it `node_modules/.bin/eslint` reads as absent, so every
+ * lint measurement below refuses with `tool-missing` before spawning. Both are stubbed
+ * to "it is there", which is the premise of these tests -- "the tool exists, here is what
+ * running it does". The COMMAND still comes from the real builder, so the `--no-install`
+ * flag is not mocked away.
+ *
+ * Stubbing `resolveProjectBinary` instead would NOT work, and it is worth knowing why:
+ * `binaryInvocation` calls it through a module-internal reference, which a partial ESM
+ * mock of the module's exports does not intercept.
+ *
+ * The real behaviour of both is covered against real files in tests/runner.test.ts and
+ * tests/providers/eslint.test.ts -- including the bun `.bin` script fall-through, and the
+ * refusal one describe below overrides this stub to reach.
  */
 vi.mock('../src/runner.js', async () => {
   const actual = await vi.importActual<typeof import('../src/runner.js')>('../src/runner.js')
-  return { ...actual, manifestDefinesScript: vi.fn(() => true) }
+  return {
+    ...actual,
+    manifestDefinesScript: vi.fn(() => true),
+    binaryInvocation: vi.fn(
+      (binary: string, args: readonly string[], selection: RunnerSelection) => ({
+        kind: 'runnable' as const,
+        command: actual.binaryCommand(binary, args, selection),
+        shimPath: `/test/project/node_modules/.bin/${binary}`,
+      })
+    ),
+  }
 })
 
 // Mock config
@@ -2558,6 +2582,58 @@ describe('extractAllMetrics', () => {
     })
 
     expect(result.custom).toBeUndefined()
+  })
+
+  /**
+   * The one place the #47 refusal is observed ABOVE the provider boundary.
+   *
+   * The module-level stub says the shim is there, because that is the premise of every
+   * other test in this file. Overriding it for this one case is what proves the refusal
+   * reaches `measurementFailures` -- which is the only thing that turns a lost dimension
+   * into a failed RULE and suppresses the cache write. Loud, not green, is the whole
+   * point, and without this nothing outside providers/eslint.test.ts pins the loudness.
+   */
+  it('carries a refused eslint pre-flight into measurementFailures', async () => {
+    const { spawnSync } = await import('child_process')
+
+    vi.mocked(fs.existsSync).mockReturnValue(false)
+    vi.mocked(spawnSync).mockReturnValue({
+      status: 0,
+      // A complete, clean report -- exactly what the launcher's cached eslint serves for
+      // a project that has none. It must not be read.
+      stdout: JSON.stringify([
+        { filePath: '/test/project/src/a.js', messages: [], errorCount: 0, warningCount: 0 },
+      ]),
+      stderr: '',
+      pid: 123,
+      signal: null,
+      output: [],
+    })
+    answerCurl(curlSays(200, { component: { measures: [] } }))
+
+    vi.mocked(binaryInvocation).mockReturnValueOnce({
+      kind: 'absent',
+      command: { executable: 'npx', args: [], display: 'npx --no-install eslint' },
+      searched: ['/test/project/node_modules/.bin/eslint'],
+    })
+
+    const result = extractAllMetrics({ skipSonarQube: true })
+
+    expect(result.eslint).toBeUndefined()
+    expect(result.measurementFailures).toBeDefined()
+    expect(
+      result.measurementFailures?.some((f) => f.dimension === 'eslint' && f.kind === 'tool-missing')
+    ).toBe(true)
+
+    // And a rule grading eslint fails on it, rather than the absent metric being skipped
+    // -- `evaluateCeilings` takes a silent `continue` on a missing metric, so the failure
+    // is the only thing that makes this loud.
+    const verdict = evaluateRules(
+      { version: '1.0.0', rules: { ceilings: { 'eslint.errors': 0 } } },
+      result
+    )
+    expect(verdict.status).toBe('fail')
+    expect(verdict.failedRules.map((f) => f.rule)).toContain('eslint.measurement')
   })
 })
 

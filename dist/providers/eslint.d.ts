@@ -10,6 +10,10 @@
  * afterwards. Improvements belong in later steps where their diffs can be
  * reviewed on their own.
  *
+ * The PARSING is still that untouched move. The INVOCATION is not: the pre-flight
+ * refusal and the launcher-refusal relabelling below were added later, for backlog #47,
+ * and are the one part of this file that is not like-for-like.
+ *
  * Two fidelity details worth naming, since both look like things to tidy up:
  *
  *   - Totals come from eslint's own `errorCount`/`warningCount` per file, NOT

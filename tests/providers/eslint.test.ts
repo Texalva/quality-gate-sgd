@@ -1,4 +1,7 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
+import { tmpdir } from 'os';
+import path from 'path';
 
 import type { SpawnSyncReturns } from 'child_process';
 
@@ -8,13 +11,30 @@ import type { MeasurementContext } from '../../src/providers/types.js';
 
 vi.mock('child_process', () => ({ spawnSync: vi.fn() }));
 
-const CONTEXT: MeasurementContext = {
+const BASE_CONTEXT: MeasurementContext = {
   projectRoot: '/test/project',
   timeoutMs: 120_000,
   maxBufferBytes: 1024,
   packageManager: { manager: 'npm', reason: 'test fixture' },
   typecheckScript: { script: 'type-check', reason: 'test fixture', definedInManifest: true },
 };
+
+/**
+ * Real directories rather than `/test/project`, because the provider now resolves
+ * `node_modules/.bin/eslint` from the filesystem BEFORE it spawns anything -- so a
+ * fictional root would make every test below a refusal.
+ *
+ * Only the RESOLUTION is real: `spawnSync` is still mocked, so no eslint ever runs.
+ *
+ * `bareRoot` has no shim, and the walk up from it reaches the filesystem root -- so
+ * these assertions fail on a machine that genuinely has `/tmp/node_modules/.bin/eslint`
+ * or `/node_modules/.bin/eslint`. Deliberate: it fails loudly rather than passing
+ * vacuously, and bounding the walk in the test would mean bounding it in production,
+ * which is the false failure this design refuses.
+ */
+let installedRoot: string;
+let bareRoot: string;
+let CONTEXT: MeasurementContext;
 
 function spawnResult(overrides: Partial<SpawnSyncReturns<string>> = {}): SpawnSyncReturns<string> {
   return {
@@ -57,6 +77,16 @@ const FINDINGS = JSON.stringify([
 describe('eslintLintProvider', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    installedRoot = mkdtempSync(path.join(tmpdir(), 'qg-eslint-installed-'));
+    mkdirSync(path.join(installedRoot, 'node_modules', '.bin'), { recursive: true });
+    writeFileSync(path.join(installedRoot, 'node_modules', '.bin', 'eslint'), '#!/bin/sh\n');
+    bareRoot = mkdtempSync(path.join(tmpdir(), 'qg-eslint-bare-'));
+    CONTEXT = { ...BASE_CONTEXT, projectRoot: installedRoot };
+  });
+
+  afterEach(() => {
+    rmSync(installedRoot, { recursive: true, force: true });
+    rmSync(bareRoot, { recursive: true, force: true });
   });
 
   it('identifies itself', () => {
@@ -249,6 +279,13 @@ describe('eslintLintProvider', () => {
       }
     });
 
+    // This injects an ENOENT object, and it exercises classifyProcessOutput's branch
+    // correctly -- but a real missing launcher does not produce one, because this
+    // provider spawns with `shell: true`. MEASURED with the provider's exact options:
+    // `spawnSync('definitely-not-a-real-launcher-47', [...], {shell: true})` gave status
+    // **127**, signal null, error **undefined** and `/bin/sh: line 1: ...: command not
+    // found` on stderr, which classifies as `crashed`. The companion test below pins
+    // that reality so the two are not confused.
     it('reports a missing binary as tool-missing', async () => {
       const enoent = Object.assign(new Error('spawnSync npx ENOENT'), { code: 'ENOENT' });
       await mockEslint({ error: enoent, status: null, stdout: '' });
@@ -257,6 +294,175 @@ describe('eslintLintProvider', () => {
 
       expect(isErr(result)).toBe(true);
       if (isErr(result)) expect(result.error.kind).toBe('tool-missing');
+    });
+
+    it('reports a launcher that is not on PATH as crashed, since shell:true makes it 127', async () => {
+      await mockEslint({
+        status: 127,
+        stdout: '',
+        stderr: '/bin/sh: line 1: npx: command not found\n',
+        error: undefined,
+      });
+
+      const result = eslintLintProvider.measure(CONTEXT);
+
+      expect(isErr(result)).toBe(true);
+      if (isErr(result)) expect(result.error.kind).toBe('crashed');
+    });
+  });
+
+  describe('the missing-eslint pre-flight (backlog #47)', () => {
+    it('refuses with tool-missing when the project has no eslint, without spawning anything', async () => {
+      // The launcher does not FAIL on an absent binary, it SUBSTITUTES one. Reproduced
+      // in a directory holding nothing but a package.json, an eslint.config.mjs and
+      // src/a.js: `npx eslint --format json src/` exited 0 with a complete per-file
+      // report, errorCount 0, from eslint v10.8.1 -- and `npx --no-install` and
+      // `bunx --no-install` did exactly the same, out of their machine-global caches.
+      //
+      // Not spawning is also what keeps a missing linter from spending the lint budget:
+      // `npx --no-install` for an absent binary still does a packument GET.
+      await mockEslint({ stdout: FINDINGS, status: 1 });
+
+      const result = eslintLintProvider.measure({ ...BASE_CONTEXT, projectRoot: bareRoot });
+
+      expect(isErr(result)).toBe(true);
+      if (!isErr(result)) return;
+      expect(result.error.kind).toBe('tool-missing');
+      expect(result.error.dimension).toBe('eslint');
+
+      const { spawnSync } = await import('child_process');
+      expect(spawnSync).not.toHaveBeenCalled();
+    });
+
+    it('names the package, the remedy and the detected manager in the refusal', () => {
+      writeFileSync(path.join(bareRoot, 'eslint.config.mjs'), 'export default [];\n');
+
+      const npmResult = eslintLintProvider.measure({ ...BASE_CONTEXT, projectRoot: bareRoot });
+      expect(isErr(npmResult)).toBe(true);
+      if (!isErr(npmResult)) return;
+      expect(npmResult.error.message).toContain('npm install --save-dev eslint');
+      expect(npmResult.error.message).toContain('node_modules/.bin/eslint');
+      expect(npmResult.error.message).toContain(bareRoot);
+      expect(npmResult.error.message).toContain('QUALITY_PACKAGE_MANAGER');
+
+      // A refusal that tells a bun project to run `npm install` is the kind of
+      // not-quite-right advice that makes an adopter stop reading the loud channel.
+      const bunResult = eslintLintProvider.measure({
+        ...BASE_CONTEXT,
+        projectRoot: bareRoot,
+        packageManager: { manager: 'bun', reason: 'bun.lock present' },
+      });
+      expect(isErr(bunResult)).toBe(true);
+      if (!isErr(bunResult)) return;
+      expect(bunResult.error.message).toContain('bun add --dev eslint');
+    });
+
+    it('does not tell a project with no eslint config to install a linter it rejected', () => {
+      // A Biome or oxlint project has no eslint config and no eslint, and the honest
+      // statement is that there is nothing here for this dimension to measure -- not
+      // "install eslint". Still a refusal, because it is still not a zero.
+      //
+      // The message must also not offer a remedy that does nothing for them: "drop the
+      // eslint.* rule from rules.json" is empty advice to a project that has no such
+      // rule, so it says what the failure actually costs (reported every run, run not
+      // cached, no opt-out) rather than pretending there is a switch.
+      const result = eslintLintProvider.measure({ ...BASE_CONTEXT, projectRoot: bareRoot });
+
+      expect(isErr(result)).toBe(true);
+      if (!isErr(result)) return;
+      expect(result.error.kind).toBe('tool-missing');
+      expect(result.error.message).toContain('no eslint config');
+      expect(result.error.message).toContain('does not fail the gate unless');
+      expect(result.error.message).toContain('no way to switch the eslint dimension off');
+      expect(result.error.message).not.toContain('It does have an eslint config');
+    });
+
+    it('claims report evidence for the pre-flight refusal, listing every path searched', () => {
+      // No process evidence for a spawn that never happened: claiming an exit code here
+      // would be a lie in the one field an investigator trusts.
+      const result = eslintLintProvider.measure({ ...BASE_CONTEXT, projectRoot: bareRoot });
+
+      expect(isErr(result)).toBe(true);
+      if (!isErr(result)) return;
+      const evidence = result.error.evidence;
+      expect(evidence.via).toBe('report');
+      expect(evidence.elapsedMs).toBe(0);
+      if (evidence.via !== 'report') return;
+      expect(evidence.attempts[0].path).toBe(
+        path.join(bareRoot, 'node_modules', '.bin', 'eslint')
+      );
+      expect(evidence.attempts[0].outcome).toBe('absent');
+      expect(evidence.attempts[0].existed).toBe(false);
+      // One per ancestor, ending at the filesystem root.
+      expect(evidence.attempts[evidence.attempts.length - 1].path).toBe(
+        path.join(path.parse(bareRoot).root, 'node_modules', '.bin', 'eslint')
+      );
+    });
+
+    it('reports a nonexistent project root as such, not as a missing eslint', () => {
+      const missing = path.join(bareRoot, 'pacakges', 'web');
+
+      const result = eslintLintProvider.measure({ ...BASE_CONTEXT, projectRoot: missing });
+
+      expect(isErr(result)).toBe(true);
+      if (!isErr(result)) return;
+      expect(result.error.message).toContain('the project root does not exist');
+      expect(result.error.message).toContain(missing);
+      // Installing eslint does not fix a mistyped path, so the remedy must not say to.
+      expect(result.error.message).not.toContain('--save-dev eslint');
+    });
+
+    it('still invokes a locally-installed eslint unchanged, with the flag before the binary', async () => {
+      await mockEslint({ stdout: FINDINGS, status: 1 });
+
+      const result = eslintLintProvider.measure(CONTEXT);
+
+      const { spawnSync } = await import('child_process');
+      expect(spawnSync).toHaveBeenCalledTimes(1);
+      expect(spawnSync).toHaveBeenCalledWith(
+        'npx',
+        ['--no-install', 'eslint', '--format', 'json', 'src/'],
+        expect.objectContaining({ cwd: installedRoot, timeout: 120_000, maxBuffer: 1024 })
+      );
+      expect(isOk(result)).toBe(true);
+      if (!isOk(result)) return;
+      expect(result.value.metrics).toEqual({ errors: 3, warnings: 1, rootCauses: 2 });
+    });
+
+    it('relabels a launcher refusal as tool-missing rather than unparseable output', async () => {
+      // Both launchers refuse with exit **1**, which is inside ESLINT_SUCCESS_EXIT_CODES
+      // because 1 is also how eslint reports findings -- so no exit-code check catches
+      // this and the run lands in the empty-stdout guard, one step from being called a
+      // formatter problem.
+      const wordings = [
+        'npm error npx canceled due to missing packages and no YES option: ["eslint@9.31.0"]',
+        "error: Could not find an existing 'eslint' binary to run. Stopping because " +
+          '--no-install was passed.',
+      ];
+
+      for (const stderr of wordings) {
+        await mockEslint({ stdout: '', stderr, status: 1 });
+        const result = eslintLintProvider.measure(CONTEXT);
+
+        expect(isErr(result), stderr).toBe(true);
+        if (!isErr(result)) return;
+        expect(result.error.kind, stderr).toBe('tool-missing');
+        // The shim the pre-flight DID find is the whole diagnostic value.
+        expect(result.error.message).toContain(
+          path.join(installedRoot, 'node_modules', '.bin', 'eslint')
+        );
+      }
+    });
+
+    it('keeps an empty report with unrelated stderr as unparseable-output', async () => {
+      // The paired control. A relabel that fired always would make every genuine empty
+      // report read as a missing tool, which trains an adopter to ignore the channel.
+      await mockEslint({ stdout: '', stderr: 'Segmentation fault\n', status: 0 });
+
+      const result = eslintLintProvider.measure(CONTEXT);
+
+      expect(isErr(result)).toBe(true);
+      if (isErr(result)) expect(result.error.kind).toBe('unparseable-output');
     });
   });
 
@@ -301,9 +507,9 @@ describe('eslintLintProvider', () => {
       const { spawnSync } = await import('child_process');
       expect(spawnSync).toHaveBeenCalledWith(
         'npx',
-        ['eslint', '--format', 'json', 'src/'],
+        ['--no-install', 'eslint', '--format', 'json', 'src/'],
         expect.objectContaining({
-          cwd: '/test/project',
+          cwd: installedRoot,
           timeout: 120_000,
           maxBuffer: 1024,
         })

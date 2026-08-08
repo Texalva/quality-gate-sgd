@@ -7,6 +7,7 @@ import {
   extractSonarqubeIssues,
   extractLocatedIssues,
 } from '../../src/targets/extract.js'
+import type { RunnerSelection } from '../../src/runner.js'
 import type { SymbolTable, CodeSymbol } from '../../src/symbols/types.js'
 
 // Mock fs
@@ -24,6 +25,36 @@ vi.mock('child_process', () => ({
   spawnSync: vi.fn(),
   execSync: vi.fn(),
 }))
+
+/**
+ * `binaryInvocation` is stubbed for the same reason `fs` is mocked at all: the runner
+ * settles whether `node_modules/.bin/eslint` exists through the same `existsSync` these
+ * tests aim at coverage reports, and most of them set it to `false` wholesale -- so
+ * eslint would read as absent and every lint measurement here would refuse with
+ * `tool-missing` before spawning.
+ *
+ * Stubbed to "the shim is there", which is the premise of these tests. The COMMAND still
+ * comes from the real builder, so the `--no-install` flag is not mocked away, and the
+ * real resolution is covered against real files in tests/runner.test.ts and
+ * tests/providers/eslint.test.ts.
+ *
+ * Stubbing `resolveProjectBinary` instead would NOT work: `binaryInvocation` calls it
+ * through a module-internal reference, which a partial ESM mock of the module's exports
+ * does not intercept.
+ */
+vi.mock('../../src/runner.js', async () => {
+  const actual = await vi.importActual<typeof import('../../src/runner.js')>('../../src/runner.js')
+  return {
+    ...actual,
+    binaryInvocation: vi.fn(
+      (binary: string, args: readonly string[], selection: RunnerSelection) => ({
+        kind: 'runnable' as const,
+        command: actual.binaryCommand(binary, args, selection),
+        shimPath: `/test/project/node_modules/.bin/${binary}`,
+      })
+    ),
+  }
+})
 
 // Mock config
 vi.mock('../../src/config.js', () => ({

@@ -19,6 +19,18 @@ import { readEntryManager } from './runner.js';
 import { measurementInputsHash, measurementInputsListing } from './measurement-inputs.js';
 
 /**
+ * 7 since an eslint the project does not have became a measurement failure. Version 6
+ * measured whatever the launcher supplied: `npx eslint --format json src/` in a directory
+ * holding only a package.json, an eslint.config.mjs and src/a.js exited 0 with a complete
+ * errorCount-0 report from eslint v10.8.1, and the version-6 CLI printed
+ * `ESLint: errors=0, warnings=0` and `✓ Quality gate PASSED` against an
+ * `eslint.errors: 0` ceiling -- reproduced end to end on the real binary. A version-6
+ * entry can hold that PASS with no recorded failure, and `cli.ts` exits 0 on a cached
+ * pass before `binaryInvocation` runs, so the fixed build would inherit the verdict the
+ * fix exists to prevent. Reachable by upgrading the tool on an unchanged tree.
+ *
+ * 6 since a lost SonarQube reading became a measurement failure.
+ *
  * 5 since an individual ratcheted metric absent from the baseline became a rule that
  * did not run. That is a change in what a PASS means, and the previous build recorded
  * it as the opposite: `monotonicSkipped` was true only when the whole baseline was
@@ -39,7 +51,7 @@ import { measurementInputsHash, measurementInputsListing } from './measurement-i
  * point: the fix must not be undone by a cache written before it. Full reasoning on
  * QualityGateCache in types.ts.
  */
-const CURRENT_SCHEMA_VERSION = 6;
+const CURRENT_SCHEMA_VERSION = 7;
 
 /**
  * Buffer ceiling for the git reads whose output scales with the repository.

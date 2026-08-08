@@ -42,7 +42,11 @@ export type Result<T, E> = {
  * observed against a real subject, not a hypothetical:
  *
  * - `tool-missing`       apollo-client ships a `typecheck` script; the tool
- *                        shells `npm run type-check` and got nothing back.
+ *                        shells `npm run type-check` and got nothing back. Also
+ *                        emitted for a project with an eslint config and no
+ *                        eslint installed, where `npx eslint --format json src/`
+ *                        exited 0 with a complete errorCount-0 report from a
+ *                        registry-supplied v10.8.1 -- see providers/eslint.ts.
  * - `crashed`            eslint died on a gitignored `canonical-references.json`
  *                        and the tool reported 0 findings.
  * - `timed-out`          the spawn budget elapsed and the child was killed.
@@ -157,28 +161,41 @@ export interface ProcessEvidence extends MeasurementEvidenceBase {
     readonly stderrExcerpt?: string;
 }
 /**
- * One report file a provider looked for, and what it found there.
+ * One filesystem path a provider consulted, and what it found there.
+ *
+ * Named for the case it was built for -- a coverage report a provider tried to
+ * read -- and used for two others, because "which paths did you look at, and
+ * what was there" is the same evidence in all three. The typecheck provider
+ * records the `package.json` it settled a script's existence from, and the
+ * eslint provider records every `node_modules/.bin/eslint` candidate its
+ * pre-flight probed. Those two are EXISTENCE probes rather than reads, which is
+ * why `bytesRead` and `modifiedMs` are null on them: no file was opened.
  *
  * `outcome` is a closed set rather than a boolean because the four ways a read
  * can go wrong need four different answers from the adopter: an absent report
  * means the tool did not write one, an unreadable one is a permissions or
  * filesystem problem, invalid JSON means the writer was interrupted, and a
- * wrong shape means the file is not the report we were told to expect.
+ * wrong shape means the file is not the report we were told to expect. An
+ * existence probe that missed is `absent`, which is the same statement.
  */
 export interface ReportAttempt {
     readonly path: string;
     readonly existed: boolean;
-    /** null when nothing was read -- absent, or the read itself threw. */
+    /** null when nothing was read -- absent, an existence probe, or the read threw. */
     readonly bytesRead: number | null;
     /**
      * mtimeMs. RECORDED, never judged -- by this provider or by any caller.
      *
-     * It is the only signal separating a report written by this run from last
-     * week's, so it belongs in the evidence a human reads. Nothing in the tool
+     * For a report it is the only signal separating one written by this run from
+     * last week's, so it belongs in the evidence a human reads. Nothing in the tool
      * compares it against anything: a caller did, briefly, and the comparison was
      * wrong in both directions at once (see MeasurementFailureKind and backlog
      * #39). Adding a threshold here would additionally be the provider vouching for
      * its own freshness, which the note on MeasurementProvider below rules out.
+     *
+     * Null for an existence probe, and that is not a lost signal: a shim path or a
+     * manifest was never claimed to be a report this run produced, so there is no
+     * freshness question to answer about it.
      */
     readonly modifiedMs: number | null;
     readonly outcome: 'read' | 'absent' | 'unreadable' | 'invalid-json' | 'wrong-shape';
@@ -186,9 +203,11 @@ export interface ReportAttempt {
     readonly errorCode?: string;
 }
 /**
- * What a report-reading provider actually looked at.
+ * What a provider that did not spawn anything actually looked at.
  *
- * A provider that reads an artifact has no exit status, no signal and no
+ * A provider that reads an artifact -- or that settles a question from the
+ * filesystem before spawning, as the typecheck and eslint pre-flights do -- has
+ * no exit status, no signal and no
  * streams, so ProcessEvidence's required fields cannot be filled honestly --
  * and filling them with `exitCode: 0, stdoutBytes: 0` would state that a
  * process ran cleanly and printed nothing, which is exactly the kind of

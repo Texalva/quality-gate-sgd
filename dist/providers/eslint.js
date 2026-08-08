@@ -10,6 +10,10 @@
  * afterwards. Improvements belong in later steps where their diffs can be
  * reviewed on their own.
  *
+ * The PARSING is still that untouched move. The INVOCATION is not: the pre-flight
+ * refusal and the launcher-refusal relabelling below were added later, for backlog #47,
+ * and are the one part of this file that is not like-for-like.
+ *
  * Two fidelity details worth naming, since both look like things to tidy up:
  *
  *   - Totals come from eslint's own `errorCount`/`warningCount` per file, NOT
@@ -23,7 +27,9 @@
  *     or truncated process) before parsing is ever reached.
  */
 import { spawnSync } from 'child_process';
-import { binaryCommand } from '../runner.js';
+import { existsSync } from 'fs';
+import path from 'path';
+import { binaryInvocation, installAdvice, NO_INSTALL_REFUSAL_PATTERN, PACKAGE_MANAGER_ENV_VAR, } from '../runner.js';
 import { buildEvidence, classifyProcessOutput, err, measurementFailure, ok } from './result.js';
 /**
  * `src/` is hardcoded on purpose -- see src/layout.ts. It is how a project says
@@ -31,6 +37,35 @@ import { buildEvidence, classifyProcessOutput, err, measurementFailure, ok } fro
  * against a project laid out otherwise rather than letting this lint a subset.
  */
 const ESLINT_ARGS = ['--format', 'json', 'src/'];
+/**
+ * Config filenames that mean "this project intends to be linted by eslint".
+ *
+ * Read for ONE purpose: to word a refusal. When the binary is missing, a project with a
+ * config is one install away from being measurable, and a project with neither has
+ * nothing here to measure at all -- and telling a Biome or oxlint project to install a
+ * linter it rejected on purpose is exactly the not-quite-right advice that trains an
+ * adopter to stop reading the loud channel.
+ *
+ * Duplicated from the eslint entries in MEASUREMENT_INPUTS rather than derived from
+ * them, because the two lists answer different questions: that one is the cache
+ * identity, where ADDING a name changes every stored verdict, and this one is a
+ * message. Importing it would also drag the config module into a provider.
+ *
+ * Root-level only, and deliberately does not read package.json's legacy `eslintConfig`
+ * field -- so the message says which paths were looked at rather than claiming the
+ * project has no config anywhere.
+ */
+const ESLINT_CONFIG_FILES = [
+    'eslint.config.js',
+    'eslint.config.mjs',
+    'eslint.config.cjs',
+    'eslint.config.ts',
+    '.eslintrc.json',
+    '.eslintrc.js',
+    '.eslintrc.cjs',
+    '.eslintrc.yml',
+    '.eslintrc.yaml',
+];
 /** eslint's own severity encoding: 2 is an error, 1 a warning, 0 disabled. */
 const SEVERITY_ERROR = 2;
 /**
@@ -148,7 +183,97 @@ export const eslintLintProvider = {
     name: 'eslint',
     dimension: 'eslint',
     measure(context) {
-        const command = binaryCommand('eslint', ESLINT_ARGS, context.packageManager);
+        const invocation = binaryInvocation('eslint', ESLINT_ARGS, context.packageManager, context.projectRoot);
+        const command = invocation.command;
+        const launcher = command.executable;
+        // Both refusals below happen BEFORE the spawn, for the same reason the typecheck
+        // provider refuses a script package.json does not define: the launcher does not FAIL
+        // on an absent binary, it SUBSTITUTES one. Reproduced in a directory holding nothing
+        // but a package.json, an eslint.config.mjs and src/a.js, with no eslint installed
+        // anywhere above it:
+        //
+        //   npx eslint --format json src/               -> exit 0, complete per-file report,
+        //                                                  errorCount 0, from eslint v10.8.1
+        //   npx --no-install eslint --format json src/  -> exit 0, the SAME clean report
+        //   bunx --no-install eslint --format json src/ -> exit 0, the SAME clean report
+        //
+        // Nothing at the process level is wrong there: something genuinely ran, exited 0 and
+        // emitted a well-formed report. It just was not this project's linter -- v10.8.1 came
+        // out of ~/.npm/_npx/<hash> and /tmp/bunx-<uid>-eslint@latest, which `--no-install`
+        // does not disable. So the flag is the belt and this check is the fix.
+        //
+        // A nonexistent project root is separated out first because it is the more specific
+        // claim, the same ordering `dimensions/custom.ts` uses for a nonexistent cwd. A walk
+        // over directories that are not there finds no eslint anywhere, and "install eslint"
+        // is confidently wrong advice for a mistyped path.
+        if (invocation.kind === 'root-missing') {
+            return err(measurementFailure('tool-missing', 'eslint', `\`${command.display}\` was not run: the project root does not exist -- ` +
+                `${invocation.projectRoot}. Every dimension is measured in that directory, so ` +
+                'there is no tree here to look for eslint in, and nothing about this project ' +
+                'could be read' +
+                `${process.env.QUALITY_PROJECT_ROOT ? ' (QUALITY_PROJECT_ROOT is set -- check it)' : ''}` +
+                '. Reported as a configuration failure rather than as a missing eslint, because ' +
+                'installing eslint would not fix a path that is not there.', {
+                via: 'report',
+                command: command.display,
+                elapsedMs: 0,
+                attempts: [
+                    {
+                        path: invocation.projectRoot,
+                        existed: false,
+                        bytesRead: null,
+                        modifiedMs: null,
+                        outcome: 'absent',
+                    },
+                ],
+            }));
+        }
+        if (invocation.kind === 'absent') {
+            const configured = ESLINT_CONFIG_FILES.some((name) => existsSync(path.join(context.projectRoot, name)));
+            const remedy = installAdvice('eslint', context.packageManager, context.projectRoot);
+            // `via: 'report'` for the reason the typecheck provider gives: this failure was
+            // established by READING the filesystem, and claiming an exit code for a spawn that
+            // never happened would be a lie in the one field an investigator trusts.
+            //
+            // Every candidate is listed rather than capped. The whole point of walking up is
+            // that a monorepo adopter has to be able to see WHICH parents were consulted, and a
+            // truncated list is exactly the evidence that makes "eslint is not installed" read
+            // as a lie to someone looking at a root node_modules.
+            const searchEvidence = {
+                via: 'report',
+                command: command.display,
+                elapsedMs: 0,
+                attempts: invocation.searched.map((candidate) => ({
+                    path: candidate,
+                    existed: false,
+                    bytesRead: null,
+                    modifiedMs: null,
+                    outcome: 'absent',
+                })),
+            };
+            return err(measurementFailure('tool-missing', 'eslint', `\`${command.display}\` was not run: this project has no eslint of its own. Looked ` +
+                `for \`node_modules/.bin/eslint\` in ${context.projectRoot} and in every parent ` +
+                `directory up to the filesystem root -- ${invocation.searched.length} candidate ` +
+                `path(s) -- and found none. ` +
+                (configured
+                    ? `It does have an eslint config, so it is one step from measurable: ${remedy}.`
+                    : `It has no eslint config either (looked for ` +
+                        `${ESLINT_CONFIG_FILES.join(', ')} in the project root), so there is nothing ` +
+                        `here for the eslint dimension to measure. That does not fail the gate unless ` +
+                        `rules.json actually grades \`eslint.*\` -- but it IS reported every run and it ` +
+                        `stops the run being cached, and this tool has no way to switch the eslint ` +
+                        `dimension off, so for a project that lints with something else that noise is ` +
+                        `the standing cost. If it should lint with eslint, add a config, then: ` +
+                        `${remedy}.`) +
+                ` Refusing rather than measuring: left to itself \`${launcher}\` answers a missing ` +
+                `linter by supplying one from the registry or from its own machine-global cache, ` +
+                `and a finding count from an eslint this project does not use is not a measurement ` +
+                `of this project. Binaries are resolved through node_modules/.bin only, so a Yarn ` +
+                `PnP tree has none for this to find however eslint is installed there. The launcher ` +
+                `was chosen because ${context.packageManager.reason}; set ${PACKAGE_MANAGER_ENV_VAR} ` +
+                `to npm or bun if that is the wrong one here (those are the only two this tool ` +
+                `spawns).`, searchEvidence));
+        }
         const startedAt = Date.now();
         const spawn = spawnSync(command.executable, [...command.args], {
             cwd: context.projectRoot,
@@ -175,6 +300,26 @@ export const eslintLintProvider = {
         // result, only a run that produced nothing. The old fallback turned exactly
         // that case into a clean bill of health.
         if (output.value.trim() === '') {
+            // Both launchers refuse with exit **1**, which is inside ESLINT_SUCCESS_EXIT_CODES
+            // because 1 is also how eslint reports findings -- so no exit-code check can catch
+            // this and the run lands here, one step from being called a formatter problem.
+            //
+            // The pre-flight above found a shim, so reaching this means either the shim vanished
+            // between the check and the exec, or the launcher does not resolve from where this
+            // tool looked. Naming the shim it DID find is the whole diagnostic value.
+            //
+            // Kept inside the empty-stdout guard on purpose, not hoisted above it: a future
+            // launcher that prints its refusal while ALSO emitting something on stdout should
+            // fall through to the ordinary parse rather than let this pattern relabel a real
+            // report. That is loud either way; the ordering is what keeps it from being wrong.
+            if (NO_INSTALL_REFUSAL_PATTERN.test(spawn.stderr ?? '')) {
+                return err(measurementFailure('tool-missing', 'eslint', `\`${command.display}\` linted nothing: ${launcher} refused to run eslint because it ` +
+                    `could not find one it was allowed to use, and this tool passes \`--no-install\` so ` +
+                    `it will not download one. This tool DID find a shim at ${invocation.shimPath} ` +
+                    `before spawning, so either it disappeared mid-run or it is not one ${launcher} ` +
+                    `resolves from ${context.projectRoot}. Re-install this project's dependencies, or: ` +
+                    `${installAdvice('eslint', context.packageManager, context.projectRoot)}.`, buildEvidence(spawn, command.display, elapsedMs)));
+            }
             return unparseable('produced no output at all, though eslint always emits a JSON report');
         }
         let parsed;

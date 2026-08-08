@@ -8,18 +8,22 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import path from 'path';
 
 import {
   binaryCommand,
+  binaryInvocation,
   detectPackageManager,
   detectTypecheckScript,
+  installAdvice,
   manifestDefinesScript,
   MISSING_SCRIPT_PATTERN,
+  NO_INSTALL_REFUSAL_PATTERN,
   PACKAGE_MANAGER_ENV_VAR,
   readEntryManager,
+  resolveProjectBinary,
   scriptCommand,
   TYPECHECK_SCRIPT_ENV_VAR,
   type RunnerSelection,
@@ -310,14 +314,40 @@ describe('command construction', () => {
 
   it('runs binaries through npx or bunx, not node_modules/.bin', () => {
     // The .bin shims start with `#!/usr/bin/env node`, so executing them directly
-    // needs node on PATH -- which defeats the point on a bun-only machine.
+    // needs node on PATH -- which defeats the point on a bun-only machine. The .bin
+    // path IS resolved a few describes down, for EXISTENCE only -- see
+    // resolveProjectBinary -- which is not the same as executing the shim.
     expect(binaryCommand('eslint', ['--format', 'json'], npm).executable).toBe('npx');
     expect(binaryCommand('eslint', ['--format', 'json'], bun).executable).toBe('bunx');
     expect(binaryCommand('eslint', ['--format', 'json'], bun).args).toEqual([
+      '--no-install',
       'eslint',
       '--format',
       'json',
     ]);
+  });
+
+  it('passes --no-install to both launchers, before the binary name', () => {
+    // Mechanism (b) of backlog #47. Both managers spell it identically -- verified by
+    // running npm 12.0.2 and bun 1.3.14 -- and the position matters: after the binary
+    // name the launcher forwards the flag to eslint instead of consuming it.
+    for (const selection of [npm, bun]) {
+      const cmd = binaryCommand('eslint', ['--format', 'json', 'src/'], selection);
+      expect(cmd.args[0]).toBe('--no-install');
+      expect(cmd.args[1]).toBe('eslint');
+    }
+  });
+
+  it("does not use npx's --no, which swallows the binary name", () => {
+    // `--no` looks like the same flag and is a trap. It is a real npm shorthand for
+    // `--no-yes`, but `no-yes` is in neither the switches nor the opts set of
+    // npx-cli.js, so its argv preprocessor consumes the NEXT TOKEN as the flag's value
+    // -- and the next token is the binary name. MEASURED on npm 12.0.2:
+    // `npx --no eslint --version` printed `12.0.2` and exited 0. It ran `npm --version`.
+    // A misspelling that manufactures its own vacuous pass is worse than no guard.
+    for (const selection of [npm, bun]) {
+      expect(binaryCommand('eslint', ['src/'], selection).args).not.toContain('--no');
+    }
   });
 
   it('keeps display exactly reproducible, with no detection reason appended', () => {
@@ -326,7 +356,210 @@ describe('command construction', () => {
     // shell -- against the whole point of reporting a reproduction command.
     const verbose: RunnerSelection = { manager: 'npm', reason: 'package-lock.json present' };
     expect(scriptCommand('build', verbose).display).toBe('npm run build');
-    expect(binaryCommand('eslint', ['src/'], verbose).display).toBe('npx eslint src/');
+    expect(binaryCommand('eslint', ['src/'], verbose).display).toBe(
+      'npx --no-install eslint src/'
+    );
+  });
+});
+
+/**
+ * Real directories again, for the reason stated at the top of this file, and one more
+ * specific to these: mocking `existsSync` could not reproduce the guarantee the walk
+ * leans on -- that `existsSync` FOLLOWS symlinks while `lstatSync` does not -- so the
+ * dangling-shim case would assert against the test's own model instead of the
+ * filesystem's behaviour.
+ *
+ * Every absence assertion uses a nonsense binary name, because the walk reaches the
+ * filesystem root: with a real name the result would depend on whether this machine
+ * happens to have `/tmp/node_modules/.bin/eslint`.
+ */
+describe('resolveProjectBinary', () => {
+  const ABSENT_BINARY = 'qg-no-such-binary-47';
+
+  const installShim = (directory: string, name: string) => {
+    const bin = path.join(directory, 'node_modules', '.bin');
+    mkdirSync(bin, { recursive: true });
+    writeFileSync(path.join(bin, name), '#!/bin/sh\n');
+    return path.join(bin, name);
+  };
+
+  it('finds a shim in the project root', () => {
+    const shim = installShim(root, 'eslint');
+
+    const resolution = resolveProjectBinary(root, 'eslint');
+
+    expect(resolution.kind).toBe('resolved');
+    if (resolution.kind !== 'resolved') return;
+    expect(resolution.shimPath).toBe(shim);
+  });
+
+  it('walks up to a hoisted shim across a package.json with no node_modules and a .git', () => {
+    // The layout both launchers were MEASURED against: shim at the top, cwd five
+    // directories below it, an intermediate package.json with no node_modules, and a
+    // `.git` in between. `npx --no-install qgwalk47` and `bunx --no-install qgwalk47`
+    // both resolved and ran the top shim from the leaf. A pre-flight stopping at the
+    // .git root, or at the first package.json, would refuse a hoisted monorepo the
+    // launcher serves perfectly well.
+    const shim = installShim(root, 'qgwalk47');
+    const leaf = path.join(root, 'a', 'b', 'c', 'd', 'e');
+    mkdirSync(leaf, { recursive: true });
+    mkdirSync(path.join(root, 'a', 'b', '.git'), { recursive: true });
+    writeFileSync(path.join(root, 'a', 'b', 'package.json'), '{}');
+    writeFileSync(path.join(leaf, 'package.json'), '{}');
+
+    const resolution = resolveProjectBinary(leaf, 'qgwalk47');
+
+    expect(resolution.kind).toBe('resolved');
+    if (resolution.kind !== 'resolved') return;
+    expect(resolution.shimPath).toBe(shim);
+  });
+
+  it('reports a dangling .bin symlink as absent', () => {
+    // A shim whose package was pruned -- a partial install, a restored CI cache -- is a
+    // dangling link. `lstatSync` reports it present; `existsSync` follows it and
+    // correctly reports it absent, which is why the walk uses existsSync. Running that
+    // shim would fail in a way nothing here could label.
+    const bin = path.join(root, 'node_modules', '.bin');
+    mkdirSync(bin, { recursive: true });
+    symlinkSync('../nowhere/bin/gone.js', path.join(bin, ABSENT_BINARY));
+
+    expect(resolveProjectBinary(root, ABSENT_BINARY).kind).toBe('absent');
+  });
+
+  it('records every directory it searched, in outward order', () => {
+    // The evidence a monorepo adopter needs: "eslint is not installed" reads as a lie
+    // to someone who can see it in the root node_modules unless the refusal says which
+    // parents were consulted.
+    const resolution = resolveProjectBinary(root, ABSENT_BINARY);
+
+    expect(resolution.kind).toBe('absent');
+    if (resolution.kind !== 'absent') return;
+    expect(resolution.searched[0]).toBe(
+      path.join(root, 'node_modules', '.bin', ABSENT_BINARY)
+    );
+    expect(resolution.searched[1]).toBe(
+      path.join(path.dirname(root), 'node_modules', '.bin', ABSENT_BINARY)
+    );
+    expect(resolution.searched.length).toBeGreaterThan(2);
+  });
+
+  it('covers the whole ancestor chain, ending at the filesystem root', () => {
+    // A CONTENT assertion, deliberately not a termination assertion: a mutation that
+    // loops forever is not a discriminating signal, so what is pinned is that the last
+    // candidate is the filesystem root's. The walk has to cover the whole chain the
+    // launchers cover -- both resolved a shim five levels up -- so any depth cap or
+    // earlier stopping point is the false failure this guards against.
+    const resolution = resolveProjectBinary(root, ABSENT_BINARY);
+
+    expect(resolution.kind).toBe('absent');
+    if (resolution.kind !== 'absent') return;
+    expect(resolution.searched[resolution.searched.length - 1]).toBe(
+      path.join(path.parse(root).root, 'node_modules', '.bin', ABSENT_BINARY)
+    );
+  });
+
+  it('consults Windows shim spellings only on win32', () => {
+    // The suffix list is a guess -- there is no Windows here to check it against -- so
+    // this pins that the branch EXISTS and is inert off Windows, not that `.cmd` is the
+    // right spelling. A bare-name-only check would report every Windows project's
+    // binary absent.
+    const bin = path.join(root, 'node_modules', '.bin');
+    mkdirSync(bin, { recursive: true });
+    writeFileSync(path.join(bin, 'eslint.cmd'), '');
+
+    expect(resolveProjectBinary(root, 'eslint', 'win32').kind).toBe('resolved');
+    expect(resolveProjectBinary(root, 'eslint', 'linux').kind).toBe('absent');
+  });
+
+  it('reports a nonexistent project root as such, not as a missing binary', () => {
+    // Same reasoning as dimensions/custom.ts checking a nonexistent cwd first: a walk
+    // over directories that are not there finds nothing anywhere, and "install eslint"
+    // is confidently wrong advice for a mistyped QUALITY_PROJECT_ROOT.
+    const resolution = resolveProjectBinary(path.join(root, 'pacakges', 'web'), 'eslint');
+
+    expect(resolution.kind).toBe('root-missing');
+  });
+});
+
+describe('binaryInvocation', () => {
+  const npm: RunnerSelection = { manager: 'npm', reason: 'test' };
+
+  it('refuses an absent binary and still reports the command it would have run', () => {
+    const invocation = binaryInvocation('qg-no-such-binary-47', ['src/'], npm, root);
+
+    expect(invocation.kind).toBe('absent');
+    if (invocation.kind !== 'absent') return;
+    // The refusal message has to name the command that was NOT run, pasteably.
+    expect(invocation.command.display).toBe('npx --no-install qg-no-such-binary-47 src/');
+    expect(invocation.searched.length).toBeGreaterThan(0);
+  });
+
+  it('hands back a runnable command when the shim is there', () => {
+    const bin = path.join(root, 'node_modules', '.bin');
+    mkdirSync(bin, { recursive: true });
+    writeFileSync(path.join(bin, 'eslint'), '#!/bin/sh\n');
+
+    const invocation = binaryInvocation('eslint', ['src/'], npm, root);
+
+    expect(invocation.kind).toBe('runnable');
+    if (invocation.kind !== 'runnable') return;
+    expect(invocation.shimPath).toBe(path.join(bin, 'eslint'));
+    expect(invocation.command.args).toEqual(['--no-install', 'eslint', 'src/']);
+  });
+});
+
+describe('installAdvice', () => {
+  const npm: RunnerSelection = { manager: 'npm', reason: 'test' };
+  const bun: RunnerSelection = { manager: 'bun', reason: 'test' };
+
+  it("names the selected manager's install command", () => {
+    expect(installAdvice('eslint', npm, root)).toBe('npm install --save-dev eslint');
+    expect(installAdvice('eslint', bun, root)).toBe('bun add --dev eslint');
+  });
+
+  it('advises pnpm and yarn for their own trees, though it still spawns npx there', () => {
+    // detectPackageManager folds both into the npm launcher path on purpose, so without
+    // this a pnpm project is told to run `npm install --save-dev`, which drops a
+    // package-lock.json and a hoisted node_modules into a pnpm tree. Advice that
+    // damages the project is worse than no advice.
+    touch('pnpm-lock.yaml');
+    expect(installAdvice('eslint', npm, root)).toBe('pnpm add -D eslint');
+
+    // pnpm REFUSES a bare `add` at a workspace root (ERR_PNPM_ADDING_TO_ROOT).
+    touch('pnpm-workspace.yaml');
+    expect(installAdvice('eslint', npm, root)).toBe('pnpm add -D -w eslint');
+
+    rmSync(path.join(root, 'pnpm-lock.yaml'));
+    rmSync(path.join(root, 'pnpm-workspace.yaml'));
+    touch('yarn.lock');
+    expect(installAdvice('eslint', npm, root)).toBe('yarn add -D eslint');
+  });
+
+  it('defers to the launcher this tool actually chose when a known lockfile is present', () => {
+    // A tree with both a bun.lock and a pnpm-lock.yaml is measured with bunx, so
+    // `pnpm add` would be advice about a different tree than the one that refused.
+    touch('pnpm-lock.yaml');
+    touch('bun.lock');
+    expect(installAdvice('eslint', bun, root)).toBe('bun add --dev eslint');
+  });
+
+  it('tells a Yarn PnP tree to change its linker, not to install what it already has', () => {
+    // A PnP project can DECLARE eslint, have it, and lint fine with `yarn exec eslint`,
+    // and still be refused because there is no node_modules/.bin to resolve. `yarn add
+    // -D eslint` changes nothing there, so re-running produces the same refusal forever
+    // -- an unresolvable refusal, which is the false failure this repo rejects designs
+    // for. The remedy has to name the thing that changes the outcome.
+    touch('yarn.lock');
+    touch('.pnp.cjs');
+
+    const advice = installAdvice('eslint', npm, root);
+    expect(advice).toContain('nodeLinker: node-modules');
+    expect(advice).not.toContain('yarn add');
+
+    // Yarn 2 spells the loader .pnp.js.
+    rmSync(path.join(root, '.pnp.cjs'));
+    touch('.pnp.js');
+    expect(installAdvice('eslint', npm, root)).toContain('nodeLinker: node-modules');
   });
 });
 
@@ -346,5 +579,43 @@ describe('MISSING_SCRIPT_PATTERN', () => {
     expect(MISSING_SCRIPT_PATTERN.test("src/a.ts(1,1): error TS2304: Cannot find name 'x'.")).toBe(
       false
     );
+  });
+});
+
+describe('NO_INSTALL_REFUSAL_PATTERN', () => {
+  // Both wordings captured verbatim by running each launcher against a package that
+  // exists on the registry and is not installed here. Like MISSING_SCRIPT_PATTERN this
+  // only ever LABELS a failure already established, so a rewording costs a label and
+  // never a verdict.
+  it("matches npm's wording", () => {
+    expect(
+      NO_INSTALL_REFUSAL_PATTERN.test(
+        'npm error npx canceled due to missing packages and no YES option: ["cowsay@1.6.0"]'
+      )
+    ).toBe(true);
+  });
+
+  it("matches bun's wording", () => {
+    expect(
+      NO_INSTALL_REFUSAL_PATTERN.test(
+        "error: Could not find an existing 'eslint' binary to run. Stopping because " +
+          '--no-install was passed.'
+      )
+    ).toBe(true);
+  });
+
+  it("does not match npm's E404, which is a broken registry rather than a missing install", () => {
+    // Verified: `npx --no-install qgabsent47zz` prints `npm error code E404`, not the
+    // cancel message. For `eslint` a 404 means the registry or mirror is broken, which no
+    // devDependency install fixes, so it must stay unparseable-output.
+    expect(
+      NO_INSTALL_REFUSAL_PATTERN.test(
+        'npm error code E404\nnpm error 404 Not Found - GET https://registry.npmjs.org/eslint'
+      )
+    ).toBe(false);
+  });
+
+  it('does not match ordinary lint output', () => {
+    expect(NO_INSTALL_REFUSAL_PATTERN.test('src/a.ts\n  3:10  error  Expected ===')).toBe(false);
   });
 });

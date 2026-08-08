@@ -30,15 +30,74 @@
  * So the safety does not come from the managers agreeing; it comes from
  * `manifestDefinesScript` settling existence from the manifest BEFORE anything is
  * spawned. A runner difference that turns "missing" into "ran something else" has to
- * be closed above the spawn, not diagnosed after it. The remaining known gap of this
- * shape is `npx`/`bunx` auto-installing an absent binary -- pre-existing for npx, and
- * tracked separately.
+ * be closed above the spawn, not diagnosed after it.
+ *
+ * THE SAME ARGUMENT APPLIES TO BINARIES, and used to have no answer. `npx eslint` and
+ * `bunx eslint` do not FAIL when the project has no eslint -- they SUPPLY one.
+ * Reproduced in a directory holding nothing but a package.json, an eslint.config.mjs
+ * and src/a.js: `npx eslint --format json src/` exited 0 with a complete per-file
+ * report, errorCount 0, out of eslint v10.8.1. `{errors: 0}` satisfying an
+ * `eslint.errors: 0` ceiling, measured by a linter the project never installed.
+ *
+ * Closed twice below. `binaryCommand` passes `--no-install`, and `binaryInvocation`
+ * settles existence from `node_modules/.bin` BEFORE anything is spawned -- exactly what
+ * `manifestDefinesScript` does for scripts, one layer out.
+ *
+ * `--no-install` ALONE would not have been enough, and that is worth recording because
+ * it looks sufficient. Both launchers fall back to a machine-global cache the flag does
+ * not disable: in that same directory `npx --no-install eslint --format json src/` and
+ * `bunx --no-install eslint --format json src/` BOTH exited 0 with the same clean
+ * errorCount-0 report, served out of `~/.npm/_npx/<hash>` and
+ * `/tmp/bunx-<uid>-eslint@latest` left behind by earlier unrelated runs. npx
+ * additionally resolves npm's global prefix bin; bunx additionally resolves anything on
+ * PATH. So the pre-flight is the load-bearing half, and the flag's honest scope is
+ * narrower than it looks: it protects a machine with a COLD cache, no global install and
+ * nothing on PATH, and nothing else. It does NOT rescue a call site that skips the
+ * pre-flight -- on any warm machine that call site gets the full vacuous pass back.
+ *
+ * Nor does it close the window between the check and the exec, which an earlier draft of
+ * this comment claimed. If the shim vanishes after `existsSync` and before the spawn --
+ * a concurrent install or prune -- the launcher falls back to the same warm cache and
+ * emits the same clean report, and nothing downstream can tell that apart from the local
+ * run. That residual is real and is NOT closed here: the fix would be to exec the
+ * resolved shim, which `binaryCommand` deliberately does not do because those shims
+ * start `#!/usr/bin/env node` and that breaks a bun-only machine. What IS caught is the
+ * narrower case where the launcher has nothing to fall back to and refuses with empty
+ * stdout, which the eslint provider relabels via NO_INSTALL_REFUSAL_PATTERN.
+ *
+ * One more residual, for the same reason it is not closed: the walk blesses ANY
+ * `node_modules/.bin/<bin>` on the way up, including one outside the project. A stray
+ * `/home/<user>/node_modules/.bin/eslint` satisfies the pre-flight for every project
+ * under `$HOME`. Deliberate -- it is exactly what the launchers do, and refusing anything
+ * above `projectRoot` false-fails hoisted monorepos and pnpm workspaces, which is the
+ * class of error two earlier designs for this died of. Proving workspace membership would
+ * mean parsing npm/pnpm/yarn workspace metadata, which this module explicitly does not do
+ * (it does not even detect pnpm as a manager). The residual is a misconfigured machine,
+ * not a project state.
+ *
+ * STILL OPEN, and the same defect one module over: custom dimensions run an arbitrary
+ * extractor command through bash (`dimensions/custom.ts`) with no launcher awareness,
+ * and the CLI's own help text seeds one -- `add-dimension "npx madge --circular --json
+ * src/"`. A custom dimension is gated by a ceiling and by nothing else, and every
+ * lower-better dimension is at its best at zero, so a foreign madge grading that
+ * ceiling is the identical failure. Nothing here touches that path.
  *
  * WHAT IS DELIBERATELY NOT SUPPORTED. pnpm and yarn are not detected as distinct
  * managers. `npm run <script>` reads scripts out of package.json and works in a
  * pnpm or yarn workspace, so they fall through to the npm path and keep working;
  * claiming first-class support would imply this tool tests against their
  * node_modules layouts, and it does not.
+ *
+ * Binary resolution is a second and STRICTER dependency on that layout. A Yarn PnP
+ * tree (`nodeLinker: pnp`) has no `node_modules/.bin` at all, so nothing can be
+ * resolved there and the pre-flight refuses rather than measuring. That is the safe
+ * direction and not a new loss -- `npm run <script>` does not work in a PnP tree
+ * either -- but it does mean such a project gets a loud refusal where today it gets a
+ * silent grade from a registry-supplied linter. A refusal has to be one the adopter can
+ * actually resolve, and "install eslint" is not that for someone who already has it, so
+ * `installAdvice` detects PnP by its `.pnp.cjs` loader and names the linker change
+ * instead. `installAdvice` is the one place that names pnpm and yarn at all, and only to
+ * word a remedy; it never picks a launcher.
  */
 /** Managers this tool actually spawns. See the module comment on pnpm/yarn. */
 export type PackageManager = 'npm' | 'bun';
@@ -99,8 +158,121 @@ export declare function scriptCommand(script: string, selection: RunnerSelection
  * shebang, so executing them requires node on PATH and defeats the point on a
  * machine that has bun and nothing else. `bunx` runs the same package under bun's
  * own runtime.
+ *
+ * `resolveProjectBinary` below does resolve those same shim paths, and that is not a
+ * contradiction: it reads them for EXISTENCE only and never execs one, so the
+ * invocation still goes through the launcher and the bun-only machine still works.
  */
 export declare function binaryCommand(binary: string, args: readonly string[], selection: RunnerSelection): ResolvedCommand;
+/**
+ * Whether the project has the binary, and everywhere the search looked.
+ *
+ * A union rather than `string | undefined` so each outcome carries its own evidence.
+ * The absent arm has to be able to tell a monorepo adopter WHICH parents were
+ * consulted, or "eslint is not installed" reads as a lie to someone who can see it in
+ * the root `node_modules`. `root-missing` is separate for the reason
+ * `dimensions/custom.ts` checks a nonexistent cwd before classifying an ENOENT: a walk
+ * over directories that are not there finds no binary anywhere, and "install eslint"
+ * is confidently wrong advice for a mistyped `QUALITY_PROJECT_ROOT`.
+ */
+export type BinaryResolution = {
+    readonly kind: 'resolved';
+    readonly shimPath: string;
+    readonly searched: readonly string[];
+} | {
+    readonly kind: 'absent';
+    readonly searched: readonly string[];
+} | {
+    readonly kind: 'root-missing';
+    readonly projectRoot: string;
+};
+/**
+ * Find the binary in the project's own node_modules, walking up as node does.
+ *
+ * The walk goes all the way to the filesystem root, and that is matched to MEASURED
+ * launcher behaviour rather than chosen for tidiness. With a shim at
+ * `<top>/node_modules/.bin/qgwalk47` and the cwd five directories below it -- crossing
+ * an intermediate package.json with no node_modules AND a `.git` directory -- both
+ * `npx --no-install qgwalk47` and `bunx --no-install qgwalk47` resolved and ran that
+ * shim. A pre-flight stopping at the `.git` root, or at the first package.json, would
+ * refuse a hoisted monorepo the launcher serves perfectly well: a false failure invented
+ * by the guard, which is the class of error this repo has rejected designs for before.
+ *
+ * `existsSync`, which FOLLOWS symlinks, and that is the point rather than an accident.
+ * Every `.bin` entry is a symlink (`eslint -> ../eslint/bin/eslint.js`), so a shim whose
+ * package is gone -- a partial install, a pruned CI cache -- is a dangling link.
+ * Verified both ways against a deliberately broken link: `lstatSync` reports it present,
+ * `existsSync` correctly reports it absent.
+ *
+ * Does NOT check that package.json declares the package. A binary can legitimately come
+ * from a parent workspace or a preset, and demanding a declaration would refuse layouts
+ * that work. The claim made here is exactly "the launcher will find something local",
+ * not "this project depends on it".
+ */
+export declare function resolveProjectBinary(projectRoot: string, binary: string, platform?: NodeJS.Platform): BinaryResolution;
+/**
+ * A binary invocation: the command, plus whether the binary is actually there.
+ *
+ * The union is the guard. `binaryCommand` will build a launcher line for anything, and
+ * a caller that spawns one for a binary the project lacks gets a NUMBER back rather
+ * than a failure -- see the reproduction in the module comment. Handing back a tagged
+ * value means the only route to a spawn is a branch that has already been told the shim
+ * exists.
+ *
+ * Every arm carries `command`, because the failure message for a refusal has to name
+ * the command that was NOT run -- the same shape as the typecheck provider's
+ * missing-script refusal.
+ */
+export type BinaryInvocation = {
+    readonly kind: 'runnable';
+    readonly command: ResolvedCommand;
+    readonly shimPath: string;
+} | {
+    readonly kind: 'absent';
+    readonly command: ResolvedCommand;
+    readonly searched: readonly string[];
+} | {
+    readonly kind: 'root-missing';
+    readonly command: ResolvedCommand;
+    readonly projectRoot: string;
+};
+/**
+ * The command to run a project binary, refused unless the project actually has it.
+ *
+ * `projectRoot` is REQUIRED, with no default, for the reason
+ * `MeasurementContext.packageManager` is: an optional one falling back to `cwd` would
+ * let a call site silently resolve against a different tree than the one being measured.
+ */
+export declare function binaryInvocation(binary: string, args: readonly string[], selection: RunnerSelection, projectRoot: string): BinaryInvocation;
+/**
+ * How to install a package as a devDependency, in the manager this project uses.
+ *
+ * Here rather than in a provider because it is manager knowledge, and a refusal that
+ * tells a bun project to run `npm install` is the kind of not-quite-right advice that
+ * makes an adopter stop reading the loud channel.
+ *
+ * pnpm and yarn are named HERE and nowhere else. `detectPackageManager` folds both into
+ * the npm launcher path on purpose (see the module comment) and this does not change
+ * that -- but `npm install --save-dev eslint` run in a pnpm tree drops a
+ * package-lock.json and a hoisted node_modules into it, and advice that damages the
+ * project is worse than no advice. The tool still spawns `npx`.
+ *
+ * Gated on there being NO lockfile this tool understands, so the advice can never
+ * contradict the launcher standing next to it: a project carrying both a `bun.lock` and
+ * a `pnpm-lock.yaml` is measured with `bunx`, and `pnpm add` would then be advice about
+ * a different tree than the one that just refused.
+ *
+ * The Yarn PnP branch is first and is not about installing at all. A PnP tree has no
+ * `node_modules/.bin` for the pre-flight to find, so a project that DECLARES eslint,
+ * HAS it, and lints fine with `yarn exec eslint` still gets refused -- and telling it to
+ * `yarn add -D eslint` is advice that changes nothing, so re-running produces the same
+ * refusal forever. An unresolvable refusal is the false failure this repo rejects designs
+ * for, so the remedy has to name the thing that actually changes the outcome: the linker.
+ * Detected by `.pnp.cjs` (Yarn 3+) or `.pnp.js` (Yarn 2), which PnP installs write at the
+ * project root. NOT verified against a real PnP tree -- yarn is not installed on this
+ * machine -- so this is a message, never a measurement decision.
+ */
+export declare function installAdvice(binary: string, selection: RunnerSelection, projectRoot: string): string;
 /** Set to run a differently-named script for the typescript dimension. */
 export declare const TYPECHECK_SCRIPT_ENV_VAR = "QUALITY_TYPECHECK_SCRIPT";
 /**
@@ -175,4 +347,25 @@ export declare function readEntryManager(value: unknown): PackageManager | undef
  * label and never the verdict.
  */
 export declare const MISSING_SCRIPT_PATTERN: RegExp;
+/**
+ * How each launcher says it refused to install the binary this tool asked for.
+ *
+ * Both wordings captured by running them against a package that exists on the registry
+ * and is not installed here:
+ *   npm 12.0.2  -> `npm error npx canceled due to missing packages and no YES option:
+ *                   ["cowsay@1.6.0"]`, exit 1
+ *   bun 1.3.14  -> `error: Could not find an existing 'cowsay' binary to run. Stopping
+ *                   because --no-install was passed.`, exit 1
+ *
+ * Like MISSING_SCRIPT_PATTERN this only ever LABELS a failure already established -- the
+ * eslint provider consults it solely once it knows the run produced no report -- so a
+ * reworded message costs a label and never a verdict.
+ *
+ * Deliberately does NOT match npm's E404, which is what npx prints when the name is not
+ * a package at all (verified: `npx --no-install qgabsent47zz` gives `npm error code
+ * E404`, not the cancel message). For `eslint` that means a broken registry or mirror,
+ * not something an adopter fixes by installing a devDependency, so it stays
+ * `unparseable-output` with the 404 in the stderr excerpt.
+ */
+export declare const NO_INSTALL_REFUSAL_PATTERN: RegExp;
 //# sourceMappingURL=runner.d.ts.map

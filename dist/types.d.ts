@@ -87,9 +87,27 @@ import type { PackageManager } from './runner.js';
  *       carrying only `bugs` satisfied every other sonarqube ceiling at zero.
  *     - Only HTTP 200 counts as a reading. Version 5 accepted every status below
  *       400, so a 3xx redirect body of the right shape was accepted as measures.
+ *
+ * 7 -- an eslint the project does not have became a measurement failure, where version
+ *   6 measured whatever the launcher supplied. `npx eslint` and `bunx eslint` do not
+ *   fail on an absent binary, they SUPPLY one: reproduced in a directory holding only a
+ *   package.json, an eslint.config.mjs and src/a.js, `npx eslint --format json src/`
+ *   exited 0 with a complete per-file errorCount-0 report from eslint v10.8.1 out of
+ *   `~/.npm/_npx`, and the version-6 CLI printed `ESLint: errors=0, warnings=0` and
+ *   `✓ Quality gate PASSED` against an `eslint.errors: 0` ceiling. A version-6 entry can
+ *   therefore hold a PASS whose lint number came from a linter the project never
+ *   installed, with no recorded failure -- and `cli.ts` exits 0 on a cached pass before
+ *   `binaryInvocation` is ever called, so the fixed build would serve exactly the run
+ *   the fix exists to catch. Reachable by anyone who upgrades the tool without touching
+ *   the tree: the content hash folds in `git ls-files`, `git diff HEAD` and the untracked
+ *   listing, so an unchanged commit re-gated after an upgrade hits the stored entry.
+ *
+ *   The cost is the standing cost of every bump and it was accepted at 3, 4, 5 and 6:
+ *   one re-measurement, and one commit's worth of baseline-missing ratchets, which are
+ *   reported as rules that did not run and resolve against the entry that run writes.
  */
 export interface QualityGateCache {
-    schemaVersion: 6;
+    schemaVersion: 7;
     entries: Record<string, CacheEntry>;
 }
 export interface CacheEntry {

@@ -252,6 +252,45 @@ describe('cache module', () => {
       expect(content).toMatch(/^[0-9a-f]{64}$/)
     })
 
+    // #41. Config files decide what a measurement MEANS, and none of them lives under
+    // `codePathspecs`, so git answers "nothing changed" for a tsconfig edit while the
+    // reading it produces is different. The old list named four such files and did not
+    // work for any of them: `isCodeFile` was consulted only for `git ls-files --others`,
+    // so a config counted while untracked and stopped counting the moment it was
+    // committed -- which every real project does. MEASURED against a real repo before
+    // the fix: rewriting a TRACKED `vitest.config.ts` end to end left the WIP key
+    // byte-identical at `wip:7de5d4b6...:3c4adc84...`.
+    //
+    // Three states, three keys. Absent-vs-present is asserted as well as
+    // content-vs-content because ADDING an `eslint.config.mjs` where there was none
+    // changes every lint reading that follows, and a naive "hash the files that exist"
+    // would miss it.
+    it('moves the wip key when a measurement input is added or edited', () => {
+      const keyWith = (configs: Record<string, string>) => {
+        mockGit({ status: 'M src/file.ts\n', diff: 'the identical diff' })
+        mockFs.statSync.mockImplementation(((p: unknown) => {
+          const name = String(p).split('/').pop() ?? ''
+          if (!(name in configs)) throw new Error('ENOENT')
+          return { isFile: () => true } as unknown as fs.Stats
+        }) as typeof fs.statSync)
+        mockFs.readFileSync.mockImplementation(((p: unknown) => {
+          const name = String(p).split('/').pop() ?? ''
+          return Buffer.from(configs[name] ?? '')
+        }) as typeof fs.readFileSync)
+        return getCacheKey().key
+      }
+
+      const none = keyWith({})
+      const strict = keyWith({ 'tsconfig.json': '{"compilerOptions":{"strict":true}}' })
+      const loose = keyWith({ 'tsconfig.json': '{"compilerOptions":{"strict":false}}' })
+
+      expect(new Set([none, strict, loose]).size).toBe(3)
+
+      // ...and the hash is a function of state, not of history: returning to a state
+      // must return to its key, or the cache would never hit at all.
+      expect(keyWith({ 'tsconfig.json': '{"compilerOptions":{"strict":true}}' })).toBe(strict)
+    })
+
     // Two commits, the same uncommitted diff: the keys must differ. Without this the
     // assertion above is satisfiable by a key that merely CONTAINS a commit hash
     // without it varying.

@@ -73,6 +73,8 @@ import type { PackageManager } from './runner.js';
  *   returns true for it -- so without this bump the fixed build would serve, as an
  *   earned verdict, precisely the run the fix exists to catch. Reachable by anyone
  *   who ran a previous build with a ratchet in rules.json.
+ *
+ *   Also carried by 5: `measurementInputsHash`, below.
  */
 export interface QualityGateCache {
   schemaVersion: 5;
@@ -139,6 +141,30 @@ export interface CacheEntry {
    * needs no schema bump -- no existing entry is ambiguous.
    */
   packageManager?: PackageManager;
+
+  /**
+   * A digest of the config files that decide what this reading MEANS.
+   *
+   * Same mechanism as `packageManager` above and for the same reason: the KEY cannot
+   * carry this. A clean tree keys on the bare commit hash -- it has to, because
+   * `findBaselineEntry` looks an entry up by commit hash -- so a GITIGNORED
+   * `quality-gate.config.js` or `tsconfig.json` can be rewritten with `git status`
+   * still reporting a clean tree, the key still landing on the same commit, and the
+   * previous verdict still being served. The WIP content hash covers the dirty case;
+   * this covers the clean one, which is the one an adopter is normally in.
+   *
+   * Checked on the VERDICT path only, not on the baseline path. Refusing a baseline
+   * on a mismatch would discard every baseline on any edit to `rules.json` -- which
+   * is in the digest -- so the commit that adds a ratchet would have nothing to
+   * compare against, the deadlock `monotonicEvaluated` exists to avoid. The residual
+   * cost is that a ratchet can difference two numbers taken under different configs;
+   * see the note in `findBaselineEntry`.
+   *
+   * Absence cannot be given a sound meaning the way `packageManager`'s can -- there
+   * is no config state it implies -- so schema 5 exists partly to guarantee every
+   * entry has one, and a reader treats an absent value as a mismatch.
+   */
+  measurementInputsHash?: string;
 }
 
 export interface Metrics {

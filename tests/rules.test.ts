@@ -7,6 +7,7 @@ import {
   isUsingEmbeddedDefaults,
 } from '../src/rules.js'
 import { resetConfig } from '../src/config.js'
+import { measurementInputsHash } from '../src/measurement-inputs.js'
 import { isEmbeddedDefaults } from '../src/defaults.js'
 import type { QualityRules, Metrics, CacheEntry } from '../src/types.js'
 import type { MeasurementFailure } from '../src/providers/types.js'
@@ -1520,6 +1521,7 @@ describe('isCacheValid', () => {
       timestamp: Date.now(),
       rulesHash: computeRulesHash(rules),
       rulesVersion: '1.0.0',
+      measurementInputsHash: measurementInputsHash(),
       metrics: { scripts: {}, coverage: { unit: { branches: 80 } } } as CacheEntry['metrics'],
       evaluation: { status: 'pass', failedRules: [] },
       ...(monotonicEvaluated === undefined ? {} : { monotonicEvaluated }),
@@ -1542,6 +1544,45 @@ describe('isCacheValid', () => {
     })
   })
 
+  // The key cannot catch a config change on the path that matters. A CLEAN tree keys
+  // on the bare commit hash -- it has to, since findBaselineEntry looks entries up by
+  // commit hash -- so a gitignored tsconfig.json or quality-gate.config.js can be
+  // rewritten with git still reporting a clean tree, the key still landing on the same
+  // commit, and the previous verdict still served for a measurement that now means
+  // something else. Found by adversarial review after the WIP-key half was fixed:
+  // "tracked or not" was true of the dirty path only.
+  describe('an entry measured under different config', () => {
+    const rules: QualityRules = {
+      version: '1.0.0',
+      rules: { floors: { 'coverage.unit.branches': 50 } },
+    }
+    const entryStamped = (hash: string | undefined): CacheEntry => ({
+      timestamp: Date.now(),
+      rulesHash: computeRulesHash(rules),
+      rulesVersion: '1.0.0',
+      metrics: { scripts: {}, coverage: { unit: { branches: 80 } } } as CacheEntry['metrics'],
+      evaluation: { status: 'pass', failedRules: [] },
+      ...(hash === undefined ? {} : { measurementInputsHash: hash }),
+    })
+
+    it('is refused', () => {
+      expect(isCacheValid(entryStamped('a-different-digest'), rules)).toBe(false)
+    })
+
+    // The control, without which "refuse everything" satisfies the case above.
+    it('is accepted when the config is the same', () => {
+      expect(isCacheValid(entryStamped(measurementInputsHash()), rules)).toBe(true)
+    })
+
+    // Unlike `packageManager`, absence implies no particular config state, so there is
+    // nothing sound to infer and the entry is refused. Schema 5 means no entry this
+    // version reads should lack one; this is the invariant made checkable rather than
+    // a case that fires in normal operation.
+    it('is refused when the entry carries no digest at all', () => {
+      expect(isCacheValid(entryStamped(undefined), rules)).toBe(false)
+    })
+  })
+
   // The cache key cannot catch a runner swap: it hashes tracked code under
   // codePathspecs (src/, tests/, scripts/), and no lockfile is in it, so dropping a
   // bun.lock into an npm project changes which toolchain measures and leaves the key
@@ -1557,6 +1598,7 @@ describe('isCacheValid', () => {
       timestamp: Date.now(),
       rulesHash: computeRulesHash(rules),
       rulesVersion: '1.0.0',
+      measurementInputsHash: measurementInputsHash(),
       metrics: { scripts: {}, coverage: { unit: { branches: 80 } } } as CacheEntry['metrics'],
       evaluation: { status: 'pass', failedRules: [] },
       ...(packageManager === undefined ? {} : { packageManager }),
@@ -1609,6 +1651,7 @@ describe('isCacheValid', () => {
       timestamp: Date.now(),
             rulesHash: computeRulesHash(rules),
       rulesVersion: '1.0.0',
+      measurementInputsHash: measurementInputsHash(),
       metrics: {
         coverage: {},
         typescript: { errors: 0, warnings: 0, rootCauses: 0 },
@@ -1634,6 +1677,7 @@ describe('isCacheValid', () => {
       timestamp: Date.now(),
             rulesHash: 'different-hash',
       rulesVersion: '1.0.0',
+      measurementInputsHash: measurementInputsHash(),
       metrics: {
         coverage: {},
         typescript: { errors: 0, warnings: 0, rootCauses: 0 },
@@ -1659,6 +1703,7 @@ describe('isCacheValid', () => {
       timestamp: Date.now(),
             rulesHash: computeRulesHash(rules),
       rulesVersion: '1.0.0',
+      measurementInputsHash: measurementInputsHash(),
       metrics: {
         coverage: {},
         typescript: { errors: 0, warnings: 0, rootCauses: 0 },
@@ -1684,6 +1729,7 @@ describe('isCacheValid', () => {
       timestamp: Date.now(),
       rulesHash: computeRulesHash(rules),
       rulesVersion: '1.0.0',
+      measurementInputsHash: measurementInputsHash(),
       metrics: {
         coverage: {}, // Missing coverage.unit.branches
         typescript: { errors: 0, warnings: 0, rootCauses: 0 },
@@ -1710,6 +1756,7 @@ describe('isCacheValid', () => {
       timestamp: Date.now(),
       rulesHash: computeRulesHash(rules),
       rulesVersion: '1.0.0',
+      measurementInputsHash: measurementInputsHash(),
       metrics: {
         coverage: { unit: { branches: 70, statements: 80, functions: 70, lines: 75 } },
         typescript: { errors: 0, warnings: 0, rootCauses: 0 },
@@ -1737,6 +1784,7 @@ describe('isCacheValid', () => {
       timestamp: Date.now(),
       rulesHash: computeRulesHash(rules),
       rulesVersion: '1.0.0',
+      measurementInputsHash: measurementInputsHash(),
       metrics: {
         coverage: {},
         typescript: { errors: 5, warnings: 0, rootCauses: 0 },
@@ -1774,6 +1822,7 @@ describe('isCacheValid', () => {
       timestamp: Date.now(),
       rulesHash: computeRulesHash(rules),
       rulesVersion: '1.0.0',
+      measurementInputsHash: measurementInputsHash(),
       metrics: {
         eslint: { errors: 0, warnings: 0, rootCauses: 0 },
         scripts: {},

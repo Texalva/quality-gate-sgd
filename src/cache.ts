@@ -16,6 +16,7 @@ import type {
 import { computeRulesHash } from './rules.js';
 import { getConfig } from './config.js';
 import { readEntryManager } from './runner.js';
+import { measurementInputsHash, measurementInputsListing } from './measurement-inputs.js';
 
 /**
  * 5 since an individual ratcheted metric absent from the baseline became a rule that
@@ -192,6 +193,11 @@ function getCodePathspec(): string {
 
 /**
  * Check if a file path matches code patterns (affects quality)
+ *
+ * Only ever asked about UNTRACKED paths -- see `computeContentHash`, which is the
+ * sole caller. Project-level config is not decided here; `measurement-inputs.ts` hashes them
+ * by content whether tracked or not, because a tracked config edit reaches
+ * this function never.
  */
 function isCodeFile(filePath: string): boolean {
   const config = getConfig();
@@ -203,15 +209,7 @@ function isCodeFile(filePath: string): boolean {
   );
   const hasCodeExt = codeExtensions.some((ext) => filePath.endsWith(ext));
 
-  // Also include specific config files that affect quality metrics
-  const isQualityConfig = [
-    'vitest.config.ts',
-    'jest.config.ts',
-    'sonar-project.properties',
-    'rules.json',
-  ].includes(filePath);
-
-  return (isInCodeDir && hasCodeExt) || isQualityConfig;
+  return isInCodeDir && hasCodeExt;
 }
 
 /**
@@ -294,8 +292,10 @@ function computeContentHash(): string {
     }
   }
 
-  // Combine and hash
-  const combined = trackedDiff + untrackedContent;
+  // Combine and hash. The measurement inputs go in unconditionally -- they are the
+  // only part of this that does not come from a git question, and that is the point:
+  // git sees a committed tsconfig as unchanged, while the reading it produces is not.
+  const combined = trackedDiff + untrackedContent + measurementInputsListing();
   return crypto.createHash('sha256').update(combined).digest('hex');
 }
 
@@ -475,6 +475,9 @@ export function createCacheEntry(
     // run that only the caller knows, so there is nothing here for a writer to
     // forget or to get wrong.
     packageManager: getConfig().packageManager.manager,
+    // Ambient for the same reason -- it is a property of the project on disk, read at
+    // the moment the reading was taken.
+    measurementInputsHash: measurementInputsHash(),
   };
 }
 

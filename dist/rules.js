@@ -7,6 +7,7 @@ import * as path from 'path';
 import * as crypto from 'crypto';
 import { getConfig } from './config.js';
 import { readEntryManager } from './runner.js';
+import { measurementInputsHash } from './measurement-inputs.js';
 import { getDefaultRules, isEmbeddedDefaults } from './defaults.js';
 import { getMetricValue as getFitnessMetricValue } from './fitness.js';
 // =============================================================================
@@ -597,6 +598,20 @@ export function isCacheValid(entry, rules) {
     // lenient -- every entry written before the field existed came from a version with
     // npm hardcoded at each spawn site. It refuses any other unrecognised value.
     if (readEntryManager(entry.packageManager) !== getConfig().packageManager.manager) {
+        return false;
+    }
+    // An entry measured under different config is a reading of a different question.
+    // The KEY cannot catch this on the path that matters: a clean tree keys on the bare
+    // commit hash, so a GITIGNORED `tsconfig.json` or `quality-gate.config.js` can be
+    // rewritten with git still reporting a clean tree and the key still landing on the
+    // same commit. The WIP content hash covers the dirty case; this covers the clean
+    // one. Same shape as the `packageManager` check above, and adopted for the same
+    // reason -- stamping the reading beats widening the key when the key has another job.
+    //
+    // A missing value is a MISMATCH, not an inference. Unlike `packageManager`, absence
+    // implies no particular config state, so there is nothing sound to assume; schema 5
+    // guarantees every entry this version reads was written with one.
+    if (entry.measurementInputsHash !== measurementInputsHash()) {
         return false;
     }
     // If evaluation passed, cache is valid - no need to re-check metrics

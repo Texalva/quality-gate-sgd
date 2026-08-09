@@ -38,5 +38,5 @@
  * All of them are provenance findings: the tool ran, the report parsed, the arithmetic is
  * honest, and what is in doubt is WHICH CODE the number describes.
  */
-export const MEASUREMENT_KINDS_REPORTING_A_NUMBER = new Set(['stale-report', 'provenance-unverified', 'code-changed-during-measurement']);
+export const MEASUREMENT_KINDS_REPORTING_A_NUMBER = new Set(['stale-report', 'provenance-unverified']);
 //# sourceMappingURL=types.js.map

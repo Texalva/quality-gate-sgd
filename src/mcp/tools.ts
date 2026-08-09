@@ -153,11 +153,12 @@ export async function handleRun(args: RunArguments): Promise<{
     // response now carries an `unbound-provenance` entry in `unevaluatedRules` saying so
     // whenever a rule grades sonarqube. Making MCP scan is a separate decision; what
     // changes here is that the response stops looking complete.
-    const { metrics, coverageProvenance } = await extractAllMetricsAsyncAndCoverageProvenance({
-      scriptsToRun: requiredScripts,
-      skipSonarQube,
-      submittedAnalysis: { kind: 'not-scanned' },
-    });
+    const { metrics, coverageProvenance, stampOutcomes } =
+      await extractAllMetricsAsyncAndCoverageProvenance({
+        scriptsToRun: requiredScripts,
+        skipSonarQube,
+        submittedAnalysis: { kind: 'not-scanned' },
+      });
 
     const cache = loadCache();
     const { isWIP } = getCacheKey();
@@ -177,7 +178,10 @@ export async function handleRun(args: RunArguments): Promise<{
       ...evaluation,
       unevaluated: [
         ...evaluation.unevaluated,
-        ...coverageProvenanceUnevaluated(rules, coverageProvenance),
+        // `stampOutcomes` threaded for the reason cli.ts threads it: it decides whether
+        // a suite's finding already travelled as a failure, and the failure channel and
+        // this one have to be exact complements.
+        ...coverageProvenanceUnevaluated(rules, coverageProvenance, undefined, stampOutcomes),
       ],
     };
 

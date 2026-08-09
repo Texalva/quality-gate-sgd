@@ -130,17 +130,20 @@ export type MeasurementFailureKind = 'tool-missing' | 'crashed' | 'timed-out' | 
  * honest -- what is wrong is which code it describes, and the remedy is to
  * regenerate or re-stamp the report rather than to fix a tool.
  *
- * It is also the ONLY kind that arrives alongside a value for its dimension, which
- * is why `evaluateMeasurements` and the `score`/`suggest` surfaces word it
- * differently: "could not be measured" is false here, and printing it over a
- * dimension the same output reports a percentage for would be exactly the
- * confidently-wrong sentence this module exists to prevent.
+ * It arrives alongside a value for its dimension -- see
+ * MEASUREMENT_KINDS_REPORTING_A_NUMBER, which is the set `evaluateMeasurements` and
+ * the `score`/`suggest` surfaces consult. "could not be measured" is false here, and
+ * printing it over a dimension the same output reports a percentage for would be
+ * exactly the confidently-wrong sentence this module exists to prevent. It was the
+ * ONLY such kind when it was written; `provenance-unverified` joined it, so the check
+ * moved from a local `=== 'stale-report'` to that shared set.
  *
  * Emitted only from positive evidence -- a sidecar naming a commit, and a
  * recomputed digest against that commit that differs, with a tracked file's content
  * or an untracked source file to point at. Never from a timestamp, never against
  * another file's mtime, never against another machine's clock, and with no tolerance
- * constant. A report nobody stamped is not this; it is an advisory that says so.
+ * constant. A report nobody stamped is not this; whether THAT fails is a policy
+ * question, answered by `provenance-unverified` below.
  */
  | 'stale-report'
 /**
@@ -165,19 +168,6 @@ export type MeasurementFailureKind = 'tool-missing' | 'crashed' | 'timed-out' | 
  * `score`/`suggest` surfaces must not print "could not be measured" over it.
  */
  | 'provenance-unverified'
-/**
- * A script or extractor rewrote the code WHILE its coverage was being measured, so
- * the report describes one generation of the source and the tree now holds another.
- *
- * Positive evidence, which is why it is a failure in both provenance modes and sits
- * beside `stale-report` rather than `provenance-unverified`: the gate did not fail to
- * find out which code the report describes, it found out that the answer changed
- * underneath it. The usual cause is codegen into `src/` from a `build` script listed
- * in `requiredScripts` after the coverage script.
- *
- * Carries a number for its dimension, for the same reason its two neighbours do.
- */
- | 'code-changed-during-measurement'
 /**
  * The service answered and REFUSED: 401 or 403 from a SonarQube endpoint.
  *

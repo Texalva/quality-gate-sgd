@@ -2636,18 +2636,17 @@ describe('rulesReadingMeasurement', () => {
 // A stale report is not an unmeasured dimension
 // ===========================================================================
 //
-// THREE measurement failures arrive WITH a number for their dimension: the report
-// parsed, `total` was valid, and `metrics.coverage.unit` holds a percentage. Every other
-// kind arrives with the dimension absent, which is what made "could not be measured" a
-// true sentence. Printing it over one of these three contradicts the percentage in the
-// same output.
+// TWO measurement failures arrive WITH a number for their dimension: the report parsed,
+// `total` was valid, and `metrics.coverage.unit` holds a percentage. Every other kind
+// arrives with the dimension absent, which is what made "could not be measured" a true
+// sentence. Printing it over one of these two contradicts the percentage in the same
+// output.
 //
-// The set is enumerated in a test rather than left implicit because it grew, and growing
-// it is what made the sentence false: `provenance-unverified` and
-// `code-changed-during-measurement` both joined `stale-report`, and every surface
-// carrying its own `=== 'stale-report'` check kept printing the wrong sentence for them.
-// This case failed only against the apollo-client golden master, which is a slow and
-// lucky way to catch a wording bug. See MEASUREMENT_KINDS_REPORTING_A_NUMBER.
+// Both are covered here rather than just `stale-report` because the set GREW, and growing
+// it is what made the sentence false: `provenance-unverified` joined, and every surface
+// carrying its own `=== 'stale-report'` check kept printing the wrong sentence for it.
+// That defect was caught only by the apollo-client golden master, which is a slow and
+// lucky way to find a wording bug. See MEASUREMENT_KINDS_REPORTING_A_NUMBER.
 describe('the sentence a stale coverage report gets', () => {
   const staleFailure: MeasurementFailure = {
     kind: 'stale-report',
@@ -2685,16 +2684,13 @@ describe('the sentence a stale coverage report gets', () => {
     expect(measurement?.message).not.toContain('could not be measured')
   })
 
-  it.each([
-    'provenance-unverified',
-    'code-changed-during-measurement',
-  ] as const)('says the same of a %s reading, which also carries a number', (kind) => {
+  it('says the same of a provenance-unverified reading, which also carries a number', () => {
     const result = evaluateRules(
       { version: '1.0.0', rules: { floors: { 'coverage.unit.statements': 50 } } },
       {
         scripts: {},
         coverage: { unit: { branches: 80, statements: 80, functions: 80, lines: 80 } },
-        measurementFailures: [{ ...staleFailure, kind }],
+        measurementFailures: [{ ...staleFailure, kind: 'provenance-unverified' }],
       }
     )
 

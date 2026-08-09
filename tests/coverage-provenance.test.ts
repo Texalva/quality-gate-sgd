@@ -480,24 +480,35 @@ describe('a report whose provenance cannot be established', () => {
   });
 
   /**
-   * CODEGEN DURING MEASUREMENT: `requiredScripts: ['test:coverage', 'build']` where
-   * `build` writes into `src/`. This is POSITIVE evidence -- the code identity taken
-   * before the scripts and the one taken after them disagree -- so unlike everything
-   * else in this describe block it fails in BOTH provenance modes. It used to degrade
-   * to a plain unverifiable advisory and pass, which put a finding and an absence of
-   * findings in the same bucket.
+   * CODE MOVED WHILE THE SCRIPTS RAN, and why it must NOT fail the gate.
+   *
+   * The stamp positively detects that the code identity before `requiredScripts` and the
+   * one after them disagree. That looks like grounds for a definite claim, and an earlier
+   * revision made one -- a `code-changed-during-measurement` failure firing in both
+   * provenance modes. It is not, because ONE snapshot is taken before ALL scripts and one
+   * after ALL of them, so these two orderings are indistinguishable:
+   *
+   *   ['test:coverage', 'build']   coverage measured, THEN build rewrote src/. Bad.
+   *   ['build', 'test:coverage']   build generated src/, THEN coverage measured the
+   *                                final tree. Correct, common, and the shape the
+   *                                promoted version hard-failed while advising the
+   *                                adopter to do what they were already doing.
+   *
+   * So the suite gets the ADVISORY -- which carries the specific diagnostic -- and not a
+   * failure, in either mode. Asserted in both directions because the false-fail half is
+   * the one that killed two previous designs for this feature.
    */
-  it('fails when a script rewrote the code while its coverage was being measured', () => {
+  it('advises rather than fails when the code moved while the scripts ran', () => {
     makeProject({ ignoreCoverage: true, report: SUMMARY(80) });
 
     const snapshot = snapshotCoverageStateBeforeScripts();
     writeFileSync(summaryPath(), SUMMARY(81));
-    // The `build` step, after coverage was written.
+    // A `build` step that generates into src/. Whether it ran before or after the
+    // coverage script is exactly what this evidence cannot say.
     write('src/generated.ts', 'export const generated = 1;\n');
 
     const outcomes = stampCoverageSummariesRewrittenDuringRun(snapshot, 'run');
-    const unit = outcomes.find((outcome) => outcome.suite === 'coverage.unit');
-    expect(unit).toMatchObject({
+    expect(outcomes.find((outcome) => outcome.suite === 'coverage.unit')).toMatchObject({
       kind: 'cannot-stamp',
       reason: 'code-changed-during-measurement',
     });
@@ -506,34 +517,36 @@ describe('a report whose provenance cannot be established', () => {
     const verdicts = verifyCoverageProvenance(['coverage.unit']);
     expect(verdicts[0]).toMatchObject({ kind: 'unverifiable' });
 
+    const graded = rulesWithFloor('coverage.unit.statements');
     for (const provenanceRequired of [true, false]) {
-      const failures = coverageProvenanceFailures(verdicts, outcomes, provenanceRequired);
-      // Exactly ONE finding for the suite, and it is the one that names the cause --
-      // not the weaker "nobody stamped this", whose remedy would send the adopter to
-      // run `stamp-coverage` over a report stamping cannot fix.
-      expect(failures).toHaveLength(1);
-      expect(failures[0]).toMatchObject({
-        kind: 'code-changed-during-measurement',
-        dimension: 'coverage.unit',
-      });
-      expect(failures[0].message).toContain('regenerate sources');
+      expect(coverageProvenanceFailures(verdicts, outcomes, provenanceRequired)).toEqual([]);
+
+      // And the advisory carries it in BOTH modes -- the exact complement. Without this
+      // the strict-mode run would say nothing at all about an ungrounded number.
+      const unevaluated = coverageProvenanceUnevaluated(
+        graded,
+        verdicts,
+        provenanceRequired,
+        outcomes
+      );
+      expect(unevaluated).toHaveLength(1);
+      expect(unevaluated[0].type).toBe('unverified-provenance');
     }
 
     const metrics: Metrics = {
       scripts: {},
       coverage: { unit: { statements: 81, branches: 81, functions: 81, lines: 81 } },
-      measurementFailures: coverageProvenanceFailures(verdicts, outcomes, false),
     };
-    expect(evaluateRules(rulesWithFloor('coverage.unit.statements'), metrics).status).toBe('fail');
+    expect(evaluateRules(graded, metrics).status).toBe('pass');
   });
 
   /**
-   * The other three `cannot-stamp` reasons are absences, not findings -- git could not
-   * answer, or a read-only artifact mount refused the write. They must NOT be promoted,
-   * or a container volume turns into a red build over a report nothing is known to be
-   * wrong with.
+   * The other `cannot-stamp` reasons are absences too -- git could not answer, or a
+   * read-only artifact mount refused the write -- but unlike codegen they say nothing
+   * about the code having moved, so strict mode DOES fail them: the report is simply
+   * unvouched-for, and `stamp-coverage` from a writable step is a remedy that works.
    */
-  it('does not promote a stamp that failed because the tool could not find out', () => {
+  it('still fails an unvouched-for report when the stamp failed for an unrelated reason', () => {
     makeProject({ ignoreCoverage: true, report: SUMMARY(80) });
 
     const verdicts = verifyCoverageProvenance(['coverage.unit']);
@@ -551,6 +564,16 @@ describe('a report whose provenance cannot be established', () => {
     expect(coverageProvenanceFailures(verdicts, cannotWrite, true)[0]).toMatchObject({
       kind: 'provenance-unverified',
     });
+
+    // Complement holds here too: where the failure fired, the advisory is silent.
+    expect(
+      coverageProvenanceUnevaluated(
+        rulesWithFloor('coverage.unit.statements'),
+        verdicts,
+        true,
+        cannotWrite
+      )
+    ).toEqual([]);
   });
 
   /**
@@ -580,11 +603,15 @@ describe('a report whose provenance cannot be established', () => {
     expect(emptyMessage).toContain('ran no scripts at all');
 
     const omittedMessage = coverageProvenanceUnevaluated(omitted, verdicts, false)[0].message;
-    expect(omittedMessage).toContain('omits `requiredScripts`');
-    expect(omittedMessage).toContain('default `quality` script');
-    // The false sentence, in either of its spellings.
+    expect(omittedMessage).toContain('`requiredScripts` is absent');
+    expect(omittedMessage).toContain('names no coverage script');
+    // The false sentences, in each of their spellings. The third is subtler than the
+    // other two: the advisory also fires when the script DID rewrite the report and the
+    // stamp was then refused, so asserting anything about what the script wrote would be
+    // false in that case. Only facts about the RULESET may be stated here.
     expect(omittedMessage).not.toContain('never ran your coverage tool');
     expect(omittedMessage).not.toContain('ran no scripts at all');
+    expect(omittedMessage).not.toContain('did not write this report');
   });
 
   /**

@@ -312,8 +312,8 @@ On the next run, each suite that produced a number gets one of four verdicts:
 |-----|-----|-----|
 | **verified** | the digest recomputed against the recorded commit matches exactly | nothing — silent |
 | **stale** | it does not match, and a tracked file's content or an untracked source file differs | a `stale-report` measurement failure on that suite, so every rule grading it FAILS |
-| **code moved mid-run** | the code identity before `requiredScripts` and after them disagree — codegen into `src/` from a `build` step is the usual cause | a `code-changed-during-measurement` failure; every rule grading the suite FAILS |
 | **unverifiable** | no sidecar, an unreadable one, or a report whose bytes changed after stamping | **by default, a `provenance-unverified` failure** — see below |
+| **code moved mid-run** | the code identity before `requiredScripts` and after them disagree — codegen into `src/` from a `build` step is the usual cause | an advisory naming that cause, and **never** a failure — see the limits below |
 
 > ### ⚠️ Breaking change: unverifiable coverage now fails
 >
@@ -330,17 +330,34 @@ On the next run, each suite that produced a number gets one of four verdicts:
 > leaves enforcement on, deliberately, so a mistake cannot silently restore a vacuous
 > pass.
 >
-> The **stale** and **code moved mid-run** verdicts fail in *both* modes. They are
-> built from positive evidence rather than from the absence of it, so there is no
-> policy question to answer.
+> The **stale** verdict fails in *both* modes. It is built from positive evidence
+> rather than from the absence of it, so there is no policy question to answer.
 
-**Where this deliberately does not fail you.** Provenance is built out of git — a
-commit and a digest against it. If `resolveCodeIdentity` cannot answer at all (no
-repository, a Docker build context that excluded `.git`, an unpacked source tarball),
-then *nobody* can write a sidecar: neither `requiredScripts` nor `stamp-coverage`
-would help. Failing there would print a red build naming two remedies that both
-cannot work, so the gate reports the advisory instead and passes. You are still told
-the numbers are ungrounded.
+**Where this deliberately does not fail you: code generated during the run.** If a
+script listed in `requiredScripts` rewrites files under `QUALITY_CODE_PATHSPECS`, the
+gate notices that the code changed while it was measuring and refuses to stamp — but it
+*cannot tell which order things happened in*, because it takes one reading of the code
+before all the scripts and one after all of them:
+
+```jsonc
+"requiredScripts": ["build", "test:coverage"]   // correct: generate, then measure
+"requiredScripts": ["test:coverage", "build"]   // broken: measure, then regenerate
+```
+
+Both leave identical evidence. Failing on it would red-build the first project while
+telling it to stop regenerating sources during coverage — which it already isn't. So
+this is an advisory that names the cause, in both provenance modes, and never a
+failure. Making it sharp needs a reading of the code taken *between* scripts, and that
+is tracked rather than guessed at.
+
+**Outside a git repository the gate refuses to run at all.** Provenance is built out of
+git, and so are the cache key and baseline resolution — a point already in the table
+above. A Docker build context that excluded `.git`, or an unpacked source tarball, exits
+1 early with `fatal: not a git repository` rather than measuring anything. That is a
+loud, early refusal, not a coverage-provenance behaviour; if you embed the library
+directly (or use the MCP server), provenance degrades to the advisory there instead,
+because no sidecar is obtainable by anyone and no remedy the message could name would
+work.
 
 Nothing is inferred from a file's age. A README edit, a commit, a revert back to
 identical content, a branch switch and a `chmod +x` all move the cache key and all

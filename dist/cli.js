@@ -362,7 +362,10 @@ async function runQualityGate(options = { skipSonarQube: false }) {
     // `evaluateRules` takes nothing else. Everything downstream keeps reading `result`,
     // including the caching logic -- `notServableAsVerdict` below already keys on
     // `result.unevaluated.length`.
-    const provenanceUnevaluated = coverageProvenanceUnevaluated(rules, coverageProvenance);
+    // `stampOutcomes` passed through, not dropped: it is what decides whether a suite's
+    // finding travelled as a failure or is left for this advisory to carry, and the two
+    // must be exact complements. See provenanceFailureIsWarranted.
+    const provenanceUnevaluated = coverageProvenanceUnevaluated(rules, coverageProvenance, undefined, stampOutcomes);
     const result = provenanceUnevaluated.length === 0
         ? evaluation
         : { ...evaluation, unevaluated: [...evaluation.unevaluated, ...provenanceUnevaluated] };
@@ -513,12 +516,12 @@ async function runQualityGate(options = { skipSonarQube: false }) {
         // the code -- was told to run `stamp-coverage`. The advisory named a remedy they
         // may already have been performing, for a cause it did not mention.
         //
-        // The CODEGEN reason is excluded, because it is no longer one of the reasons a
-        // report ends up merely unvouched-for: it is now a `code-changed-during-measurement`
-        // measurement failure that fails the gate in both provenance modes. Printing it here
-        // too would report one cause twice and, worse, put it under the "Not failing the gate
-        // on these" sentence below -- next to a run that is failing the gate on exactly it.
-        const couldNotStamp = stampOutcomes.filter((outcome) => outcome.kind === 'cannot-stamp' && outcome.reason !== 'code-changed-during-measurement');
+        // ALL `cannot-stamp` reasons, codegen included. An earlier revision excluded codegen
+        // here because it had been promoted to a measurement failure; that promotion was
+        // reverted (the evidence cannot distinguish safe from unsafe script ordering -- see
+        // provenanceFailureIsWarranted), so this is once again the only channel carrying it,
+        // and it is the channel with the specific remedy.
+        const couldNotStamp = stampOutcomes.filter((outcome) => outcome.kind === 'cannot-stamp');
         for (const outcome of couldNotStamp) {
             log(`  ${outcome.suite}: this run could not stamp it -- ${outcome.why}`);
         }

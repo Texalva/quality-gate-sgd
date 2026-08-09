@@ -1175,11 +1175,15 @@ export function extractAllMetricsAndCoverageProvenance(scriptsToRunOrOptions = [
     //     it, so a report this run produced records the code it was produced from;
     //   - after the read, each suite that yielded a NUMBER is verified against its
     //     sidecar. A recorded state that no longer matches is a `stale-report`
-    //     measurement failure; a report nobody stamped is an advisory, not silence.
+    //     measurement failure; a report nobody stamped is a `provenance-unverified`
+    //     failure by default, and an advisory under
+    //     QUALITY_COVERAGE_PROVENANCE=optional.
     //
-    // What remains open is the un-stamped report itself -- the advisory does not
-    // prevent it being graded, because "nobody stamped this" is not evidence the
-    // numbers are wrong. It prevents the run being CACHED as a verdict.
+    // The un-stamped report USED to be graded anyway, on the reasoning that "nobody
+    // stamped this" is not evidence the numbers are wrong. That default reversed -- it is
+    // also not evidence they are right. See `config.coverage.provenanceRequired`, and
+    // `provenanceFailureIsWarranted` for the two shapes strict mode still refuses to fail.
+    // Either way the run is not CACHED as a verdict.
     //
     // The return literal's property ORDER is deliberately left exactly as it was,
     // because the refactor harness compares capture sections with raw

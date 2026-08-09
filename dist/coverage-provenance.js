@@ -63,7 +63,7 @@
  *                               `:100644 100755 cb0ff5c cb0ff5c M` -- identical
  *                               blob shas, so no content changed                   -> not stale
  *
- * FOUR VERDICTS, and the asymmetry between them is the design:
+ * THREE VERDICTS, and the asymmetry between them is the design:
  *
  *   verified      silent.
  *   stale         a `stale-report` MeasurementFailure on the SUITE dimension, so
@@ -71,13 +71,6 @@
  *                 definite claim, made only about a report recognised byte-for-byte
  *                 and only when a tracked file's CONTENT or an untracked source file
  *                 demonstrably differs.
- *   code moved
- *     mid-run     a `code-changed-during-measurement` MeasurementFailure. Also a
- *                 definite claim, and detected by the STAMP rather than here: the two
- *                 code identities taken either side of `requiredScripts` disagree, so
- *                 the report provably describes a generation of the source the tree no
- *                 longer holds. Codegen into `src/` from a `build` script is the usual
- *                 cause. Fails in both provenance modes.
  *   unverifiable  no evidence either way -- no sidecar, an unusable one, a report
  *                 rewritten since the stamp. What this COSTS is a policy decision, and
  *                 it is the one thing in this module that is configurable:
@@ -97,10 +90,15 @@
  *                 the one deciding whether the build ships. See
  *                 `config.coverage.provenanceRequired`.
  *
+ *                 TWO EXCEPTIONS keep strict mode from false-failing where no remedy
+ *                 exists or where the evidence cannot bear the claim. Both are decided
+ *                 in ONE place -- `provenanceFailureIsWarranted` -- and are documented
+ *                 there rather than restated here.
+ *
  * WHERE THIS IS NOT CALLED, deliberately. `runScore` and `runSuggest` (and the MCP
  * score/suggest handlers) never see the unverifiable ADVISORY, because they produce no
  * verdict and write no cache entry and the advisory is entirely about those two
- * things. They do see all three FAILURES, through `metrics.measurementFailures` and
+ * things. They do see both FAILURES, through `metrics.measurementFailures` and
  * `describeUnmeasured`, which partitions them as `numberReported` so those surfaces
  * report the number and say in the same breath that nothing ties it to this code. In
  * `optional` mode there is no failure to carry, so they print the number unqualified
@@ -793,67 +791,94 @@ function describeChanged(changed) {
  * coverage is an ungated advisory rather than a red gate -- and the run is still not
  * cached, exactly as it already is for an unparseable lambda report.
  *
- * THREE FINDINGS, and the epistemic difference between them is the whole design:
+ * TWO FINDINGS FAIL, and the epistemic difference between them is the whole design:
  *
  *   - `stale`: positive evidence the report describes other code. Always fails.
- *   - `code-changed-during-measurement`: positive evidence the code moved WHILE the
- *     report was being written. Always fails. Reached through `stampOutcomes` rather
- *     than `verdicts`, because the stamp is what detected it -- the sidecar was
- *     discarded, so verification only sees an absence afterwards and would report the
- *     much weaker `no-sidecar`.
- *   - `unverifiable`: no evidence either way. Fails only when the adopter has asked
- *     for provenance to be required, which is the default. See
- *     `config.coverage.provenanceRequired` for why that default was changed.
+ *   - `unverifiable`: no evidence either way. Fails only when the adopter has asked for
+ *     provenance to be required, which is the default, AND the two exceptions below do
+ *     not apply. See `config.coverage.provenanceRequired`.
  *
- * `stampFailedSuites` is the double-reporting guard. A codegen run discards its
- * sidecar, so the same suite arrives here as BOTH a positive stamp finding and an
- * `unverifiable` verdict; without the guard a strict-mode codegen run emits two
- * failures for one suite. The positive finding wins, because it names the actual
- * cause and its remedy ("run coverage in a step that does not regenerate sources")
- * is not the unvouched-for one ("stamp it").
+ * TWO EXCEPTIONS, and both exist because a red build naming a remedy that cannot work
+ * is the false-fail that killed designs A and B. `provenanceFailureIsWarranted` is the
+ * single place they are decided, and it is shared with `coverageProvenanceUnevaluated`
+ * rather than duplicated: two copies of this predicate is precisely how a suite came to
+ * be reported as a hard failure AND listed under "Not failing the gate on these".
  *
- * STRICT MODE NEVER FAILS A PROJECT THAT CANNOT STAMP AT ALL, and that exception is
- * load-bearing rather than a softening. Provenance is built out of git: a commit and
- * a digest against it. Where `resolveCodeIdentity` cannot answer -- no repository, a
- * Docker build context that excluded `.git` (the common CI shape, not an exotic one),
- * an unpacked source tarball -- no sidecar can be written by ANYONE. Neither
- * `requiredScripts` nor `stamp-coverage` can produce one, so failing would hand the
- * adopter a red build, name two remedies, and have both of them not work. Refusing a
- * measurement the tool cannot take is right; refusing a project for an environment
- * fact it cannot act on is the false-fail that killed designs A and B. The advisory
- * still fires, so the reader is told the numbers are ungrounded.
+ * (1) THE TOOL CANNOT STAMP AT ALL. Provenance is built out of git -- a commit and a
+ *     digest against it. Where `resolveCodeIdentity` cannot answer, no sidecar can be
+ *     written by ANYONE, so neither `requiredScripts` nor `stamp-coverage` would help.
+ *     Note that the CLI does not reach this: `assertSupportedLayout` shells `git
+ *     ls-files` and exits 1 first, which is a loud, early, honest refusal and is the
+ *     documented contract ("git: the run refuses rather than guessing the tree state").
+ *     This exception is therefore for the LIBRARY and MCP paths, which call
+ *     `extractAllMetrics*` directly with no layout assertion -- the shape every harness
+ *     case uses.
  *
- * Resolved LAZILY and at most once: it costs git calls, and it is only consulted on
- * the path that is otherwise about to fail the build.
+ * (2) THE CODE CHANGED WHILE THE SCRIPTS RAN. The stamp detects that the code identity
+ *     before `requiredScripts` and after them disagree, and refuses. That detection
+ *     CANNOT distinguish the unsafe ordering from the safe one, because one snapshot is
+ *     taken before ALL scripts and one after ALL of them:
+ *
+ *       ['test:coverage', 'build']   coverage measured, THEN build rewrote src/.
+ *                                    The report describes code the tree no longer
+ *                                    holds. Genuinely bad.
+ *       ['build', 'test:coverage']   build generated src/, THEN coverage measured the
+ *                                    final tree. The report describes the tree exactly.
+ *                                    Perfectly correct, and a common shape.
+ *
+ *     Both produce identical evidence. An earlier revision of this function promoted it
+ *     to a `code-changed-during-measurement` failure that fired in both provenance
+ *     modes -- which hard-failed the SECOND row, on a project that had already ordered
+ *     its scripts correctly, while telling it to "run the coverage script in a step that
+ *     does not also regenerate sources". It already was. That promotion is reverted; the
+ *     specific diagnostic survives on the advisory, which is where an inference the tool
+ *     cannot actually make belongs.
+ *
+ *     Making this sharp needs a code identity captured BETWEEN scripts so that "the code
+ *     last changed at step j, the report was last rewritten at step k" is answerable
+ *     without a timestamp. That is real work in `runScripts` and is filed rather than
+ *     guessed at here.
+ *
+ * `canStampAtAll` is resolved LAZILY and at most once: it costs git calls, and it is
+ * only consulted on the path that is otherwise about to fail the build.
  */
-export function coverageProvenanceFailures(verdicts, stampOutcomes = [], provenanceRequired = getConfig().coverage.provenanceRequired) {
-    const codegen = stampOutcomes.filter((outcome) => outcome.kind === 'cannot-stamp' && outcome.reason === 'code-changed-during-measurement');
-    const stampFailedSuites = new Set(codegen.map((outcome) => outcome.suite));
+/**
+ * Whether an `unverifiable` suite should FAIL, or only be advised about.
+ *
+ * ONE definition, consumed by both `coverageProvenanceFailures` and
+ * `coverageProvenanceUnevaluated`, so that the failure channel and the advisory channel
+ * cannot disagree about a suite. They are exact complements: whichever one declines,
+ * the other must speak, or a finding is lost. Two independent copies of this logic is
+ * how a suite came to be reported as a hard failure and simultaneously listed under
+ * "Not failing the gate on these".
+ *
+ * Returns a PREDICATE rather than a set so `resolveCodeIdentity` stays lazy -- the
+ * overwhelmingly common run has no unverifiable suite at all and should pay no git call.
+ */
+function provenanceFailureIsWarranted(stampOutcomes, provenanceRequired) {
+    const codeMovedDuringRun = new Set(stampOutcomes
+        .filter((outcome) => outcome.kind === 'cannot-stamp' && outcome.reason === 'code-changed-during-measurement')
+        .map((outcome) => outcome.suite));
     let establishable;
     const canStampAtAll = () => (establishable ??= resolveCodeIdentity().ok);
-    const codegenFailures = codegen.map((outcome) => ({
-        kind: 'code-changed-during-measurement',
-        dimension: outcome.suite,
-        message: `${outcome.summaryPath} was written by this run, but ${outcome.why} The number parsed out ` +
-            'of it is a real measurement of code the tree no longer holds, so it is reported rather ' +
-            'than graded.',
-        evidence: buildReportEvidence(`read ${outcome.summaryPath}`, 0, [
-            {
-                path: outcome.summaryPath,
-                existed: true,
-                bytesRead: null,
-                modifiedMs: modifiedMsOf(outcome.summaryPath),
-                outcome: 'read',
-            },
-        ]),
-    }));
+    return (suite) => {
+        if (!provenanceRequired)
+            return false;
+        // Exception 2: the evidence cannot tell a correctly-ordered `['build',
+        // 'test:coverage']` from a broken `['test:coverage', 'build']`, so it cannot carry a
+        // red build. See the header.
+        if (codeMovedDuringRun.has(suite))
+            return false;
+        // Exception 1: no sidecar is obtainable by anyone here, so no remedy would work.
+        return canStampAtAll();
+    };
+}
+export function coverageProvenanceFailures(verdicts, stampOutcomes = [], provenanceRequired = getConfig().coverage.provenanceRequired) {
+    const warranted = provenanceFailureIsWarranted(stampOutcomes, provenanceRequired);
     return [
-        ...codegenFailures,
         ...verdicts.flatMap((verdict) => {
             if (verdict.kind === 'unverifiable') {
-                if (!provenanceRequired || stampFailedSuites.has(verdict.suite))
-                    return [];
-                if (!canStampAtAll())
+                if (!warranted(verdict.suite))
                     return [];
                 return [
                     {
@@ -942,19 +967,18 @@ export function coverageProvenanceFailures(verdicts, stampOutcomes = [], provena
  *                           script is what design A was removed for.
  *   scripts NAMED           the ordinary remedy.
  */
-export function coverageProvenanceUnevaluated(rules, verdicts, provenanceRequired = getConfig().coverage.provenanceRequired) {
-    // Silent when the same verdict has ALREADY travelled as a `provenance-unverified`
-    // measurement failure. Saying it twice in two registers -- once as a red rule, once
-    // as "this was not evaluated" -- is how a loud channel stops being read.
+export function coverageProvenanceUnevaluated(rules, verdicts, provenanceRequired = getConfig().coverage.provenanceRequired, stampOutcomes = []) {
+    // The EXACT COMPLEMENT of the failure channel, decided by the one predicate both call.
+    // Where a suite failed, saying it again here -- once as a red rule, once as "this was
+    // not evaluated" -- is how a loud channel stops being read. Where a suite did NOT fail
+    // because of one of the two exceptions, this advisory is the ONLY thing reporting that
+    // the numbers are ungrounded, and dropping it would turn a reasoned
+    // refusal-to-false-fail into exactly the silence this module exists to remove.
     //
-    // The `resolveCodeIdentity` half is why this is not simply `if (provenanceRequired)`.
-    // Where provenance cannot be established at all, `coverageProvenanceFailures`
-    // deliberately emits nothing even in strict mode, so this advisory is the ONLY thing
-    // reporting that the coverage numbers are ungrounded. Dropping it there would turn a
-    // reasoned refusal-to-false-fail into exactly the silence this module exists to
-    // remove.
-    if (provenanceRequired && resolveCodeIdentity().ok)
-        return [];
+    // `stampOutcomes` is threaded in for that second case: without it this function
+    // decided the question differently from `coverageProvenanceFailures`, and a codegen
+    // run in `optional` mode was reported through both channels at once.
+    const warranted = provenanceFailureIsWarranted(stampOutcomes, provenanceRequired);
     // THREE cases, not two, because `[]` and `undefined` are not the same ruleset and the
     // sentence explaining WHY differs between them. Every caller resolves the scripts as
     // `rules.rules.requiredScripts || ['quality']`, and `[]` is TRUTHY in JS -- so an
@@ -968,6 +992,8 @@ export function coverageProvenanceUnevaluated(rules, verdicts, provenanceRequire
     return verdicts.flatMap((verdict) => {
         if (verdict.kind !== 'unverifiable')
             return [];
+        if (warranted(verdict.suite))
+            return [];
         const graded = rulesReadingMeasurement(rules, verdict.suite);
         if (graded.length === 0)
             return [];
@@ -977,9 +1003,14 @@ export function coverageProvenanceUnevaluated(rules, verdicts, provenanceRequire
                 'nothing to vouch for. Add the coverage-writing script to `requiredScripts` in ' +
                 `rules.json, or ${stampIt}`
             : scriptSituation === 'defaulted'
-                ? 'This ruleset omits `requiredScripts`, so the gate ran the default `quality` script ' +
-                    '-- and that script did not write this report. Name the coverage-writing script in ' +
-                    `\`requiredScripts\` in rules.json, or ${stampIt}`
+                ? // "did not write this report" is NOT said here, and that is deliberate: the
+                    // advisory also fires when the script DID rewrite the report and the stamp
+                    // was then refused, so asserting it would be false in that case. What can be
+                    // stated is that no script was named -- an inference-free fact about the
+                    // ruleset.
+                    'This ruleset names no coverage script -- `requiredScripts` is absent, so the gate ' +
+                        'ran only the default `quality` script. Name the coverage-writing script in ' +
+                        `\`requiredScripts\` in rules.json, or ${stampIt}`
                 : 'Add the script that writes coverage to `requiredScripts` so the gate produces the ' +
                     `report itself, or ${stampIt}`;
         return [

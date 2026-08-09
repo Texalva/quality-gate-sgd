@@ -22349,12 +22349,38 @@
       "rootCauses": 57
     },
     "scripts": {},
-    "sloc": 98129
+    "sloc": 98129,
+    "measurementFailures": [
+      {
+        "kind": "provenance-unverified",
+        "dimension": "coverage.unit",
+        "message": "<SUBJECT>/coverage/coverage-summary.json yielded a number, but nothing establishes which code it describes: no .quality-gate-provenance.json beside <SUBJECT>/coverage/coverage-summary.json, so nothing records which state of the code this report describes. A coverage report is a file on disk -- a crashed test run, or a CI cache restored from another commit, leaves one that reads exactly like a fresh one. Run the coverage script through `requiredScripts` so the gate produces the report itself, or run `npx quality-gate-sgd stamp-coverage` in the step that produces it. To grade unvouched-for numbers anyway, set QUALITY_COVERAGE_PROVENANCE=optional.",
+        "evidence": {
+          "via": "report",
+          "command": "read <SUBJECT>/coverage/coverage-summary.json",
+          "elapsedMs": 0,
+          "attempts": [
+            {
+              "path": "<SUBJECT>/coverage/coverage-summary.json",
+              "existed": true,
+              "bytesRead": null,
+              "modifiedMs": 1785632630515.8286,
+              "outcome": "read"
+            }
+          ]
+        }
+      }
+    ]
   },
   "metricsError": null,
   "evaluation": {
     "status": "fail",
     "failedRules": [
+      {
+        "type": "measurement",
+        "rule": "coverage.unit.measurement",
+        "message": "coverage.unit was measured, but nothing ties the number to this code (provenance-unverified): <SUBJECT>/coverage/coverage-summary.json yielded a number, but nothing establishes which code it describes: no .quality-gate-provenance.json beside <SUBJECT>/coverage/coverage-summary.json, so nothing records which state of the code this report describes. A coverage report is a file on disk -- a crashed test run, or a CI cache restored from another commit, leaves one that reads exactly like a fresh one. Run the coverage script through `requiredScripts` so the gate produces the report itself, or run `npx quality-gate-sgd stamp-coverage` in the step that produces it. To grade unvouched-for numbers anyway, set QUALITY_COVERAGE_PROVENANCE=optional. [1 path(s) tried: <SUBJECT>/coverage/coverage-summary.json read mtime=2026-08-02T01:03:50.515Z, after 0ms]"
+      },
       {
         "type": "floor",
         "rule": "coverage.unit.branches",
@@ -22424,7 +22450,7 @@
       "parsedOk": true,
       "filesCount": 524,
       "messageCount": 1038,
-      "elapsedMs": 36969,
+      "elapsedMs": 34198,
       "budgetMs": 120000,
       "killed": false,
       "toolReportedCount": 1038,
@@ -22436,7 +22462,7 @@
       "exitCode": 0,
       "combinedBytes": 92,
       "errorCount": 0,
-      "elapsedMs": 27651,
+      "elapsedMs": 26216,
       "budgetMs": 60000,
       "killed": false,
       "unexpectedExit": false,

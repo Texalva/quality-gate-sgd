@@ -64,7 +64,7 @@ will tell you, but it is cheaper to know first.
 |-----|-----|-----|
 | `git` | the cache key and baseline resolution | the run refuses rather than guessing the tree state |
 | `npm` **or** `bun` | `requiredScripts`, and the `type-check` script | that script reports `tool-missing` |
-| `npx`/`bunx` `eslint`, `tsc` | the eslint and typescript dimensions | those dimensions report a failure |
+| `eslint`, `tsc` **in the project's own `node_modules/.bin`** | the eslint and typescript dimensions | those dimensions report `tool-missing` |
 | **`bash`** | **every custom dimension extractor** | **each one reports `tool-missing`** |
 | `curl` | SonarQube, and `init`'s LLM call | that dimension / that step fails |
 | `claude` CLI **or** `ANTHROPIC_API_KEY` | `init`'s threshold suggestion only | `init` falls back to built-in defaults |
@@ -79,6 +79,42 @@ fails loudly instead.
 
 Every extractor failure reports a command you can paste into your own shell to get
 the same run, including the working directory and the pipefail prefix.
+
+#### The linter has to be the project's own
+
+The gate resolves `eslint` through `node_modules/.bin`, walking up from the project
+root the way node does, and **refuses to run if it finds nothing**. It does not fall
+back to `npx eslint`.
+
+The reason is that `npx eslint` and `bunx eslint` do not *fail* when a project has no
+eslint — they **download one and run it**. A fresh linter with no configuration it
+recognises exits 0 with zero findings, and a ceiling of `eslint.errors: 0` is
+satisfied by a linter that never read your code. That is a vacuous pass, so the gate
+now reports `tool-missing` instead.
+
+Two setups that used to work therefore now get a loud refusal:
+
+| Setup | Why it stopped working | Remedy |
+|---|---|---|
+| **A machine-global eslint** (`npm i -g eslint`, no local dependency) | `npx` used to resolve the global prefix bin; the pre-flight only looks in `node_modules/.bin` | `npm i -D eslint` in the project |
+| **Yarn PnP** (`.pnp.cjs`, no `node_modules` at all) | PnP has no `node_modules/.bin` for the walk to find, though `yarn exec eslint` works fine | Switch that project to Yarn's `node-modules` linker, or drop the `eslint.*` rules from `rules.json` (see below) |
+
+Yarn PnP is a genuine false failure, tracked as a known limitation rather than a
+design decision. It has not been reproduced against a real PnP project.
+
+Dropping the rules works because a measurement failure only turns into a *gate*
+failure for a dimension some rule actually reads. With no `eslint.*` rule the
+refusal is still reported in the output — you are told the linter did not run — but
+it does not make the build red. That is the same rule-scoping that lets a broken
+`coverage.lambda` report be reported without failing a project that grades no
+coverage.
+
+**Custom dimension extractors are NOT protected by this.** They run whatever command
+you configure straight through bash, so an extractor written as
+`npx madge --circular --json src/` still has the auto-install behaviour described
+above — and because custom dimensions are ceiling-gated with their best value at
+zero, a tool that never ran scores perfectly. Prefer a locally-installed binary in
+extractor commands.
 
 ### npm and bun
 
@@ -270,13 +306,41 @@ coverage suite**, beside that suite's summary, because `coverage/` and
 `coverage-lambda/` are written by different scripts at different times and a shared
 sidecar would vouch for a report it never saw.
 
-On the next run, each suite that produced a number gets one of three verdicts:
+On the next run, each suite that produced a number gets one of four verdicts:
 
 | Verdict | When | What it does |
 |-----|-----|-----|
 | **verified** | the digest recomputed against the recorded commit matches exactly | nothing — silent |
 | **stale** | it does not match, and a tracked file's content or an untracked source file differs | a `stale-report` measurement failure on that suite, so every rule grading it FAILS |
-| **unverifiable** | no sidecar, an unreadable one, or a report whose bytes changed after stamping | an advisory; the gate still passes, but the run is cached as a **baseline only** and never served later as `PASSED (cached)` |
+| **code moved mid-run** | the code identity before `requiredScripts` and after them disagree — codegen into `src/` from a `build` step is the usual cause | a `code-changed-during-measurement` failure; every rule grading the suite FAILS |
+| **unverifiable** | no sidecar, an unreadable one, or a report whose bytes changed after stamping | **by default, a `provenance-unverified` failure** — see below |
+
+> ### ⚠️ Breaking change: unverifiable coverage now fails
+>
+> Earlier versions printed an advisory and passed, on the reasoning that "nobody
+> stamped this report" is not evidence its numbers are *wrong*. True — and it is
+> equally not evidence they are right, and the number in question is the one deciding
+> whether your build ships. A coverage report is a file on disk: a crashed test run
+> that left last week's report, and a CI cache restored from another commit, both
+> read exactly like a fresh one.
+>
+> **To restore the old behaviour**, set `QUALITY_COVERAGE_PROVENANCE=optional`. The
+> reading then becomes an advisory again, the gate passes, and the run is still
+> cached as a baseline only. `optional` is the only spelling that disables it — a typo
+> leaves enforcement on, deliberately, so a mistake cannot silently restore a vacuous
+> pass.
+>
+> The **stale** and **code moved mid-run** verdicts fail in *both* modes. They are
+> built from positive evidence rather than from the absence of it, so there is no
+> policy question to answer.
+
+**Where this deliberately does not fail you.** Provenance is built out of git — a
+commit and a digest against it. If `resolveCodeIdentity` cannot answer at all (no
+repository, a Docker build context that excluded `.git`, an unpacked source tarball),
+then *nobody* can write a sidecar: neither `requiredScripts` nor `stamp-coverage`
+would help. Failing there would print a red build naming two remedies that both
+cannot work, so the gate reports the advisory instead and passes. You are still told
+the numbers are ungrounded.
 
 Nothing is inferred from a file's age. A README edit, a commit, a revert back to
 identical content, a branch switch and a `chmod +x` all move the cache key and all
@@ -318,10 +382,17 @@ no check:**
 - A **cache hit** re-reads neither the report nor the sidecar, so a report replaced
   after a verified entry was written is served as a cached pass.
 - Both embedded default rulesets ship `requiredScripts: []`, so a **zero-config**
-  project never has its report stamped by `run` and gets the advisory (and
-  baseline-only caching) on every run until it writes a `rules.json` naming its
-  coverage script, or stamps in CI. The advisory says so rather than telling you to
-  do something your configuration cannot do.
+  project never has its report stamped by `run`. With provenance required — the
+  default — that now **fails** any coverage rule until the project writes a
+  `rules.json` naming its coverage script, or stamps in CI, or opts out. This is the
+  single most likely way to meet the breaking change above.
+- The gate may write a **`.gitignore` inside your coverage directory**, containing
+  only an ignore rule for the sidecar, and only when the directory is not already
+  ignored and has no `.gitignore` of its own. Without it the sidecar shows up as an
+  untracked file, which keys every run as WIP and costs every monotonic rule its
+  baseline. It is never appended to a `.gitignore` you wrote. It is invisible to
+  `git status` by construction, but it *is* present in tarballs, rsyncs and docker
+  build contexts.
 
 Getting the `requiredScripts` pairing right is still the better answer, and it is
 the reason `init` picks a coverage-writing script.
@@ -456,6 +527,7 @@ console.log(prioritized[0].priority);  // Priority score
 | `QUALITY_COVERAGE_UNIT_DIR` | `coverage` | Directory holding the coverage summary |
 | `QUALITY_COVERAGE_SUMMARY_FILE` | `coverage-summary.json` | Summary filename within it |
 | `QUALITY_COVERAGE_REQUIRED` | `true` | Whether a missing coverage report is an error |
+| `QUALITY_COVERAGE_PROVENANCE` | `required` | Set to `optional` to grade coverage numbers that cannot be tied to the code |
 | `QUALITY_PACKAGE_MANAGER` | Detected | Force `npm` or `bun`; any other value is refused |
 
 ### Projects with no coverage
@@ -532,6 +604,43 @@ not faulted when another suite produced a report.
    sonar.tests=tests
    sonar.javascript.lcov.reportPaths=coverage/lcov.info
    ```
+
+#### What the gate requires of SonarQube
+
+The same provenance question applies here: SonarQube's `/api/measures/component`
+returns whatever the project key currently holds, which is not necessarily the
+analysis *this* run submitted. Someone else's scan landing between your scan and
+your gate would otherwise be graded as yours. So the gate now confirms that the
+analysis it submitted is the one the server reports as current.
+
+That has three consequences worth knowing before you turn it on.
+
+- **`SONARQUBE_TOKEN` needs the "Browse" permission** on the project, because
+  confirming the analysis reads `/api/project_analyses/search`. A token that can
+  submit a scan but not browse the project makes every run unconfirmable.
+- **An analysis the gate cannot confirm makes the run baseline-only.** The numbers
+  are still reported, but the run is not cached as a verdict, so the next run
+  re-measures instead of printing `PASSED (cached)`.
+- **A `wrong-subject` failure** means the server named a different analysis as
+  current for your project key than the one your scan produced. Usually a concurrent
+  scan of the same key.
+
+> ### ⚠️ Known limitation: pull-request analyses are graded as the wrong subject
+>
+> Both requests the gate makes are sent **without** a `branch` or `pullRequest`
+> parameter, so both address the default branch. On Developer Edition and above,
+> `sonar-scanner` auto-detects pull-request context from CI environment variables
+> without anyone configuring it — so a PR build submits analysis `AN-PR`, the gate
+> asks about the default branch, gets `AN-MAIN`, and emits `wrong-subject`, failing
+> every SonarQube rule.
+>
+> **This is a systematic false failure on the ordinary PR CI shape.** Until it is
+> fixed, either scan the default branch only, or drop the `sonarqube.*` rules from
+> `rules.json` for PR builds so the failure is reported without going red.
+>
+> The pre-change behaviour was also wrong — it silently graded the default branch's
+> numbers against a PR scan — so failing is the more honest of the two, but it is not
+> where this should land.
 
 ## Caching
 

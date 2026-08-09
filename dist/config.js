@@ -43,6 +43,25 @@ function coverageRequired() {
         return true;
     return !COVERAGE_REQUIREMENT_DISABLED_BY.has(raw.trim().toLowerCase());
 }
+/**
+ * The one value that turns provenance enforcement off.
+ *
+ * A single spelling rather than the set `COVERAGE_REQUIREMENT_DISABLED_BY` accepts,
+ * because this opt-out weakens what a PASS means and the person reading the CI config
+ * six months from now should not have to wonder whether `0` was a typo. `optional` has
+ * to be written out.
+ *
+ * The unrecognised-value asymmetry is the same as its neighbour's and for the same
+ * reason: a typo leaves enforcement ON, because reading it as "off" silently restores
+ * the vacuous pass and gives the reader no sign their opt-out did nothing.
+ */
+const PROVENANCE_OPTIONAL = 'optional';
+function coverageProvenanceRequired() {
+    const raw = process.env.QUALITY_COVERAGE_PROVENANCE;
+    if (raw === undefined)
+        return true;
+    return raw.trim().toLowerCase() !== PROVENANCE_OPTIONAL;
+}
 function resolveProjectRoot() {
     // Start from cwd and verify package.json exists
     const cwd = process.cwd();
@@ -86,6 +105,7 @@ export function loadConfig() {
             lambdaDir: process.env.QUALITY_COVERAGE_LAMBDA_DIR || 'coverage-lambda',
             summaryFile: process.env.QUALITY_COVERAGE_SUMMARY_FILE || 'coverage-summary.json',
             required: coverageRequired(),
+            provenanceRequired: coverageProvenanceRequired(),
             // Emptiness counts as unset here, matching the `||` above it: a variable set
             // to '' resolves to the default path, so calling it "configured" would claim
             // the project named a directory it did not.

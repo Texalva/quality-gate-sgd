@@ -174,6 +174,7 @@ describe('mcp handlers report what they could not measure', () => {
     // `vi.clearAllMocks()` clears CALLS and not implementations, so both stubs are put
     // back by hand rather than left to leak into whatever runs next.
     const { loadRules } = await import('../../src/rules.js');
+    const { resetConfig } = await import('../../src/config.js');
     const gradesEslintOnly = vi.mocked(loadRules).getMockImplementation();
     vi.mocked(loadRules).mockReturnValue({
       version: '1.0.0',
@@ -182,6 +183,22 @@ describe('mcp handlers report what they could not measure', () => {
     });
 
     try {
+      // The DEFAULT policy makes this a measurement failure rather than an advisory,
+      // so the advisory must be silent -- one finding reported once. What this file
+      // cannot show is the failure arriving, because the extraction that produces it
+      // is mocked out above; that half is proven in tests/coverage-provenance.ts
+      // against a real repository, and end to end by verify-vacuous-pass.mjs.
+      delete process.env.QUALITY_COVERAGE_PROVENANCE;
+      resetConfig();
+      expect((await responseOf(() => handleRun({}))).unevaluatedRules).toEqual([]);
+
+      // Under the opt-out the handler's wiring is the only thing carrying the finding,
+      // and this is the assertion that proves it is wired: `evaluateRules` cannot
+      // produce these entries (they do not travel inside `Metrics`), so a handler that
+      // forgot to append them would serialise `unevaluatedRules: []` over a coverage
+      // floor graded against a report nothing ties to the code.
+      process.env.QUALITY_COVERAGE_PROVENANCE = 'optional';
+      resetConfig();
       const response = await responseOf(() => handleRun({}));
       expect(response.unevaluatedRules).toEqual([
         {
@@ -192,6 +209,8 @@ describe('mcp handlers report what they could not measure', () => {
         },
       ]);
     } finally {
+      delete process.env.QUALITY_COVERAGE_PROVENANCE;
+      resetConfig();
       if (gradesEslintOnly) vi.mocked(loadRules).mockImplementation(gradesEslintOnly);
       provenanceOf.mockReturnValue([]);
     }

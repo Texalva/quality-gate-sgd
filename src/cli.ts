@@ -34,6 +34,7 @@ import {
   stampAllCoverageSummaries,
   describeCodeCommit,
   PROVENANCE_SIDECAR_FILE,
+  type StampOutcome,
 } from './coverage-provenance.js';
 import {
   loadRules,
@@ -705,7 +706,16 @@ async function runQualityGate(options: RunOptions = { skipSonarQube: false }): P
     // `stamp-coverage` cannot fix because the tree genuinely holds two generations of
     // the code -- was told to run `stamp-coverage`. The advisory named a remedy they
     // may already have been performing, for a cause it did not mention.
-    const couldNotStamp = stampOutcomes.filter((outcome) => outcome.kind === 'cannot-stamp');
+    //
+    // The CODEGEN reason is excluded, because it is no longer one of the reasons a
+    // report ends up merely unvouched-for: it is now a `code-changed-during-measurement`
+    // measurement failure that fails the gate in both provenance modes. Printing it here
+    // too would report one cause twice and, worse, put it under the "Not failing the gate
+    // on these" sentence below -- next to a run that is failing the gate on exactly it.
+    const couldNotStamp = stampOutcomes.filter(
+      (outcome): outcome is Extract<StampOutcome, { kind: 'cannot-stamp' }> =>
+        outcome.kind === 'cannot-stamp' && outcome.reason !== 'code-changed-during-measurement'
+    );
     for (const outcome of couldNotStamp) {
       log(`  ${outcome.suite}: this run could not stamp it -- ${outcome.why}`);
     }

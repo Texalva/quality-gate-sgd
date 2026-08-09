@@ -63,7 +63,7 @@
  *                               `:100644 100755 cb0ff5c cb0ff5c M` -- identical
  *                               blob shas, so no content changed                   -> not stale
  *
- * THREE VERDICTS, and the asymmetry between them is the design:
+ * FOUR VERDICTS, and the asymmetry between them is the design:
  *
  *   verified      silent.
  *   stale         a `stale-report` MeasurementFailure on the SUITE dimension, so
@@ -71,19 +71,43 @@
  *                 definite claim, made only about a report recognised byte-for-byte
  *                 and only when a tracked file's CONTENT or an untracked source file
  *                 demonstrably differs.
- *   unverifiable  an advisory plus an `unverified-provenance` entry in
- *                 `EvaluationResult.unevaluated`, which forces
- *                 `monotonicEvaluated: false` -- baseline-only caching. Never a gate
- *                 failure. This is the answer whenever the tool cannot tell, which
- *                 includes the ordinary no-sidecar case.
+ *   code moved
+ *     mid-run     a `code-changed-during-measurement` MeasurementFailure. Also a
+ *                 definite claim, and detected by the STAMP rather than here: the two
+ *                 code identities taken either side of `requiredScripts` disagree, so
+ *                 the report provably describes a generation of the source the tree no
+ *                 longer holds. Codegen into `src/` from a `build` script is the usual
+ *                 cause. Fails in both provenance modes.
+ *   unverifiable  no evidence either way -- no sidecar, an unusable one, a report
+ *                 rewritten since the stamp. What this COSTS is a policy decision, and
+ *                 it is the one thing in this module that is configurable:
+ *
+ *                   provenanceRequired (DEFAULT)  a `provenance-unverified`
+ *                     MeasurementFailure. The gate goes red on any rule that grades
+ *                     the suite.
+ *                   QUALITY_COVERAGE_PROVENANCE=optional  an advisory plus an
+ *                     `unverified-provenance` entry in `EvaluationResult.unevaluated`,
+ *                     which forces `monotonicEvaluated: false` -- baseline-only
+ *                     caching. Gate green.
+ *
+ *                 The default REVERSED in this version, and it is a breaking contract
+ *                 change made on purpose. "Nobody stamped this" is not evidence the
+ *                 numbers are wrong, which is why it shipped green the first time; it
+ *                 is also not evidence they are right, and the number in question is
+ *                 the one deciding whether the build ships. See
+ *                 `config.coverage.provenanceRequired`.
  *
  * WHERE THIS IS NOT CALLED, deliberately. `runScore` and `runSuggest` (and the MCP
- * score/suggest handlers) get the STALE failure through `metrics.measurementFailures`
- * and `describeUnmeasured` like any other failure, and they get NO unverifiable
- * advisory. They produce no verdict and write no cache entry, and the unverifiable
- * branch is entirely about those two things. On a cache HIT nothing here runs
- * either: the sidecar is not read, which is the same shape as #41 and is stated in
- * the cached-pass comment in cli.ts rather than left to be inferred.
+ * score/suggest handlers) never see the unverifiable ADVISORY, because they produce no
+ * verdict and write no cache entry and the advisory is entirely about those two
+ * things. They do see all three FAILURES, through `metrics.measurementFailures` and
+ * `describeUnmeasured`, which partitions them as `numberReported` so those surfaces
+ * report the number and say in the same breath that nothing ties it to this code. In
+ * `optional` mode there is no failure to carry, so they print the number unqualified
+ * -- accepted, because that mode is an explicit opt-out of the check and the run path
+ * still prints the advisory. On a cache HIT nothing here runs either: the sidecar is
+ * not read, which is the same shape as #41 and is stated in the cached-pass comment in
+ * cli.ts rather than left to be inferred.
  *
  * LIMITS, each one reproduced rather than supposed:
  *
@@ -238,6 +262,24 @@ export type StampOutcome = {
     readonly suite: CoverageSuite;
     readonly summaryPath: string;
     readonly why: string;
+    /**
+     * Whether the stamp was refused because something was POSITIVELY WRONG, or
+     * because the tool could not find out.
+     *
+     * The distinction decides whether the run fails, so it is carried in the data
+     * rather than left to a caller to re-derive from the wording of `why`.
+     *
+     * `code-changed-during-measurement` is a finding: the code identity before the
+     * scripts ran and the identity after them disagree, so the report provably
+     * describes a generation of the source the tree no longer holds. That fails in
+     * both provenance modes, like `stale`.
+     *
+     * `code-state-unknown` is an absence: git could not answer, or the sidecar
+     * could not be written to a read-only artifact mount. Nothing is known to be
+     * wrong, so it degrades to the ordinary unvouched-for path and is governed by
+     * `provenanceRequired` like any other report nobody stamped.
+     */
+    readonly reason: 'code-changed-during-measurement' | 'code-state-unknown';
 };
 /**
  * Stamp every suite whose summary this run WROTE.
@@ -290,15 +332,48 @@ export declare function suitesWithNumbers(coverage: AllCoverageMetrics | undefin
  */
 export declare function verifyCoverageProvenance(suites: readonly CoverageSuite[]): readonly SuiteProvenance[];
 /**
- * A stale report is a failed MEASUREMENT of its suite.
+ * A report that cannot be tied to the code being graded is a failed MEASUREMENT.
  *
  * Emitted unconditionally, not scoped to the rules, because that is this codebase's
  * architecture: the fact is reported and `evaluateMeasurements` decides which facts
  * become failed RULES. So a stale `coverage.lambda` on a project that grades no
  * coverage is an ungated advisory rather than a red gate -- and the run is still not
  * cached, exactly as it already is for an unparseable lambda report.
+ *
+ * THREE FINDINGS, and the epistemic difference between them is the whole design:
+ *
+ *   - `stale`: positive evidence the report describes other code. Always fails.
+ *   - `code-changed-during-measurement`: positive evidence the code moved WHILE the
+ *     report was being written. Always fails. Reached through `stampOutcomes` rather
+ *     than `verdicts`, because the stamp is what detected it -- the sidecar was
+ *     discarded, so verification only sees an absence afterwards and would report the
+ *     much weaker `no-sidecar`.
+ *   - `unverifiable`: no evidence either way. Fails only when the adopter has asked
+ *     for provenance to be required, which is the default. See
+ *     `config.coverage.provenanceRequired` for why that default was changed.
+ *
+ * `stampFailedSuites` is the double-reporting guard. A codegen run discards its
+ * sidecar, so the same suite arrives here as BOTH a positive stamp finding and an
+ * `unverifiable` verdict; without the guard a strict-mode codegen run emits two
+ * failures for one suite. The positive finding wins, because it names the actual
+ * cause and its remedy ("run coverage in a step that does not regenerate sources")
+ * is not the unvouched-for one ("stamp it").
+ *
+ * STRICT MODE NEVER FAILS A PROJECT THAT CANNOT STAMP AT ALL, and that exception is
+ * load-bearing rather than a softening. Provenance is built out of git: a commit and
+ * a digest against it. Where `resolveCodeIdentity` cannot answer -- no repository, a
+ * Docker build context that excluded `.git` (the common CI shape, not an exotic one),
+ * an unpacked source tarball -- no sidecar can be written by ANYONE. Neither
+ * `requiredScripts` nor `stamp-coverage` can produce one, so failing would hand the
+ * adopter a red build, name two remedies, and have both of them not work. Refusing a
+ * measurement the tool cannot take is right; refusing a project for an environment
+ * fact it cannot act on is the false-fail that killed designs A and B. The advisory
+ * still fires, so the reader is told the numbers are ungrounded.
+ *
+ * Resolved LAZILY and at most once: it costs git calls, and it is only consulted on
+ * the path that is otherwise about to fail the build.
  */
-export declare function coverageProvenanceFailures(verdicts: readonly SuiteProvenance[]): readonly MeasurementFailure[];
+export declare function coverageProvenanceFailures(verdicts: readonly SuiteProvenance[], stampOutcomes?: readonly StampOutcome[], provenanceRequired?: boolean): readonly MeasurementFailure[];
 /**
  * A rule graded against coverage nobody can tie to this code.
  *
@@ -312,14 +387,24 @@ export declare function coverageProvenanceFailures(verdicts: readonly SuiteProve
  * verdict), so without the scoping every build-only project with a stray
  * `coverage/` directory would lose `PASSED (cached)` over a report nothing grades.
  *
- * The requiredScripts branch exists because the remedy an adopter is given has to be
- * one their configuration can reach. Both embedded default rulesets ship
- * `requiredScripts: []`, and cli.ts's `rules.rules.requiredScripts || ['quality']`
- * does not rescue that -- `[]` is truthy -- so "let the gate run your coverage
- * script" is impossible advice for a zero-config project until they write a
- * rules.json. Saying so is the difference between an advisory and a runaround.
+ * The requiredScripts branches exist because the remedy an adopter is given has to be
+ * one their configuration can reach, and because the sentence explaining WHY has to be
+ * true of the ruleset in front of them. Three cases, not two:
+ *
+ *   `requiredScripts: []`   both embedded default rulesets, and cli.ts's
+ *                           `rules.rules.requiredScripts || ['quality']` does not
+ *                           rescue it because `[]` is TRUTHY. Nothing ran, so "let the
+ *                           gate run your coverage script" is impossible advice until
+ *                           they write a rules.json.
+ *   key OMITTED             the `||` substitutes `['quality']`, so a script really did
+ *                           run and it simply did not write this report. Telling this
+ *                           reader the gate "never ran your coverage tool" is false and
+ *                           sends them hunting a configuration problem that is not
+ *                           there -- and blaming a report for a phantom substituted
+ *                           script is what design A was removed for.
+ *   scripts NAMED           the ordinary remedy.
  */
-export declare function coverageProvenanceUnevaluated(rules: QualityRules, verdicts: readonly SuiteProvenance[]): readonly UnevaluatedRule[];
+export declare function coverageProvenanceUnevaluated(rules: QualityRules, verdicts: readonly SuiteProvenance[], provenanceRequired?: boolean): readonly UnevaluatedRule[];
 /** `4f2a1c9`, matching how cli.ts prints a commit. */
 export declare function describeCodeCommit(commit: string): string;
 export {};

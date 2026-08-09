@@ -15,6 +15,7 @@ import type {
   CacheEntry,
   CoverageProvenanceStamp,
 } from './types.js';
+import { MEASUREMENT_KINDS_REPORTING_A_NUMBER } from './providers/types.js';
 import type { CoverageSuite, MeasurementEvidence } from './providers/types.js';
 import { getConfig } from './config.js';
 import { readEntryManager } from './runner.js';
@@ -364,15 +365,19 @@ function evaluateMeasurements(
     .map((failure) => ({
       type: 'measurement' as const,
       rule: `${failure.dimension}.measurement`,
-      // "could not be measured" is true of every kind but one. `stale-report`
-      // arrives WITH a number -- the report parsed, `total` was valid, the suite has
-      // a value in `metrics` -- and what failed is the claim that the number
-      // describes this code. Printing "could not be measured" over a dimension the
-      // same output reports a percentage for is the kind of confidently-false
-      // sentence this file exists to remove.
+      // "could not be measured" is true of most kinds and FALSE of the provenance
+      // ones, which arrive WITH a number -- the report parsed, `total` was valid, the
+      // suite has a value in `metrics`. What failed there is the claim that the number
+      // describes this code. Printing "could not be measured" over a dimension the same
+      // output reports a percentage for is the kind of confidently-false sentence this
+      // file exists to remove.
+      //
+      // The set is imported rather than spelled `=== 'stale-report'` here because two
+      // later kinds joined it, and a local check made this sentence quietly false for
+      // both. See MEASUREMENT_KINDS_REPORTING_A_NUMBER.
       message:
         `${failure.dimension} ${
-          failure.kind === 'stale-report'
+          MEASUREMENT_KINDS_REPORTING_A_NUMBER.has(failure.kind)
             ? 'was measured, but nothing ties the number to this code'
             : 'could not be measured'
         } (${failure.kind}): ${failure.message} ` + describeEvidence(failure.evidence),

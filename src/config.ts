@@ -43,6 +43,27 @@ export interface QualityGateConfig {
     required: boolean;
 
     /**
+     * Whether a coverage number must be traceable to the code being graded.
+     *
+     * ON by default, and that default is a BREAKING contract change made
+     * deliberately: before it, a report nobody could tie to this code was graded
+     * anyway, on the reasoning that "nobody stamped this" is not evidence the
+     * numbers are wrong. That reasoning holds right up until you notice the number
+     * being defended is the one deciding whether the build ships. A coverage report
+     * is a file on disk; the three states "your tests just ran", "your test command
+     * crashed and last week's report is still here", and "CI restored a cached
+     * coverage/ from another commit" are indistinguishable without a sidecar, and
+     * the last two are exactly the vacuous pass this tool exists to remove.
+     *
+     * `optional` restores the previous behaviour -- advisory, gate green, run still
+     * not cacheable as a verdict -- and exists so a project mid-migration can opt
+     * out rather than be stuck. It does NOT disable the STALE verdict, which is
+     * positive evidence that the report describes different code and fails in both
+     * modes.
+     */
+    provenanceRequired: boolean;
+
+    /**
      * Whether each directory above was named by the PROJECT rather than defaulted.
      *
      * Both are resolved with `||` against a hardcoded default, which loses exactly
@@ -122,6 +143,26 @@ function coverageRequired(): boolean {
   return !COVERAGE_REQUIREMENT_DISABLED_BY.has(raw.trim().toLowerCase());
 }
 
+/**
+ * The one value that turns provenance enforcement off.
+ *
+ * A single spelling rather than the set `COVERAGE_REQUIREMENT_DISABLED_BY` accepts,
+ * because this opt-out weakens what a PASS means and the person reading the CI config
+ * six months from now should not have to wonder whether `0` was a typo. `optional` has
+ * to be written out.
+ *
+ * The unrecognised-value asymmetry is the same as its neighbour's and for the same
+ * reason: a typo leaves enforcement ON, because reading it as "off" silently restores
+ * the vacuous pass and gives the reader no sign their opt-out did nothing.
+ */
+const PROVENANCE_OPTIONAL = 'optional';
+
+function coverageProvenanceRequired(): boolean {
+  const raw = process.env.QUALITY_COVERAGE_PROVENANCE;
+  if (raw === undefined) return true;
+  return raw.trim().toLowerCase() !== PROVENANCE_OPTIONAL;
+}
+
 function resolveProjectRoot(): string {
   // Start from cwd and verify package.json exists
   const cwd = process.cwd();
@@ -172,6 +213,7 @@ export function loadConfig(): QualityGateConfig {
       summaryFile:
         process.env.QUALITY_COVERAGE_SUMMARY_FILE || 'coverage-summary.json',
       required: coverageRequired(),
+      provenanceRequired: coverageProvenanceRequired(),
       // Emptiness counts as unset here, matching the `||` above it: a variable set
       // to '' resolves to the default path, so calling it "configured" would claim
       // the project named a directory it did not.

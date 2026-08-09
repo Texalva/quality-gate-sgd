@@ -144,6 +144,41 @@ export type MeasurementFailureKind = 'tool-missing' | 'crashed' | 'timed-out' | 
  */
  | 'stale-report'
 /**
+ * The report parsed and yielded a number, and NOTHING establishes which state of the
+ * code that number describes -- no sidecar, or one that cannot be used.
+ *
+ * The counterpart of `stale-report` and its opposite in epistemic character: that one
+ * is a definite claim built from positive evidence, this one is the absence of
+ * evidence said out loud. They are separate kinds because the remedy differs -- a
+ * stale report has to be regenerated, an unvouched one only has to be stamped, and a
+ * message that conflates them sends an adopter to rerun tests that were fine.
+ *
+ * Emitted only when `config.coverage.provenanceRequired`. That gate is a POLICY
+ * decision recorded in config.ts, not a measurement one: the tool's confidence in
+ * these numbers is identical in both modes, and what changes is whether that
+ * confidence is enough to ship on. In `optional` mode the same verdict travels as an
+ * `UnevaluatedRule` advisory instead, and the run is still refused as a cacheable
+ * verdict either way.
+ *
+ * Like `stale-report`, and unlike every other kind, it arrives ALONGSIDE a value for
+ * its dimension -- so `describeUnmeasured` reports it as `numberReported` and the
+ * `score`/`suggest` surfaces must not print "could not be measured" over it.
+ */
+ | 'provenance-unverified'
+/**
+ * A script or extractor rewrote the code WHILE its coverage was being measured, so
+ * the report describes one generation of the source and the tree now holds another.
+ *
+ * Positive evidence, which is why it is a failure in both provenance modes and sits
+ * beside `stale-report` rather than `provenance-unverified`: the gate did not fail to
+ * find out which code the report describes, it found out that the answer changed
+ * underneath it. The usual cause is codegen into `src/` from a `build` script listed
+ * in `requiredScripts` after the coverage script.
+ *
+ * Carries a number for its dimension, for the same reason its two neighbours do.
+ */
+ | 'code-changed-during-measurement'
+/**
  * The service answered and REFUSED: 401 or 403 from a SonarQube endpoint.
  *
  * Its own kind for the reason the others are: the response it calls for is
@@ -176,6 +211,23 @@ export type MeasurementFailureKind = 'tool-missing' | 'crashed' | 'timed-out' | 
  * instead, which is an advisory and fails nothing.
  */
  | 'wrong-subject';
+/**
+ * The kinds that arrive ALONGSIDE a value for their dimension.
+ *
+ * Lives here, beside the union it partitions, because three separate surfaces have to
+ * agree about it and each one says something FALSE if it disagrees. `evaluateMeasurements`
+ * in rules.ts prints "could not be measured", `describeUnmeasured` labels a dimension
+ * "missing from this score", and the MCP handlers serialise the same partition -- all
+ * three of which are wrong about a dimension whose percentage appears in the very same
+ * output. Each one used to carry its own `=== 'stale-report'` check and its own comment
+ * explaining the exception, so adding a second such kind silently made all three false at
+ * once. It is a closed set rather than a predicate on the string so that adding a fourth
+ * is a deliberate edit here.
+ *
+ * All of them are provenance findings: the tool ran, the report parsed, the arithmetic is
+ * honest, and what is in doubt is WHICH CODE the number describes.
+ */
+export declare const MEASUREMENT_KINDS_REPORTING_A_NUMBER: ReadonlySet<MeasurementFailureKind>;
 /**
  * What a failed measurement was measuring.
  *

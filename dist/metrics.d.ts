@@ -273,13 +273,13 @@ export declare function extractAllMetricsAndCoverageProvenance(scriptsToRunOrOpt
  * Returns `undefined` rather than an empty array so it disappears from JSON
  * output entirely when everything was measured.
  *
- * `numberReported` exists because one kind breaks the assumption the name of this
- * function is built on. Every failure but `stale-report` arrives with
- * `metrics: undefined` for its dimension, which is why "missing from this score" was
- * a true sentence; a stale report parsed fine and `computeFitness` includes its
- * number. A caller that prints one sentence for both says something false about one
- * of them, so the distinction is carried in the data rather than left to each
- * surface to rediscover from the kind.
+ * `numberReported` exists because a few kinds break the assumption the name of this
+ * function is built on. Most failures arrive with `metrics: undefined` for their
+ * dimension, which is why "missing from this score" was a true sentence; the three
+ * provenance kinds parsed a report fine and `computeFitness` includes their numbers.
+ * A caller that prints one sentence for both says something false about one of them,
+ * so the distinction is carried in the data rather than left to each surface to
+ * rediscover from the kind.
  */
 export declare function describeUnmeasured(metrics: Metrics): readonly {
     readonly dimension: string;

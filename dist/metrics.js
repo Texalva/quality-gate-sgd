@@ -23,6 +23,7 @@ import { eslintLintProvider } from './providers/eslint.js';
 import { typescriptTypecheckProvider } from './providers/typescript.js';
 import { DEFAULT_MEASUREMENT_LIMITS, measurementFailure } from './providers/result.js';
 import { createIstanbulCoverageProvider } from './providers/coverage.js';
+import { MEASUREMENT_KINDS_REPORTING_A_NUMBER } from './providers/types.js';
 /**
  * spawnSync defaults to a 1 MiB stdout buffer. Past that, Node truncates the
  * output and kills the child, leaving status === null -- and every parse path
@@ -1257,7 +1258,12 @@ export function extractAllMetricsAndCoverageProvenance(scriptsToRunOrOptions = [
         ...coverage.failures,
         // Immediately after, so both halves of "what is wrong with the coverage reading"
         // are together: what the report says, then which code it says it about.
-        ...coverageProvenanceFailures(coverageProvenance),
+        //
+        // `stampOutcomes` is passed in because one of the three findings -- the code being
+        // rewritten WHILE its coverage was measured -- is only visible to the stamp. That
+        // path discards the sidecar, so verification afterwards sees a plain absence and
+        // would report the far weaker "nobody stamped this".
+        ...coverageProvenanceFailures(coverageProvenance, stampOutcomes),
         ...customFailures,
         // Last, so the orderings the existing tests assert on are untouched. `--coverage-only`
         // yields no reading and therefore no failure, which is correct: the adopter asked
@@ -1294,13 +1300,13 @@ export function extractAllMetricsAndCoverageProvenance(scriptsToRunOrOptions = [
  * Returns `undefined` rather than an empty array so it disappears from JSON
  * output entirely when everything was measured.
  *
- * `numberReported` exists because one kind breaks the assumption the name of this
- * function is built on. Every failure but `stale-report` arrives with
- * `metrics: undefined` for its dimension, which is why "missing from this score" was
- * a true sentence; a stale report parsed fine and `computeFitness` includes its
- * number. A caller that prints one sentence for both says something false about one
- * of them, so the distinction is carried in the data rather than left to each
- * surface to rediscover from the kind.
+ * `numberReported` exists because a few kinds break the assumption the name of this
+ * function is built on. Most failures arrive with `metrics: undefined` for their
+ * dimension, which is why "missing from this score" was a true sentence; the three
+ * provenance kinds parsed a report fine and `computeFitness` includes their numbers.
+ * A caller that prints one sentence for both says something false about one of them,
+ * so the distinction is carried in the data rather than left to each surface to
+ * rediscover from the kind.
  */
 export function describeUnmeasured(metrics) {
     const failures = metrics.measurementFailures ?? [];
@@ -1310,7 +1316,7 @@ export function describeUnmeasured(metrics) {
         dimension: failure.dimension,
         kind: failure.kind,
         why: failure.message,
-        numberReported: failure.kind === 'stale-report',
+        numberReported: MEASUREMENT_KINDS_REPORTING_A_NUMBER.has(failure.kind),
     }));
 }
 /**

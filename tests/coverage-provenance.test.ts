@@ -31,7 +31,7 @@ import {
 import { tmpdir } from 'os';
 import * as path from 'path';
 
-import { resetConfig } from '../src/config.js';
+import { getConfig, resetConfig } from '../src/config.js';
 import { codeStateDigest, getCacheKey } from '../src/cache.js';
 import { evaluateRules } from '../src/rules.js';
 import {
@@ -370,12 +370,63 @@ describe('states that must NOT be reported stale', () => {
 // ===========================================================================
 
 describe('a report whose provenance cannot be established', () => {
-  it('is unverifiable rather than stale when no sidecar exists, and fails nothing', () => {
+  it('is unverifiable rather than stale when no sidecar exists', () => {
     makeProject({ ignoreCoverage: true, report: SUMMARY(80) });
 
     const verdicts = verifyCoverageProvenance(['coverage.unit']);
     expect(verdicts[0]).toMatchObject({ kind: 'unverifiable', why: 'no-sidecar' });
-    expect(coverageProvenanceFailures(verdicts)).toEqual([]);
+  });
+
+  /**
+   * THE POLICY, and it reversed. An unverifiable reading used to satisfy a floor: the
+   * advisory printed, `status` stayed `pass`, and the build shipped on a number nothing
+   * tied to the code. The reasoning was that "nobody stamped this" is not evidence the
+   * numbers are WRONG -- true, and beside the point once you notice the number being
+   * defended is the one deciding whether to ship.
+   *
+   * Asserted through `evaluateRules` rather than only on the failure list, because the
+   * failure existing is not the claim. The claim is that the GATE goes red, and the
+   * route from one to the other runs through `evaluateMeasurements`, which is rule-
+   * scoped: an unvouched-for `coverage.lambda` on a project that grades no coverage
+   * must still pass. That second half is the next test.
+   */
+  it('fails a floor it cannot tie to the code, under the default policy', () => {
+    makeProject({ ignoreCoverage: true, report: SUMMARY(80) });
+
+    const verdicts = verifyCoverageProvenance(['coverage.unit']);
+    const failures = coverageProvenanceFailures(verdicts, [], true);
+    expect(failures).toHaveLength(1);
+    expect(failures[0]).toMatchObject({
+      kind: 'provenance-unverified',
+      dimension: 'coverage.unit',
+    });
+    expect(failures[0].message).toContain('stamp-coverage');
+    expect(failures[0].message).toContain('QUALITY_COVERAGE_PROVENANCE=optional');
+
+    const metrics: Metrics = {
+      scripts: {},
+      coverage: { unit: { statements: 80, branches: 80, functions: 80, lines: 80 } },
+      measurementFailures: failures,
+    };
+    expect(evaluateRules(rulesWithFloor('coverage.unit.statements'), metrics).status).toBe('fail');
+
+    // And the advisory does NOT also fire: one finding, one register. Saying it twice
+    // is how the loud channel stops being read.
+    expect(
+      coverageProvenanceUnevaluated(rulesWithFloor('coverage.unit.statements'), verdicts, true)
+    ).toEqual([]);
+  });
+
+  /**
+   * The escape hatch, which is the whole of the previous contract preserved verbatim:
+   * advisory, gate green, and (elsewhere) the run still refused as a cacheable verdict.
+   * It exists so a project mid-migration can opt out rather than be stuck.
+   */
+  it('advises and passes under QUALITY_COVERAGE_PROVENANCE=optional', () => {
+    makeProject({ ignoreCoverage: true, report: SUMMARY(80) });
+
+    const verdicts = verifyCoverageProvenance(['coverage.unit']);
+    expect(coverageProvenanceFailures(verdicts, [], false)).toEqual([]);
 
     const metrics: Metrics = {
       scripts: {},
@@ -385,12 +436,178 @@ describe('a report whose provenance cannot be established', () => {
 
     const unevaluated = coverageProvenanceUnevaluated(
       rulesWithFloor('coverage.unit.statements'),
-      verdicts
+      verdicts,
+      false
     );
     expect(unevaluated).toHaveLength(1);
     expect(unevaluated[0].type).toBe('unverified-provenance');
     expect(unevaluated[0].message).toContain('requiredScripts');
     expect(unevaluated[0].message).toContain('stamp-coverage');
+  });
+
+  /**
+   * THE GUARD THAT HAD NO TEST. Reached by stamping over uncommitted code and then
+   * reverting it: `digestOfUnchangedCodeState()` no longer reproduces the digest in the
+   * sidecar, while `contentChangedPaths` and `listUntrackedCodeFiles` are both EMPTY
+   * because the tree is now identical to the recorded commit.
+   *
+   * Without the `digestOfUnchangedCodeState()` comparison the function falls through to
+   * `verified` -- vouching for a generation of the code that exists nowhere in the tree
+   * -- and before this test, deleting that comparison broke nothing. It has to be
+   * `unverifiable` rather than `stale`: no content differs from the recorded commit, so
+   * there is no file to name, and naming one anyway is what design B was rejected for.
+   */
+  it('is unverifiable when the stamped uncommitted state can no longer be reproduced', () => {
+    makeProject({ ignoreCoverage: true, report: SUMMARY(80) });
+
+    const committed = 'export const a = 1;\n';
+    write('src/a.ts', 'export const a = 99;\n');
+    stampAsRun();
+    expect(verifyCoverageProvenance(['coverage.unit'])[0].kind).toBe('verified');
+
+    // Revert to exactly the committed bytes. The report still describes a = 99.
+    write('src/a.ts', committed);
+    expect(git('status', '--porcelain', '--', 'src/')).toBe('');
+
+    const verdicts = verifyCoverageProvenance(['coverage.unit']);
+    expect(verdicts[0]).toMatchObject({
+      kind: 'unverifiable',
+      why: 'stamp-state-not-reproducible',
+    });
+    expect(coverageProvenanceFailures(verdicts, [], true)[0]).toMatchObject({
+      kind: 'provenance-unverified',
+    });
+  });
+
+  /**
+   * CODEGEN DURING MEASUREMENT: `requiredScripts: ['test:coverage', 'build']` where
+   * `build` writes into `src/`. This is POSITIVE evidence -- the code identity taken
+   * before the scripts and the one taken after them disagree -- so unlike everything
+   * else in this describe block it fails in BOTH provenance modes. It used to degrade
+   * to a plain unverifiable advisory and pass, which put a finding and an absence of
+   * findings in the same bucket.
+   */
+  it('fails when a script rewrote the code while its coverage was being measured', () => {
+    makeProject({ ignoreCoverage: true, report: SUMMARY(80) });
+
+    const snapshot = snapshotCoverageStateBeforeScripts();
+    writeFileSync(summaryPath(), SUMMARY(81));
+    // The `build` step, after coverage was written.
+    write('src/generated.ts', 'export const generated = 1;\n');
+
+    const outcomes = stampCoverageSummariesRewrittenDuringRun(snapshot, 'run');
+    const unit = outcomes.find((outcome) => outcome.suite === 'coverage.unit');
+    expect(unit).toMatchObject({
+      kind: 'cannot-stamp',
+      reason: 'code-changed-during-measurement',
+    });
+
+    // No sidecar survives, so verification on its own can only say "nobody stamped it".
+    const verdicts = verifyCoverageProvenance(['coverage.unit']);
+    expect(verdicts[0]).toMatchObject({ kind: 'unverifiable' });
+
+    for (const provenanceRequired of [true, false]) {
+      const failures = coverageProvenanceFailures(verdicts, outcomes, provenanceRequired);
+      // Exactly ONE finding for the suite, and it is the one that names the cause --
+      // not the weaker "nobody stamped this", whose remedy would send the adopter to
+      // run `stamp-coverage` over a report stamping cannot fix.
+      expect(failures).toHaveLength(1);
+      expect(failures[0]).toMatchObject({
+        kind: 'code-changed-during-measurement',
+        dimension: 'coverage.unit',
+      });
+      expect(failures[0].message).toContain('regenerate sources');
+    }
+
+    const metrics: Metrics = {
+      scripts: {},
+      coverage: { unit: { statements: 81, branches: 81, functions: 81, lines: 81 } },
+      measurementFailures: coverageProvenanceFailures(verdicts, outcomes, false),
+    };
+    expect(evaluateRules(rulesWithFloor('coverage.unit.statements'), metrics).status).toBe('fail');
+  });
+
+  /**
+   * The other three `cannot-stamp` reasons are absences, not findings -- git could not
+   * answer, or a read-only artifact mount refused the write. They must NOT be promoted,
+   * or a container volume turns into a red build over a report nothing is known to be
+   * wrong with.
+   */
+  it('does not promote a stamp that failed because the tool could not find out', () => {
+    makeProject({ ignoreCoverage: true, report: SUMMARY(80) });
+
+    const verdicts = verifyCoverageProvenance(['coverage.unit']);
+    const cannotWrite = [
+      {
+        kind: 'cannot-stamp' as const,
+        suite: 'coverage.unit' as const,
+        summaryPath: summaryPath(),
+        why: 'the sidecar could not be written (EROFS)',
+        reason: 'code-state-unknown' as const,
+      },
+    ];
+
+    expect(coverageProvenanceFailures(verdicts, cannotWrite, false)).toEqual([]);
+    expect(coverageProvenanceFailures(verdicts, cannotWrite, true)[0]).toMatchObject({
+      kind: 'provenance-unverified',
+    });
+  });
+
+  /**
+   * `[]` and `undefined` are DIFFERENT rulesets, because every caller resolves scripts
+   * as `requiredScripts || ['quality']` and `[]` is truthy. An empty array runs nothing;
+   * an omitted key silently runs `quality`. The advisory used to tell both readers "the
+   * gate never ran your coverage tool", which is false for the second and sends them
+   * looking for a configuration problem that is not there.
+   */
+  it('does not tell a ruleset that omits requiredScripts that no script ran', () => {
+    makeProject({ ignoreCoverage: true, report: SUMMARY(80) });
+    const verdicts = verifyCoverageProvenance(['coverage.unit']);
+
+    const withEmpty: QualityRules = {
+      version: '1.0.0',
+      description: 'empty array',
+      rules: { floors: { 'coverage.unit.statements': 5 }, requiredScripts: [] },
+    };
+    const omitted: QualityRules = {
+      version: '1.0.0',
+      description: 'key absent',
+      rules: { floors: { 'coverage.unit.statements': 5 } },
+    };
+
+    const emptyMessage = coverageProvenanceUnevaluated(withEmpty, verdicts, false)[0].message;
+    expect(emptyMessage).toContain('`requiredScripts: []`');
+    expect(emptyMessage).toContain('ran no scripts at all');
+
+    const omittedMessage = coverageProvenanceUnevaluated(omitted, verdicts, false)[0].message;
+    expect(omittedMessage).toContain('omits `requiredScripts`');
+    expect(omittedMessage).toContain('default `quality` script');
+    // The false sentence, in either of its spellings.
+    expect(omittedMessage).not.toContain('never ran your coverage tool');
+    expect(omittedMessage).not.toContain('ran no scripts at all');
+  });
+
+  /**
+   * The default is read from config, and the ONLY spelling that turns it off is
+   * `optional`. A typo leaves enforcement on, which is the same asymmetry
+   * `QUALITY_COVERAGE_REQUIRED` uses and for the same reason: reading a typo as "off"
+   * silently restores the vacuous pass and gives the reader no sign of it.
+   */
+  it('requires provenance by default, and only the word `optional` disables it', () => {
+    makeProject({ ignoreCoverage: true, report: SUMMARY(80) });
+    expect(getConfig().coverage.provenanceRequired).toBe(true);
+
+    for (const spelling of ['optional', 'OPTIONAL', ' optional ']) {
+      process.env.QUALITY_COVERAGE_PROVENANCE = spelling;
+      resetConfig();
+      expect(getConfig().coverage.provenanceRequired).toBe(false);
+    }
+
+    for (const typo of ['false', '0', 'off', 'no', 'optionaI', '']) {
+      process.env.QUALITY_COVERAGE_PROVENANCE = typo;
+      resetConfig();
+      expect(getConfig().coverage.provenanceRequired).toBe(true);
+    }
   });
 
   /**
@@ -489,7 +706,15 @@ describe('a report whose provenance cannot be established', () => {
 
     const verdicts = verifyCoverageProvenance(['coverage.unit']);
     expect(verdicts[0]).toMatchObject({ kind: 'unverifiable', why: 'report-rewritten-since-stamp' });
-    expect(coverageProvenanceFailures(verdicts)).toEqual([]);
+
+    // UNVERIFIABLE, not stale, even though a doctored report is the likeliest way to
+    // reach it: the sidecar describes some other file, so what this one measures is
+    // unknown rather than known-wrong. Under the default policy that is still a
+    // failure -- it just says the honest thing about why.
+    expect(coverageProvenanceFailures(verdicts, [], false)).toEqual([]);
+    expect(coverageProvenanceFailures(verdicts, [], true)[0]).toMatchObject({
+      kind: 'provenance-unverified',
+    });
   });
 
   /** A shallow clone, or a commit that was rebased away. Never a stale claim. */
@@ -539,6 +764,49 @@ describe('a report whose provenance cannot be established', () => {
 
     expect(() => stampAllCoverageSummaries('stamp-coverage')).not.toThrow();
     expect(stampAllCoverageSummaries('stamp-coverage')[0].kind).toBe('cannot-stamp');
+  });
+
+  /**
+   * THE STRICT-MODE EXCEPTION, and it is not a softening of the policy. Provenance is
+   * built out of git, so where `resolveCodeIdentity` cannot answer -- no repository, a
+   * Docker build context that excluded `.git`, an unpacked tarball -- NOBODY can write
+   * a sidecar. Failing would print a red build naming two remedies (`requiredScripts`,
+   * `stamp-coverage`) that both cannot work, which is the false-fail that killed
+   * designs A and B, arriving through the guard meant to prevent the opposite error.
+   *
+   * Caught by verify-vacuous-pass.mjs and not by any unit test, because its subject is
+   * an ordinary temp directory with no `git init` -- which is exactly the shape this
+   * covers. The advisory MUST still fire, or refusing to false-fail becomes silence.
+   */
+  it('does not fail a project that cannot stamp at all, but still says the numbers are ungrounded', () => {
+    root = mkdtempSync(path.join(tmpdir(), 'qg-prov-nogit-'));
+    write('src/a.ts', 'export const a = 1;\n');
+    write('coverage/coverage-summary.json', SUMMARY(80));
+    process.env.QUALITY_PROJECT_ROOT = root;
+    process.env.QUALITY_COVERAGE_LAMBDA_DIR = 'coverage-lambda-absent';
+    resetConfig();
+
+    const verdicts = verifyCoverageProvenance(['coverage.unit']);
+    expect(verdicts[0].kind).toBe('unverifiable');
+
+    // Strict, and still no failure -- there is no action the adopter could take.
+    expect(coverageProvenanceFailures(verdicts, [], true)).toEqual([]);
+
+    const metrics: Metrics = {
+      scripts: {},
+      coverage: { unit: { statements: 80, branches: 80, functions: 80, lines: 80 } },
+    };
+    expect(evaluateRules(rulesWithFloor('coverage.unit.statements'), metrics).status).toBe('pass');
+
+    // But the advisory is the ONLY channel left, so it has to fire in strict mode here
+    // even though it is suppressed in strict mode everywhere else.
+    const unevaluated = coverageProvenanceUnevaluated(
+      rulesWithFloor('coverage.unit.statements'),
+      verdicts,
+      true
+    );
+    expect(unevaluated).toHaveLength(1);
+    expect(unevaluated[0].type).toBe('unverified-provenance');
   });
 
   /**

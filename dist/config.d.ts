@@ -29,6 +29,26 @@ export interface QualityGateConfig {
         /** False only for a project that deliberately has no coverage report at all. */
         required: boolean;
         /**
+         * Whether a coverage number must be traceable to the code being graded.
+         *
+         * ON by default, and that default is a BREAKING contract change made
+         * deliberately: before it, a report nobody could tie to this code was graded
+         * anyway, on the reasoning that "nobody stamped this" is not evidence the
+         * numbers are wrong. That reasoning holds right up until you notice the number
+         * being defended is the one deciding whether the build ships. A coverage report
+         * is a file on disk; the three states "your tests just ran", "your test command
+         * crashed and last week's report is still here", and "CI restored a cached
+         * coverage/ from another commit" are indistinguishable without a sidecar, and
+         * the last two are exactly the vacuous pass this tool exists to remove.
+         *
+         * `optional` restores the previous behaviour -- advisory, gate green, run still
+         * not cacheable as a verdict -- and exists so a project mid-migration can opt
+         * out rather than be stuck. It does NOT disable the STALE verdict, which is
+         * positive evidence that the report describes different code and fails in both
+         * modes.
+         */
+        provenanceRequired: boolean;
+        /**
          * Whether each directory above was named by the PROJECT rather than defaulted.
          *
          * Both are resolved with `||` against a hardcoded default, which loses exactly

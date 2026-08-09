@@ -247,9 +247,18 @@ export async function handleScore(args: ScoreArguments): Promise<{
 
     const response = {
       score: Math.round(score * 10) / 10,
-      // Reported alongside the score, not instead of it: the score is still the
-      // best available reading, but a caller cannot judge it without knowing
-      // which dimensions are missing from it.
+      // Reported alongside the score, not instead of it: the score is still the best
+      // available reading, but a caller cannot judge it without knowing what is wrong
+      // with the reading behind it.
+      //
+      // NOT only "which dimensions are missing from it", which is what this said and
+      // is now false for three of the kinds. `stale-report`,
+      // `provenance-unverified` and `code-changed-during-measurement` all arrive WITH
+      // a number, and `computeFitness` has already folded that number into the score
+      // above. `describeUnmeasured` marks those `numberReported: true` so a caller can
+      // tell "absent from this score" from "in this score, and unvouched for" --
+      // printing the first sentence over the second is the confidently-false claim
+      // this tool exists to remove.
       unmeasured: describeUnmeasured(metrics),
       breakdown: gradient.slice(0, 10).map(g => ({
         dimension: g.dimension,
@@ -289,6 +298,11 @@ export async function handleSuggest(args: SuggestArguments): Promise<{
     });
 
     const currentScore = computeFitness(metrics);
+    // Carried for the reason given in `handleScore`, and it matters more here: an agent
+    // drives its next edit off this ranking. A dimension whose number is real but
+    // unvouched-for is RANKED below, so `numberReported` is the only thing separating
+    // "not ranked, because it could not be measured" from "ranked, on a number nothing
+    // ties to your code".
     const unmeasured = describeUnmeasured(metrics);
 
     // Dimension-level suggestions (original behavior)

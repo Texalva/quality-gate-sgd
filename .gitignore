@@ -1,8 +1,17 @@
 # Dependencies
 node_modules/
 
-# Build output (committed for GitHub installs)
-# dist/
+# Build output. NOT committed: dist statically imports typescript, openai and the
+# MCP SDK, so a checkout without `node_modules` cannot run it no matter what is in
+# here -- `npm install` was never optional, and the `prepare` script builds during
+# it. That covers `npm i github:Texalva/quality-gate-sgd` too, since npm runs
+# `prepare` for git dependencies.
+#
+# Tracking it also made "the committed build matches the committed source" an
+# invariant with nothing enforcing it, which matters here more than in most repos:
+# tools/refactor-harness verifies through the shipped dist/cli.js, so a dist that
+# lags src grades one version while the test suite grades another.
+dist/
 
 # Cache files
 .quality-gate-cache.json

@@ -15,7 +15,7 @@
     "test:coverage": "vitest run --coverage",
     "lint": "eslint src/ tests/",
     "lint:fix": "eslint src/ tests/ --fix",
-    "prepublishOnly": "npm run build",
+    "prepare": "npm run build",
     "quality-gate": "tsx src/cli.ts",
     "list-issues": "tsx src/list-issues.ts"
   },

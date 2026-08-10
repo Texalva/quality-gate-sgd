@@ -196,16 +196,6 @@ export {
 } from './coverage-provenance.js';
 
 // =============================================================================
-// Severity Weights (SGD Gradient)
-// =============================================================================
-
-export {
-  DEFAULT_SEVERITY_WEIGHTS,
-  getSeverityWeight,
-  sumSeverityWeights,
-} from './severity.js';
-
-// =============================================================================
 // Dependency Graph Analysis
 // =============================================================================
 
@@ -222,19 +212,6 @@ export {
   // Coverage integration
   attachCoverageData,
 } from './dependency-graph.js';
-
-// =============================================================================
-// Optimizer (Priority Computation)
-// =============================================================================
-
-export {
-  // Priority computation
-  computePriority,
-  prioritizeFiles,
-
-  // Default weights
-  DEFAULT_PRIORITY_WEIGHTS,
-} from './optimizer.js';
 
 // =============================================================================
 // Issue Listing

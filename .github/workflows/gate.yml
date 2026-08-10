@@ -1,0 +1,117 @@
+# Gates pull requests. Every step here was run against a fresh `git clone` before
+# being written down, because a workflow that has never been executed is a claim,
+# not a check.
+#
+# Node is pinned to 22 while local development runs 26, deliberately: the version
+# skew is in the direction a consumer would hit, and `engines` claims ">=18".
+name: gate
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# A superseded run's verdict is noise, and the harness job takes minutes.
+concurrency:
+  group: gate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: types, lint, tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history on purpose. Parts of the suite read real git state --
+          # cache keys are anchored to a commit, and baseline resolution walks
+          # for one -- so a depth-1 checkout tests a different program.
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # `dist/` is not committed; the `prepare` script builds it during install.
+      - run: npm ci
+
+      # If that build silently produced nothing, everything downstream would
+      # measure an absent tool and could still report success -- which is the
+      # exact failure mode this repo exists to prevent. So check it directly
+      # rather than inferring it from a later step passing.
+      - name: the build actually produced something
+        run: test -f dist/cli.js && test -f dist/index.js
+
+      - run: npx tsc --noEmit
+
+      # `lint:ci` is `eslint src/ tests/ --max-warnings 78`, which is exactly
+      # today's count: 0 errors, 78 warnings. A new warning is a red build.
+      # Verified capable of rejecting -- at 77 it exits 1.
+      #
+      # The number is a floor to lower, not a budget to spend. 45 of the 78 are
+      # in src/experiments and tests/experiments, so pruning those (Texalva#3)
+      # should drop it to 33 in the same commit.
+      - run: npm run lint:ci
+
+      - run: npm test
+
+  harness:
+    name: verification harness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # The synthetic subject carries a bun.lock, so the gate's runner detects
+      # bun for it. Without bun on PATH the subject's scripts cannot run at all.
+      - uses: oven-sh/setup-bun@v2
+
+      - run: npm ci
+
+      # The subject's own devDependencies. Since #47 the gate refuses a binary
+      # the project does not itself provide, so `node_modules/.bin` here is a
+      # hard requirement rather than a convenience.
+      - name: install the synthetic subject's dependencies
+        working-directory: tools/refactor-harness/synthetic-subject
+        run: bun install --frozen-lockfile
+
+      # verify-ground-truth reads the subject's coverage report and refuses
+      # (exit 2, VACUOUS) when it is absent -- `coverage/` is gitignored, so a
+      # fresh checkout never has one. This step is what makes the coverage third
+      # of that check mean anything; locally it was being satisfied by a
+      # leftover report from an earlier session.
+      - name: produce the subject's coverage report
+        working-directory: tools/refactor-harness/synthetic-subject
+        run: bun run test:coverage
+
+      - name: not run here, and why
+        run: |
+          echo "verify-fixture.mjs is NOT part of this gate: it checks the"
+          echo "apollo-client golden subject, which is 793 MB with node_modules,"
+          echo "needs three local patches to be measurable, and is not vendored."
+          echo "Nor is accept-refactor.mjs against golden-A.json, for the same"
+          echo "reason. Both stay manual. Treat a green run here as covering the"
+          echo "four checks below and not the golden comparison."
+
+      # Can the acceptance gate still reject? Pure JSON mutation of golden-A in
+      # a tmpdir, so it needs no subject.
+      - run: node tools/refactor-harness/verify-gate.mjs
+
+      # Are the numbers correct, against hand-derived expectations?
+      - run: node tools/refactor-harness/verify-ground-truth.mjs
+
+      # Does baseline resolution survive a real shallow clone? Builds its own
+      # repositories, sets its own git identity, skips the signed-commit case
+      # explicitly if gpg is missing.
+      - run: node tools/refactor-harness/verify-baseline-resolution.mjs
+
+      # When a measurement genuinely breaks, does the gate say so? Slowest of
+      # the four at roughly a minute.
+      - run: node tools/refactor-harness/verify-vacuous-pass.mjs

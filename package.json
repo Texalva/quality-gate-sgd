@@ -14,8 +14,10 @@
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
     "lint": "eslint src/ tests/",
+    "lint:ci": "eslint src/ tests/ --max-warnings 78",
+    "typecheck:all": "tsc -p tsconfig.check.json",
     "lint:fix": "eslint src/ tests/ --fix",
-    "prepublishOnly": "npm run build",
+    "prepare": "npm run build",
     "quality-gate": "tsx src/cli.ts",
     "list-issues": "tsx src/list-issues.ts"
   },
@@ -36,11 +38,11 @@
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/andrew-templeton/quality-gate-sgd.git"
+    "url": "https://github.com/Texalva/quality-gate-sgd.git"
   },
-  "homepage": "https://github.com/andrew-templeton/quality-gate-sgd#readme",
+  "homepage": "https://github.com/Texalva/quality-gate-sgd#readme",
   "bugs": {
-    "url": "https://github.com/andrew-templeton/quality-gate-sgd/issues"
+    "url": "https://github.com/Texalva/quality-gate-sgd/issues"
   },
   "engines": {
     "node": ">=18.0.0"
@@ -54,11 +56,19 @@
   ],
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.25.2",
-    "openai": "^6.16.0",
     "typescript": "^5.0.0"
+  },
+  "peerDependencies": {
+    "openai": "^6.16.0"
+  },
+  "peerDependenciesMeta": {
+    "openai": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
+    "openai": "^6.16.0",
     "@typescript-eslint/eslint-plugin": "^8.53.0",
     "@typescript-eslint/parser": "^8.53.0",
     "@vitest/coverage-v8": "^4.0.17",

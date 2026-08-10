@@ -11,9 +11,9 @@
  */
 
 import type { LLMExecutor, FixContext, FixAttemptResult, FileChange } from './harness.js';
-import type { ExperimentTask, IterationEvaluationResult } from './runner.js';
+import type { ExperimentTask } from './runner.js';
 import type { TargetSuggestion } from './types.js';
-import type { PatchProposalReasoning, PatchQualityMetrics } from './swebench/quality-gate.js';
+import type { PatchProposalReasoning } from './swebench/quality-gate.js';
 import type { SWEBenchTask } from './swebench/types.js';
 import { retrieveCodeContext, formatCodeContext, type CodeRetrievalConfig } from './swebench/code-retrieval.js';
 import * as fs from 'fs';
@@ -697,7 +697,7 @@ export async function extractReasoning(
     }
 
     return { reasoning };
-  } catch (parseError) {
+  } catch {
     return {
       reasoning: null,
       error: `Failed to parse reasoning: ${responseText.slice(0, 200)}`,
@@ -789,7 +789,7 @@ export async function reasoningToPatch(
     const patch = convertToUnifiedDiff(changes, config.projectRoot);
 
     return { patch, changes };
-  } catch (parseError) {
+  } catch {
     return {
       patch: null,
       changes: null,

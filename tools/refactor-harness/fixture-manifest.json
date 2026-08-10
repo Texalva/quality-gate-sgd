@@ -1,0 +1,16 @@
+{
+  "what": "Frozen state of the Apollo Client fixture the golden baseline was captured against.",
+  "fixture": "/home/rai/scratch/qg-fixtures/apollo-client",
+  "head": "359f3e6357534d7933906d3c4bcb2a3bf5735b4f",
+  "trackedDiffSha": "8ee552bc1ab8625276d83702bf66aee897597171ab01019551afcadf0a454cdd",
+  "trackedDiffBytes": 18421,
+  "modifiedPaths": [
+    "eslint.config.mjs",
+    "package-lock.json",
+    "package.json"
+  ],
+  "ignoredFiles": {
+    "docs/public/canonical-references.json": "37517e5f3dc66819f61f5a7bb8ace1921282415f10551d2defa5c3eb0985b570"
+  },
+  "packageLockSha": "e854f416f67d706b18efcfa87bcf0bf2ca52572083bcf010563bc2dc6c0957d2"
+}

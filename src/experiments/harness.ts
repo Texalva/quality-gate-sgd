@@ -23,7 +23,6 @@ import { computeFitness, computeGradient } from '../fitness.js';
 import { extractLocatedIssues } from '../targets/extract.js';
 import { aggregateToSymbolsWithOptions } from '../targets/aggregate.js';
 import { extractSymbols } from '../symbols/extractor.js';
-import type { ExtractedIssues } from '../targets/types.js';
 
 // =============================================================================
 // Types
@@ -149,7 +148,6 @@ export function createAgentHarness(options: HarnessOptions): ExperimentAgent {
 
   // State
   let currentTask: ExperimentTask | null = null;
-  let currentConfig: ExperimentConfig | null = null;
   let currentMetrics: Metrics | null = null;
   let currentScore = 0;
   let previousScore = 0;
@@ -185,7 +183,7 @@ export function createAgentHarness(options: HarnessOptions): ExperimentAgent {
     // Dimension-level suggestions (fastest)
     if (config.granularity === 'dimension') {
       const gradient = computeGradient(currentMetrics);
-      return gradient.slice(0, topTargets).map((g, i) => ({
+      return gradient.slice(0, topTargets).map((g, _i) => ({
         type: 'dimension' as const,
         id: g.dimension,
         expectedDeltaQ: g.estimatedImprovement,
@@ -197,6 +195,22 @@ export function createAgentHarness(options: HarnessOptions): ExperimentAgent {
       const extracted = await extractLocatedIssues({
         coverageDir: metricsProvider.getProjectRoot(),
       });
+
+      // An experiment that ranked no targets because nothing could be READ is not the
+      // same result as one that ranked none because the code is clean, and downstream
+      // both become `getSuggestion() -> null`. Said out loud rather than gated on,
+      // because an experiment run is a measurement of the EXPERIMENT and refusing to
+      // proceed would discard the run; what it must not do is record the null as a
+      // clean sweep.
+      if (extracted.measurementFailures.length > 0) {
+        console.error(
+          `[harness] ${extracted.measurementFailures.length} issue source(s) could not ` +
+            'be read, so the target list below is incomplete: ' +
+            extracted.measurementFailures
+              .map((f) => `${f.dimension} (${f.kind})`)
+              .join(', ')
+        );
+      }
 
       // Combine all issues into a single array
       const allIssues = [
@@ -282,7 +296,6 @@ export function createAgentHarness(options: HarnessOptions): ExperimentAgent {
   return {
     async initialize(task: ExperimentTask, config: ExperimentConfig): Promise<void> {
       currentTask = task;
-      currentConfig = config;
       currentMetrics = await metricsProvider.extractMetrics();
       currentScore = computeFitness(currentMetrics);
       previousScore = currentScore;
@@ -372,7 +385,7 @@ export function createAgentHarness(options: HarnessOptions): ExperimentAgent {
       };
     },
 
-    async evaluate(config: ExperimentConfig): Promise<IterationEvaluationResult> {
+    async evaluate(_config: ExperimentConfig): Promise<IterationEvaluationResult> {
       if (!currentMetrics) {
         return {
           metrics: {},
@@ -393,7 +406,6 @@ export function createAgentHarness(options: HarnessOptions): ExperimentAgent {
 
     async cleanup(): Promise<void> {
       currentTask = null;
-      currentConfig = null;
       currentMetrics = null;
       currentScore = 0;
       previousScore = 0;
@@ -479,9 +491,9 @@ export function createMockExecutor(options: {
 
   return {
     async attemptFix(
-      task: ExperimentTask,
-      suggestion: TargetSuggestion | null,
-      context: FixContext
+      _task: ExperimentTask,
+      _suggestion: TargetSuggestion | null,
+      _context: FixContext
     ): Promise<FixAttemptResult> {
       // Simulate fix attempt
       const succeeded = rng() < improvementProbability;

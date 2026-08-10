@@ -1,0 +1,26 @@
+{
+  // Typecheck-only config that covers the tests as well as src.
+  //
+  // tsconfig.json cannot do this: it drives the build, so it is pinned to
+  // `rootDir: ./src` and `include: src/**/*`, which means `tsc --noEmit` against
+  // it silently skips every test file. A suite that is never typechecked can
+  // assert against a shape the source no longer has and still compile, because
+  // vitest transpiles per-file without checking types.
+  //
+  // NOT WIRED INTO CI, deliberately, and this is the only place that says so:
+  // `npm run typecheck:all` reports 303 errors as of this commit -- mostly test
+  // fixtures built as partial objects (66 missing `description`, 30 missing
+  // `impact`, 21 missing `preconnect`) plus unguarded array indexing. Gating on
+  // that today would be a red build on every pull request for debt none of them
+  // introduced. The number is the point: it is measurable in one command, and it
+  // is a floor to drive down rather than a fact to live with.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": ".",
+    "declaration": false,
+    "declarationMap": false,
+    "sourceMap": false
+  },
+  "include": ["src/**/*", "tests/**/*"]
+}

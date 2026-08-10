@@ -25,9 +25,11 @@ export type {
   Metrics,
   AllCoverageMetrics,
   CoverageMetrics,
+  TotalCoverageMetrics,
   TypescriptMetrics,
   EslintMetrics,
   SonarqubeMetrics,
+  SonarqubeAnalysisProvenance,
   BundleMetrics,
 
   // Root-cause analysis types
@@ -90,13 +92,27 @@ export {
 
 export {
   // Coverage
+  measureCoverage,
   extractAllCoverageMetrics,
   extractCoverageMetrics,
 
   // SonarQube
   extractSonarqubeMetrics,
+  // The failure-carrying variant, exported alongside the lossy one. Publishing only
+  // `extractSonarqubeMetrics` left every external caller with the defect this
+  // package exists to catch: `undefined` from a refused token and `undefined` from
+  // a project with no issues are the same value.
+  readSonarqubeMetrics,
+  type SonarqubeReading,
   isSonarqubeAvailable,
   runSonarqubeScan,
+  // Not tidiness: `declaration: true` means tsc has to be able to NAME
+  // `runSonarqubeScan`'s return type and `readSonarqubeMetrics`'s parameter in the
+  // emitted .d.ts, and an external caller threading a scan into an extraction needs
+  // both.
+  type SonarqubeScanOutcome,
+  type SubmittedAnalysis,
+  type SubmittedAnalysisFromScan,
   getTopSonarIssues,
   type SonarIssue,
 
@@ -114,6 +130,13 @@ export {
   // Full extraction
   extractAllMetrics,
   extractAllMetricsAsync,
+  // The variants that keep the coverage provenance verdicts. Published alongside the
+  // lossy ones for the same reason `readSonarqubeMetrics` is: a consumer producing a
+  // VERDICT needs to know which reports it can stand behind, and the Metrics-only
+  // signatures cannot say.
+  extractAllMetricsAndCoverageProvenance,
+  extractAllMetricsAsyncAndCoverageProvenance,
+  type MetricsWithCoverageProvenance,
 } from './metrics.js';
 
 // =============================================================================
@@ -123,7 +146,7 @@ export {
 export {
   // Git utilities
   getCurrentCommitHash,
-  getBaselineCommitHash,
+  resolveBaselineCommit,
   getCacheKey,
   isWIPKey,
 
@@ -137,17 +160,40 @@ export {
   createCacheEntry,
   findBaselineEntry,
   pruneOldEntries,
+
+  // The code-state question the provenance sidecar asks, published because a consumer
+  // that wants to stamp a report from its own pipeline needs the same answer the gate
+  // uses rather than a second one.
+  codeStateDigest,
+  type CodeStateDigest,
+  listUntrackedCodeFiles,
 } from './cache.js';
 
 // =============================================================================
-// Severity Weights (SGD Gradient)
+// Coverage Report Provenance
 // =============================================================================
+//
+// Published because the verdict is a FACT ABOUT THE READING, not an internal detail of
+// the CLI. A consumer that reads `metrics.coverage` without being able to ask which
+// state of the code produced it is back where this module started: grading a report
+// nothing ties to the code.
 
 export {
-  DEFAULT_SEVERITY_WEIGHTS,
-  getSeverityWeight,
-  sumSeverityWeights,
-} from './severity.js';
+  verifyCoverageProvenance,
+  snapshotCoverageStateBeforeScripts,
+  stampCoverageSummariesRewrittenDuringRun,
+  stampAllCoverageSummaries,
+  coverageProvenanceFailures,
+  coverageProvenanceUnevaluated,
+  suitesWithNumbers,
+  describeCodeCommit,
+  PROVENANCE_SIDECAR_FILE,
+  type CoverageProvenanceSidecar,
+  type CoverageProvenanceSnapshot,
+  type ProvenanceUnverifiableReason,
+  type StampOutcome,
+  type SuiteProvenance,
+} from './coverage-provenance.js';
 
 // =============================================================================
 // Dependency Graph Analysis
@@ -166,19 +212,6 @@ export {
   // Coverage integration
   attachCoverageData,
 } from './dependency-graph.js';
-
-// =============================================================================
-// Optimizer (Priority Computation)
-// =============================================================================
-
-export {
-  // Priority computation
-  computePriority,
-  prioritizeFiles,
-
-  // Default weights
-  DEFAULT_PRIORITY_WEIGHTS,
-} from './optimizer.js';
 
 // =============================================================================
 // Issue Listing

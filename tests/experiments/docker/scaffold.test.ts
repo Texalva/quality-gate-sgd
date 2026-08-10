@@ -18,7 +18,13 @@ import {
 import type { ExperimentDirectoryStructure } from '../../../src/experiments/docker/types.js';
 
 describe('docker experiment scaffolding', () => {
-  const testBaseDir = path.join(process.cwd(), '.test-experiments');
+  // Per-file, not the shared '.test-experiments' both this suite and
+  // tests/experiments/logger.test.ts used to claim. vitest runs files in
+  // parallel, so each one's recursive cleanup deleted the other's directory
+  // mid-test -- ENOTEMPTY here, missing experiments there, and only sometimes.
+  // A flaky suite in a repo about not trusting green results is worse than most
+  // places: it teaches you to re-run until it passes.
+  const testBaseDir = path.join(process.cwd(), '.test-experiments-scaffold');
 
   beforeEach(() => {
     // Clean up test directory

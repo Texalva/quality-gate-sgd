@@ -1,0 +1,59 @@
+{
+  "what": "quality-gate-sgd OWN eslint state, pre-refactor. Not the Apollo fixture capture.",
+  "command": "npx eslint src/ tests/ --format json",
+  "totals": {
+    "errors": 60,
+    "warnings": 75
+  },
+  "byRule": {
+    "@typescript-eslint/no-unused-vars": {
+      "errors": 57,
+      "warnings": 0
+    },
+    "@typescript-eslint/no-require-imports": {
+      "errors": 3,
+      "warnings": 0
+    },
+    "@typescript-eslint/no-non-null-assertion": {
+      "errors": 0,
+      "warnings": 75
+    }
+  },
+  "errorsByFile": {
+    "src/cli.ts": 5,
+    "src/experiments/analyzer.ts": 2,
+    "src/experiments/docker/code-extractor.ts": 3,
+    "src/experiments/docker/evaluator.ts": 1,
+    "src/experiments/docker/quality-gated-agent.ts": 4,
+    "src/experiments/docker/real-agent.ts": 4,
+    "src/experiments/docker/runner.ts": 3,
+    "src/experiments/docker/scaffold.ts": 2,
+    "src/experiments/docker/types.ts": 1,
+    "src/experiments/harness.ts": 7,
+    "src/experiments/llm-executor.ts": 4,
+    "src/experiments/logger.ts": 2,
+    "src/experiments/mini-swe/quality-gated-mini-agent.ts": 6,
+    "src/experiments/runner.ts": 4,
+    "src/experiments/swebench/evaluator.ts": 1,
+    "src/experiments/swebench/loader.ts": 1,
+    "src/experiments/swebench/quality-gate.ts": 2,
+    "tests/config.test.ts": 1,
+    "tests/experiments/docker/trajectory.test.ts": 1,
+    "tests/experiments/harness.test.ts": 3,
+    "tests/experiments/runner.test.ts": 2,
+    "tests/experiments/swebench/evaluator.test.ts": 1
+  },
+  "refactorSurfaceIsClean": [
+    "src/metrics.ts",
+    "src/targets/",
+    "src/rules.ts"
+  ],
+  "capturedAtCommit": "95b3a41bce6bfbfdea93cec1f28ac5ea0f8330e6",
+  "note": "src/targets/aggregate.ts carries 3 no-non-null-assertion WARNINGS (0 errors); refactor surface has 0 errors.",
+  "status": "HISTORICAL SNAPSHOT, not an active check. Nothing reads this file. It records the state the refactor started from so the end state can be compared to it by hand.",
+  "endState": {
+    "atCommit": "the tip of the refactor branch",
+    "totals": { "errors": 0, "warnings": 78 },
+    "whatMoved": "All 60 errors cleared (see the first refactor commit). Warnings went 75 -> 78; 45 of the 78 are in src/experiments and tests/experiments, which is research scaffolding rather than gate surface. The refactor surface listed above is still at 0 errors."
+  }
+}

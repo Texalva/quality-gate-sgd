@@ -4,7 +4,15 @@
  * Implements the tool handlers for the MCP server.
  */
 
-import { extractAllMetrics } from '../metrics.js';
+// Not `extractAllMetrics`: it cannot load custom dimensions, so every handler
+// that used it reported a verdict or a score over a smaller quality space than
+// the project configured.
+import {
+  extractAllMetricsAsync,
+  extractAllMetricsAsyncAndCoverageProvenance,
+  describeUnmeasured,
+} from '../metrics.js';
+import { coverageProvenanceUnevaluated } from '../coverage-provenance.js';
 import { loadRules, evaluateRules } from '../rules.js';
 import {
   loadCache,
@@ -135,25 +143,78 @@ export async function handleRun(args: RunArguments): Promise<{
     const rules = loadRules({ coverageOnly: skipSonarQube });
     const requiredScripts = rules.rules.requiredScripts || ['quality'];
 
-    const metrics = extractAllMetrics({
-      scriptsToRun: requiredScripts,
-      skipSonarQube,
-    });
+    // Async variant: it is the only one that loads custom dimensions, and this
+    // handler produces a gate verdict. See extractAllMetricsAsync.
+    //
+    // `not-scanned`, and that is a pre-existing hole this change makes VISIBLE rather
+    // than closes: this handler produces a verdict without ever calling
+    // `runSonarqubeScan`, so its sonarqube numbers are whatever the server currently
+    // holds -- an analysis of unknown vintage, possibly of a different commit -- and the
+    // response now carries an `unbound-provenance` entry in `unevaluatedRules` saying so
+    // whenever a rule grades sonarqube. Making MCP scan is a separate decision; what
+    // changes here is that the response stops looking complete.
+    const { metrics, coverageProvenance, stampOutcomes } =
+      await extractAllMetricsAsyncAndCoverageProvenance({
+        scriptsToRun: requiredScripts,
+        skipSonarQube,
+        submittedAnalysis: { kind: 'not-scanned' },
+      });
 
     const cache = loadCache();
     const { isWIP } = getCacheKey();
     const baselineEntry = findBaselineEntry(cache, rules, isWIP);
-    const result = evaluateRules(rules, metrics, baselineEntry);
+    const evaluation = evaluateRules(rules, metrics, baselineEntry);
     const fitness = computeFitness(metrics);
+
+    // The coverage-provenance advisory, appended here for the same reason cli.ts
+    // appends it: the verdict cannot travel inside `Metrics` (the refactor harness
+    // byte-compares it) and `evaluateRules` takes nothing else.
+    //
+    // handleRun and not handleScore/handleSuggest, because this is the verdict surface
+    // an agent acts on -- it already carries `unmeasured` and `unevaluatedRules` for
+    // exactly this reason. The MCP server writes no cache entry, so the caching half of
+    // the policy has no analogue here and the advisory is the whole of it.
+    const result = {
+      ...evaluation,
+      unevaluated: [
+        ...evaluation.unevaluated,
+        // `stampOutcomes` threaded for the reason cli.ts threads it: it decides whether
+        // a suite's finding already travelled as a failure, and the failure channel and
+        // this one have to be exact complements.
+        ...coverageProvenanceUnevaluated(rules, coverageProvenance, undefined, stampOutcomes),
+      ],
+    };
 
     const response = {
       status: result.status,
       fitnessScore: Math.round(fitness * 10) / 10,
       metrics: formatMetricsSummary(metrics),
+      // Alongside the verdict, because a measurement failure only becomes a
+      // failed RULE when some rule grades that dimension (see
+      // evaluateMeasurements). Without this key, an ungated failure would be
+      // invisible to an MCP client -- reported nowhere, on a response that looks
+      // complete.
+      //
+      // Each entry carries `numberReported`, because the key name is not true of one
+      // of them: a `stale-report` dimension DOES have a number in `metrics` above, and
+      // an agent that reads this list as "these are absent" would draw the wrong
+      // conclusion about a percentage it can see in the same response.
+      unmeasured: describeUnmeasured(metrics),
       failedRules: result.failedRules.map(f => ({
         type: f.type,
         rule: f.rule,
         message: f.message,
+      })),
+      // Same reasoning as `unmeasured` above, one step further along: a rule that
+      // did not RUN is not in `failedRules` either, and an agent reading
+      // `status: "pass"` with an empty `failedRules` would conclude the ratchet held.
+      // It did not run. Omitting this key is how an agent gets talked into believing
+      // a narrower reading than it actually got.
+      unevaluatedRules: result.unevaluated.map(u => ({
+        type: u.type,
+        rule: u.rule,
+        reason: u.reason,
+        message: u.message,
       })),
     };
 
@@ -176,9 +237,13 @@ export async function handleScore(args: ScoreArguments): Promise<{
     const rules = loadRules({ coverageOnly: skipSonarQube });
     const requiredScripts = rules.rules.requiredScripts || ['quality'];
 
-    const metrics = extractAllMetrics({
+    // Async: it is the only path that loads custom dimensions, and a score
+    // computed over fewer dimensions than the project configured is a confident
+    // number about a smaller quality space. See extractAllMetricsAsync.
+    const metrics = await extractAllMetricsAsync({
       scriptsToRun: requiredScripts,
       skipSonarQube,
+      submittedAnalysis: { kind: 'not-scanned' },
     });
 
     const score = computeFitness(metrics);
@@ -186,6 +251,19 @@ export async function handleScore(args: ScoreArguments): Promise<{
 
     const response = {
       score: Math.round(score * 10) / 10,
+      // Reported alongside the score, not instead of it: the score is still the best
+      // available reading, but a caller cannot judge it without knowing what is wrong
+      // with the reading behind it.
+      //
+      // NOT only "which dimensions are missing from it", which is what this said and
+      // is now false for three of the kinds. `stale-report`,
+      // `provenance-unverified` and `code-changed-during-measurement` all arrive WITH
+      // a number, and `computeFitness` has already folded that number into the score
+      // above. `describeUnmeasured` marks those `numberReported: true` so a caller can
+      // tell "absent from this score" from "in this score, and unvouched for" --
+      // printing the first sentence over the second is the confidently-false claim
+      // this tool exists to remove.
+      unmeasured: describeUnmeasured(metrics),
       breakdown: gradient.slice(0, 10).map(g => ({
         dimension: g.dimension,
         displayName: g.displayName,
@@ -216,12 +294,20 @@ export async function handleSuggest(args: SuggestArguments): Promise<{
     const rules = loadRules({ coverageOnly: skipSonarQube });
     const requiredScripts = rules.rules.requiredScripts || ['quality'];
 
-    const metrics = extractAllMetrics({
+    // Async, for the reason given in handleScore.
+    const metrics = await extractAllMetricsAsync({
       scriptsToRun: requiredScripts,
       skipSonarQube,
+      submittedAnalysis: { kind: 'not-scanned' },
     });
 
     const currentScore = computeFitness(metrics);
+    // Carried for the reason given in `handleScore`, and it matters more here: an agent
+    // drives its next edit off this ranking. A dimension whose number is real but
+    // unvouched-for is RANKED below, so `numberReported` is the only thing separating
+    // "not ranked, because it could not be measured" from "ranked, on a number nothing
+    // ties to your code".
+    const unmeasured = describeUnmeasured(metrics);
 
     // Dimension-level suggestions (original behavior)
     if (granularity === 'dimension') {
@@ -230,6 +316,7 @@ export async function handleSuggest(args: SuggestArguments): Promise<{
       const response = {
         mode: 'dimension',
         currentScore: Math.round(currentScore * 10) / 10,
+        unmeasured,
         suggestions: suggestions.map(s => ({
           dimension: s.dimension,
           displayName: s.displayName,
@@ -261,6 +348,7 @@ export async function handleSuggest(args: SuggestArguments): Promise<{
     const response = {
       mode: granularity,
       currentScore: Math.round(currentScore * 10) / 10,
+      unmeasured,
       issuesSummary: {
         total: extractedIssues.totalCount,
         coverage: extractedIssues.summary.coverage,
@@ -268,6 +356,14 @@ export async function handleSuggest(args: SuggestArguments): Promise<{
         eslint: extractedIssues.summary.eslint,
         sonarqube: extractedIssues.summary.sonarqube,
       },
+      // The counts above cannot say "0 because there are none" apart from "0 because
+      // the source would not read". An agent handed the first reading of the second
+      // marks a dimension done and moves on.
+      unreadableSources: extractedIssues.measurementFailures.map(f => ({
+        dimension: f.dimension,
+        kind: f.kind,
+        message: f.message,
+      })),
       ...formatTargetsForJson(targets),
     };
 
@@ -385,10 +481,20 @@ The trajectory command shows detailed convergence analysis.`,
 function formatMetricsSummary(metrics: Metrics): Record<string, unknown> {
   const summary: Record<string, unknown> = {};
 
-  if (metrics.coverage?.unit) {
+  const unitCoverage = metrics.coverage?.unit;
+  if (unitCoverage) {
+    // Per dimension, because a dimension can still be absent -- not from a fresh
+    // reading, which reports a zero denominator as 100 (see
+    // TotalCoverageMetrics), but from a cache entry an older version wrote.
+    // Leaving the key out is the honest rendering: an MCP client should see the
+    // dimension missing, not a fabricated number it will go on to reason about.
     summary.coverage = {
-      branches: Math.round(metrics.coverage.unit.branches * 10) / 10,
-      statements: Math.round(metrics.coverage.unit.statements * 10) / 10,
+      ...(unitCoverage.branches === undefined
+        ? {}
+        : { branches: Math.round(unitCoverage.branches * 10) / 10 }),
+      ...(unitCoverage.statements === undefined
+        ? {}
+        : { statements: Math.round(unitCoverage.statements * 10) / 10 }),
     };
   }
 

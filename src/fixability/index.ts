@@ -9,9 +9,38 @@
  * - Whether fixes are straightforward vs. require architectural changes
  */
 
-import OpenAI from 'openai';
 import { readFileSync, existsSync } from 'fs';
 import type { SymbolIssues } from '../symbols/types.js';
+
+// Type-level only, so no runtime import of `openai` survives compilation. The
+// package is an OPTIONAL PEER dependency: this estimator is the only thing in the
+// tool that needs it, and 13 MB of LLM SDK is a strange hard requirement for a
+// gate whose entire premise is deterministic measurement. Optional peers are the
+// encoding that actually skips the download -- `optionalDependencies` are
+// installed by default, so they would not have.
+type OpenAIConstructor = (typeof import('openai'))['default'];
+type OpenAIClient = InstanceType<OpenAIConstructor>;
+
+const OPENAI_ABSENT =
+  'Fixability estimation needs the optional `openai` package, which is not installed. ' +
+  'Run `npm install openai` (or `bun add openai`) to enable it. ' +
+  'Nothing else is affected: every measured dimension is unchanged, and suggestions ' +
+  'are still ranked, just without a fixability adjustment.';
+
+/**
+ * Resolve the OpenAI constructor, or null when the package is not installed.
+ *
+ * Distinguishing "not installed" from "installed but broken" is not worth a
+ * branch here: either way this estimator cannot run, the remedy is the same
+ * install command, and no measurement depends on the outcome.
+ */
+async function loadOpenAI(): Promise<OpenAIConstructor | null> {
+  try {
+    return (await import('openai')).default;
+  } catch {
+    return null;
+  }
+}
 
 // GPT-5 models - use nano for cost efficiency on simple classification
 const GPT5_MODELS = {
@@ -140,7 +169,7 @@ function isValidResponse(parsed: unknown): parsed is { score: number; effort: st
  * Includes retry logic for empty/invalid responses.
  */
 async function estimateOne(
-  client: OpenAI,
+  client: OpenAIClient,
   symbol: SymbolIssues,
   model: string,
   maxRetries: number = 2
@@ -245,7 +274,15 @@ export async function estimateFixability(
     return [];
   }
 
-  const client = new OpenAI({ apiKey: key });
+  // After the key check, so a project that has the package but no key still gets
+  // the message about the key rather than one about an install it already did.
+  const OpenAIClass = await loadOpenAI();
+  if (!OpenAIClass) {
+    console.error(OPENAI_ABSENT);
+    return [];
+  }
+
+  const client = new OpenAIClass({ apiKey: key });
   const estimates: FixabilityEstimate[] = [];
   const estimatedIds = new Set<string>();
 

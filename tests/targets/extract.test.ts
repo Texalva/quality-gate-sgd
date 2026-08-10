@@ -7,6 +7,7 @@ import {
   extractSonarqubeIssues,
   extractLocatedIssues,
 } from '../../src/targets/extract.js'
+import type { RunnerSelection } from '../../src/runner.js'
 import type { SymbolTable, CodeSymbol } from '../../src/symbols/types.js'
 
 // Mock fs
@@ -25,10 +26,44 @@ vi.mock('child_process', () => ({
   execSync: vi.fn(),
 }))
 
+/**
+ * `binaryInvocation` is stubbed for the same reason `fs` is mocked at all: the runner
+ * settles whether `node_modules/.bin/eslint` exists through the same `existsSync` these
+ * tests aim at coverage reports, and most of them set it to `false` wholesale -- so
+ * eslint would read as absent and every lint measurement here would refuse with
+ * `tool-missing` before spawning.
+ *
+ * Stubbed to "the shim is there", which is the premise of these tests. The COMMAND still
+ * comes from the real builder, so the `--no-install` flag is not mocked away, and the
+ * real resolution is covered against real files in tests/runner.test.ts and
+ * tests/providers/eslint.test.ts.
+ *
+ * Stubbing `resolveProjectBinary` instead would NOT work: `binaryInvocation` calls it
+ * through a module-internal reference, which a partial ESM mock of the module's exports
+ * does not intercept.
+ */
+vi.mock('../../src/runner.js', async () => {
+  const actual = await vi.importActual<typeof import('../../src/runner.js')>('../../src/runner.js')
+  return {
+    ...actual,
+    binaryInvocation: vi.fn(
+      (binary: string, args: readonly string[], selection: RunnerSelection) => ({
+        kind: 'runnable' as const,
+        command: actual.binaryCommand(binary, args, selection),
+        shimPath: `/test/project/node_modules/.bin/${binary}`,
+      })
+    ),
+  }
+})
+
 // Mock config
 vi.mock('../../src/config.js', () => ({
   getConfig: vi.fn(() => ({
     projectRoot: '/test/project',
+    // Every spawn-based measurement reads this; a mock without it makes the
+    // providers throw rather than measure.
+    packageManager: { manager: 'npm', reason: 'test fixture' },
+    typecheckScript: { script: 'type-check', reason: 'test fixture', definedInManifest: true },
     coverage: {
       unitDir: 'coverage',
       lambdaDir: 'coverage-lambda',
@@ -40,6 +75,7 @@ vi.mock('../../src/config.js', () => ({
     },
   })),
   getSonarAuthToken: vi.fn(() => 'test-token'),
+  redactUrlCredentials: vi.fn((url: string) => url),
 }))
 
 // Mock symbols/mapper
@@ -812,6 +848,76 @@ describe('extractLocatedIssues', () => {
     expect(result).toHaveProperty('eslint')
     expect(result).toHaveProperty('sonarqube')
     expect(result).toHaveProperty('totalCount')
+  })
+
+  // #25. A dead type-checker and a clean project are the same `typescript: []` here,
+  // and every consumer -- `suggest`, the target ranking, the MCP fix-advice tool --
+  // reported the second when it had the first. Not a vacuous gate PASS (the verdict
+  // reads Metrics, and extractAllMetrics carries the same failure to evaluateRules),
+  // but vacuous ADVICE: "nothing to fix" for a dimension nobody could look at.
+  //
+  // The pair matters. Asserting only the failure is satisfiable by reporting one
+  // always, which would make every clean run look broken and train adopters to ignore
+  // the channel -- the exact cost that kept measurement failures rule-scoped.
+  it('reports a source it could not read, and stays quiet when it could', async () => {
+    const { spawnSync } = await import('child_process')
+
+    vi.mocked(fs.existsSync).mockReturnValue(false)
+
+    const typecheck = (result: Partial<ReturnType<typeof spawnSync>>) => {
+      vi.mocked(spawnSync).mockImplementation((cmd, args) => {
+        const base = { pid: 123, signal: null, output: [], stderr: '' }
+        if (String(args).includes('type-check')) {
+          return { status: 0, stdout: '', ...base, ...result } as ReturnType<typeof spawnSync>
+        }
+        return { status: 0, stdout: '[]', ...base } as ReturnType<typeof spawnSync>
+      })
+    }
+
+    // ENOENT from the spawn itself: the type-checker did not run at all.
+    typecheck({ error: Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT' }) })
+    const broken = extractLocatedIssues({ skipSonarQube: true })
+
+    expect(broken.typescript).toEqual([])
+    expect(broken.measurementFailures.map((f) => f.dimension)).toContain('typescript')
+
+    // The control: the same empty findings from a type-checker that ran and found
+    // nothing must carry no failure.
+    typecheck({ status: 0, stdout: '' })
+    const clean = extractLocatedIssues({ skipSonarQube: true })
+
+    expect(clean.typescript).toEqual([])
+    expect(clean.measurementFailures.map((f) => f.dimension)).not.toContain('typescript')
+  })
+
+  // Found by adversarial review. A SUCCESSFUL typecheck reading can still be short on
+  // findings: the provider takes the error TOTAL as `max(strictly parsed, loose
+  // 'error TSnnnn' matches)` because tsc emits global diagnostics with no file:line
+  // prefix, so `metrics.errors === 1` with `issues.length === 0` is a tested, intended
+  // combination. Treating every `ok` reading as complete meant the advice channel
+  // reported zero TypeScript errors while the gate counted one.
+  it('reports type errors that carry no location, on an otherwise successful reading', async () => {
+    const { spawnSync } = await import('child_process')
+
+    vi.mocked(fs.existsSync).mockReturnValue(false)
+    vi.mocked(spawnSync).mockImplementation((cmd, args) => {
+      const base = { pid: 123, signal: null, output: [], stderr: '' }
+      if (String(args).includes('type-check')) {
+        // TS18003 has no file and no line, so no LocatedIssue can be built from it.
+        return {
+          status: 2,
+          stdout: "error TS18003: No inputs were found in config file 'tsconfig.json'.",
+          ...base,
+        } as ReturnType<typeof spawnSync>
+      }
+      return { status: 0, stdout: '[]', ...base } as ReturnType<typeof spawnSync>
+    })
+
+    const result = extractLocatedIssues({ skipSonarQube: true })
+
+    expect(result.typescript).toEqual([])
+    const failure = result.measurementFailures.find((f) => f.dimension === 'typescript')
+    expect(failure?.message).toMatch(/carry no file and line/)
   })
 
   it('respects skipSonarQube option', async () => {

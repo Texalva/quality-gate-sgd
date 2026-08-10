@@ -435,7 +435,7 @@ async function runContainer(options: {
       reject(new Error(`Container timed out after ${timeout}ms`));
     }, timeout);
 
-    docker.on('close', (code) => {
+    docker.on('close', (_code) => {
       clearTimeout(timer);
 
       // Parse output

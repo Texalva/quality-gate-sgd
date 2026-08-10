@@ -13,6 +13,9 @@
 import * as path from 'path';
 import * as fs from 'fs';
 
+import { detectPackageManager, detectTypecheckScript } from './runner.js';
+import type { RunnerSelection, TypecheckScriptSelection } from './runner.js';
+
 // =============================================================================
 // Configuration Interface
 // =============================================================================
@@ -35,6 +38,40 @@ export interface QualityGateConfig {
     unitDir: string;
     lambdaDir: string; // or "integration", "e2e", etc.
     summaryFile: string;
+
+    /** False only for a project that deliberately has no coverage report at all. */
+    required: boolean;
+
+    /**
+     * Whether a coverage number must be traceable to the code being graded.
+     *
+     * ON by default, and that default is a BREAKING contract change made
+     * deliberately: before it, a report nobody could tie to this code was graded
+     * anyway, on the reasoning that "nobody stamped this" is not evidence the
+     * numbers are wrong. That reasoning holds right up until you notice the number
+     * being defended is the one deciding whether the build ships. A coverage report
+     * is a file on disk; the three states "your tests just ran", "your test command
+     * crashed and last week's report is still here", and "CI restored a cached
+     * coverage/ from another commit" are indistinguishable without a sidecar, and
+     * the last two are exactly the vacuous pass this tool exists to remove.
+     *
+     * `optional` restores the previous behaviour -- advisory, gate green, run still
+     * not cacheable as a verdict -- and exists so a project mid-migration can opt
+     * out rather than be stuck. It does NOT disable the STALE verdict, which is
+     * positive evidence that the report describes different code and fails in both
+     * modes.
+     */
+    provenanceRequired: boolean;
+
+    /**
+     * Whether each directory above was named by the PROJECT rather than defaulted.
+     *
+     * Both are resolved with `||` against a hardcoded default, which loses exactly
+     * the distinction the coverage provider needs to decide whether an absent
+     * summary for that suite is a failed measurement. See CoverageReportPaths.
+     */
+    unitDirConfigured: boolean;
+    lambdaDirConfigured: boolean;
   };
 
   // Cache settings
@@ -42,6 +79,25 @@ export interface QualityGateConfig {
     file: string;
     maxAgeDays: number;
   };
+
+  /**
+   * Which package manager runs this project's scripts, and why that was chosen.
+   *
+   * Resolved once, here, so that every measurement and `init`'s calibration shell
+   * the same tool. Resolving it per call site is how the interview measures a
+   * project with one runner and the gate then grades it with another.
+   */
+  packageManager: RunnerSelection;
+
+  /**
+   * The package.json script the typescript dimension runs, and why that one.
+   *
+   * Resolved here for the same reason as the runner: the provider must not read
+   * package.json itself (a provider shelling `tsc` or `deno check` has no script to
+   * look up), and `init` has to agree with the gate about which script is the
+   * project's type-check.
+   */
+  typecheckScript: TypecheckScriptSelection;
 
   // Rules file path (relative to projectRoot or absolute)
   rulesFile: string;
@@ -57,6 +113,55 @@ export interface QualityGateConfig {
 // =============================================================================
 // Default Configuration
 // =============================================================================
+
+/**
+ * The values that turn the coverage requirement off, and the reason the set is
+ * closed.
+ *
+ * DEFAULT ON. An absent coverage summary used to produce no metrics AND no
+ * measurement failure, and `evaluateFloors` is the only rule evaluator that
+ * reports a missing metric -- `evaluateCeilings` and `evaluateMonotonic` both
+ * `continue` on an undefined value. So a project whose only coverage rule was a
+ * ratchet got no coverage enforcement whatsoever the moment its report stopped
+ * being written, and because a monotonic rule still returned a baseline the run
+ * counted as fully evaluated and cached the pass. A required script can exit 0
+ * while writing no report, so nothing had to look broken for this to happen.
+ *
+ * An UNRECOGNISED value leaves the requirement ON, and the asymmetry is
+ * deliberate. Reading a typo as "off" restores exactly the silence above and the
+ * reader gets no sign that their opt-out did nothing; reading it as "on" costs an
+ * advisory that says what to fix. Note that this includes the empty string, so
+ * `QUALITY_COVERAGE_REQUIRED=` does NOT disable it -- elsewhere in this file `||`
+ * makes an empty value mean "unset", and that convention would be the wrong one
+ * here for the same reason.
+ */
+const COVERAGE_REQUIREMENT_DISABLED_BY = new Set(['false', '0', 'no', 'off']);
+
+function coverageRequired(): boolean {
+  const raw = process.env.QUALITY_COVERAGE_REQUIRED;
+  if (raw === undefined) return true;
+  return !COVERAGE_REQUIREMENT_DISABLED_BY.has(raw.trim().toLowerCase());
+}
+
+/**
+ * The one value that turns provenance enforcement off.
+ *
+ * A single spelling rather than the set `COVERAGE_REQUIREMENT_DISABLED_BY` accepts,
+ * because this opt-out weakens what a PASS means and the person reading the CI config
+ * six months from now should not have to wonder whether `0` was a typo. `optional` has
+ * to be written out.
+ *
+ * The unrecognised-value asymmetry is the same as its neighbour's and for the same
+ * reason: a typo leaves enforcement ON, because reading it as "off" silently restores
+ * the vacuous pass and gives the reader no sign their opt-out did nothing.
+ */
+const PROVENANCE_OPTIONAL = 'optional';
+
+function coverageProvenanceRequired(): boolean {
+  const raw = process.env.QUALITY_COVERAGE_PROVENANCE;
+  if (raw === undefined) return true;
+  return raw.trim().toLowerCase() !== PROVENANCE_OPTIONAL;
+}
 
 function resolveProjectRoot(): string {
   // Start from cwd and verify package.json exists
@@ -107,6 +212,13 @@ export function loadConfig(): QualityGateConfig {
       lambdaDir: process.env.QUALITY_COVERAGE_LAMBDA_DIR || 'coverage-lambda',
       summaryFile:
         process.env.QUALITY_COVERAGE_SUMMARY_FILE || 'coverage-summary.json',
+      required: coverageRequired(),
+      provenanceRequired: coverageProvenanceRequired(),
+      // Emptiness counts as unset here, matching the `||` above it: a variable set
+      // to '' resolves to the default path, so calling it "configured" would claim
+      // the project named a directory it did not.
+      unitDirConfigured: !!process.env.QUALITY_COVERAGE_UNIT_DIR,
+      lambdaDirConfigured: !!process.env.QUALITY_COVERAGE_LAMBDA_DIR,
     },
 
     cache: {
@@ -115,6 +227,9 @@ export function loadConfig(): QualityGateConfig {
         path.join(projectRoot, '.quality-gate-cache.json'),
       maxAgeDays: parseInt(process.env.QUALITY_CACHE_MAX_AGE_DAYS || '90', 10),
     },
+
+    packageManager: detectPackageManager(projectRoot),
+    typecheckScript: detectTypecheckScript(projectRoot),
 
     rulesFile: process.env.QUALITY_RULES_FILE || 'rules.json',
 
@@ -201,6 +316,14 @@ export function getSonarAuthToken(): string {
 
 /**
  * Get curl auth argument for SonarQube API calls
+ *
+ * Returns ONE shell word pair as a single string, which makes it usable only where
+ * a shell parses the result. That is the problem: a token or password containing a
+ * space, a quote, `$`, a backtick or `;` either splits into extra arguments or is
+ * interpreted. Prefer `sonarAuthArgs()`, which cannot be reinterpreted, and treat
+ * this as retained for the published API surface.
+ *
+ * @deprecated Use {@link sonarAuthArgs} -- see the note above.
  */
 export function getSonarCurlAuth(): string {
   const config = getConfig();
@@ -210,4 +333,50 @@ export function getSonarCurlAuth(): string {
   }
   const { user, password } = config.sonarqube.defaultCredentials;
   return `-u ${user}:${password}`;
+}
+
+/**
+ * The SonarQube credential as argv words, for a spawn with no shell.
+ *
+ * Two argv entries, never one string, and never interpolated into a command line.
+ * A credential that reaches a shell has to survive quoting; a credential that
+ * reaches `execve` directly does not, so `p@ss word`, `to;ken` and `$SECRET` are
+ * all passed through verbatim instead of splitting the command or being expanded
+ * by the shell.
+ *
+ * It also means no caller can accidentally print it: the only string form of the
+ * credential in this process is the one curl receives, and nothing builds a
+ * message out of that.
+ */
+export function sonarAuthArgs(): readonly string[] {
+  const config = getConfig();
+  if (fs.existsSync(config.sonarqube.tokenFile)) {
+    const token = fs.readFileSync(config.sonarqube.tokenFile, 'utf-8').trim();
+    // A SonarQube token authenticates as the user with an empty password.
+    return ['-u', `${token}:`];
+  }
+  const { user, password } = config.sonarqube.defaultCredentials;
+  return ['-u', `${user}:${password}`];
+}
+
+/**
+ * A SonarQube URL with any embedded credential removed, safe to print.
+ *
+ * `https://user:token@sonar.example.com` is a legal value for SONARQUBE_URL, and
+ * every failure message and piece of evidence names the URL. Redacting the `-u`
+ * argument is not enough on its own while the credential can also arrive inside
+ * the URL itself.
+ */
+export function redactUrlCredentials(url: string): string {
+  try {
+    const parsed = new URL(url);
+    if (parsed.username === '' && parsed.password === '') return url;
+    parsed.username = '<redacted>';
+    parsed.password = '';
+    return parsed.toString();
+  } catch {
+    // Not a parseable URL. Fall back to removing anything that looks like
+    // userinfo, rather than returning a string that may carry a credential.
+    return url.replace(/\/\/[^/@]*@/, '//<redacted>@');
+  }
 }

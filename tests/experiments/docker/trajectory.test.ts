@@ -7,7 +7,6 @@ import {
   withTrajectoryLogging,
   analyzeTrajectory,
   computeTrajectoryMetrics,
-  type TrajectoryLogger,
 } from '../../../src/experiments/docker/trajectory.js';
 import type { TrajectoryEvent } from '../../../src/experiments/docker/types.js';
 

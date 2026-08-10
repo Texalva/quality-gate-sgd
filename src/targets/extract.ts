@@ -7,10 +7,8 @@
  * the file:line:column information so we can compute target-space gradients.
  */
 
-import { existsSync, readFileSync } from 'fs';
 import { spawnSync } from 'child_process';
-import path from 'path';
-import { getConfig, getSonarAuthToken } from '../config.js';
+import { getConfig, getSonarAuthToken, redactUrlCredentials } from '../config.js';
 import type {
   LocatedIssue,
   ExtractedIssues,
@@ -19,398 +17,231 @@ import type {
 } from './types.js';
 import { mapLocationToSymbol } from '../symbols/mapper.js';
 import type { SymbolTable, CodeSymbol } from '../symbols/types.js';
+import type {
+  MeasurementFailure,
+  MeasurementFailureKind,
+} from '../providers/types.js';
+import { eslintLintProvider } from '../providers/eslint.js';
+import { typescriptTypecheckProvider } from '../providers/typescript.js';
+import { createIstanbulCoverageProvider } from '../providers/coverage.js';
+import { DEFAULT_MEASUREMENT_LIMITS, measurementFailure } from '../providers/result.js';
+
+/**
+ * See the identical constant in ../metrics.ts. spawnSync's 1 MiB default
+ * truncates large linter output and kills the child; the catch blocks below
+ * then report zero issues instead of failing, so a noisy codebase looks clean.
+ */
+const SUBPROCESS_MAX_BUFFER = 64 * 1024 * 1024;
+
+/**
+ * Findings, plus the reason there might be none.
+ *
+ * Each `read*Issues` below returns this and each `extract*Issues` unwraps it to the
+ * bare array. Two functions rather than one changed signature because the bare array
+ * is the shape every existing caller and test already asks for, and widening the
+ * contract everywhere to reach one new consumer is churn that hides the change.
+ */
+interface IssueReading {
+  issues: LocatedIssue[];
+  failures: MeasurementFailure[];
+}
 
 // =============================================================================
 // Coverage Issue Extraction
 // =============================================================================
 
 /**
- * Istanbul coverage-final.json structure
- */
-interface IstanbulCoverage {
-  [filePath: string]: IstanbulFileCoverage;
-}
-
-interface IstanbulFileCoverage {
-  path: string;
-  statementMap: Record<string, IstanbulLocation>;
-  fnMap: Record<string, IstanbulFunction>;
-  branchMap: Record<string, IstanbulBranch>;
-  s: Record<string, number>;  // statement hit counts
-  f: Record<string, number>;  // function hit counts
-  b: Record<string, number[]>; // branch hit counts per branch
-}
-
-interface IstanbulLocation {
-  start: { line: number; column: number };
-  end: { line: number; column: number };
-}
-
-interface IstanbulFunction {
-  name: string;
-  decl: IstanbulLocation;
-  loc: IstanbulLocation;
-}
-
-interface IstanbulBranch {
-  type: string;
-  loc: IstanbulLocation;
-  locations: IstanbulLocation[];
-}
-
-/**
- * coverage-summary.json structure
- */
-interface CoverageSummaryEntry {
-  statements: { total: number; covered: number; pct: number };
-  branches: { total: number; covered: number; pct: number };
-  functions: { total: number; covered: number; pct: number };
-  lines: { total: number; covered: number; pct: number };
-}
-
-interface CoverageSummaryJson {
-  total?: CoverageSummaryEntry;
-  [filePath: string]: CoverageSummaryEntry | undefined;
-}
-
-function shouldSkipCoverageFile(filePath: string): boolean {
-  return (
-    filePath.includes('node_modules') ||
-    filePath.includes('.test.') ||
-    filePath.includes('.spec.')
-  );
-}
-
-function extractCoverageIssuesFromSummary(
-  summaryPath: string,
-  dimensionPrefix: 'coverage.unit' | 'coverage.lambda'
-): LocatedIssue[] {
-  if (!existsSync(summaryPath)) return [];
-
-  try {
-    const data = JSON.parse(readFileSync(summaryPath, 'utf-8')) as CoverageSummaryJson;
-    const issues: LocatedIssue[] = [];
-
-    for (const [filePath, entry] of Object.entries(data)) {
-      if (filePath === 'total' || !entry) continue;
-      if (shouldSkipCoverageFile(filePath)) continue;
-
-      const branchTotal = entry.branches.total ?? 0;
-      const branchCovered = entry.branches.covered ?? 0;
-      const branchMissing = Math.max(branchTotal - branchCovered, 0);
-
-      if (branchTotal > 0 && branchMissing > 0) {
-        const delta = branchMissing / branchTotal;
-        issues.push({
-          file: filePath,
-          source: 'coverage',
-          dimension: `${dimensionPrefix}.branches`,
-          code: 'uncovered-branches',
-          impact: {
-            dimension: `${dimensionPrefix}.branches`,
-            delta,
-            direction: 'higher-better',
-          },
-          message: `Low branch coverage (${entry.branches.pct.toFixed(1)}%)`,
-          context: `${branchMissing}/${branchTotal} branches uncovered`,
-        });
-      }
-
-      const fnTotal = entry.functions.total ?? 0;
-      const fnCovered = entry.functions.covered ?? 0;
-      const fnMissing = Math.max(fnTotal - fnCovered, 0);
-
-      if (fnTotal > 0 && fnMissing > 0) {
-        const delta = fnMissing / fnTotal;
-        issues.push({
-          file: filePath,
-          source: 'coverage',
-          dimension: `${dimensionPrefix}.functions`,
-          code: 'uncovered-functions',
-          impact: {
-            dimension: `${dimensionPrefix}.functions`,
-            delta,
-            direction: 'higher-better',
-          },
-          message: `Low function coverage (${entry.functions.pct.toFixed(1)}%)`,
-          context: `${fnMissing}/${fnTotal} functions uncovered`,
-        });
-      }
-    }
-
-    return issues;
-  } catch (error) {
-    console.error(`Warning: Could not parse ${summaryPath}: ${error}`);
-    return [];
-  }
-}
-
-/**
- * Extract uncovered branches and lines from coverage-final.json.
+ * Extract uncovered branches and functions with location information.
  *
- * Each uncovered branch becomes a LocatedIssue with estimated coverage impact.
+ * Delegates to the coverage provider; the parsing that used to live here now
+ * lives in src/providers/coverage.ts, unchanged -- including the summary
+ * fallback, which fires on `issues.length === 0` rather than on the detail
+ * report's absence, so a detail report that parsed fine and found nothing
+ * uncovered still falls through to the coarser file-level findings.
+ *
+ * `coverageDir` keeps its exact previous meaning: it replaces ONLY the unit
+ * directory, for both the detail report and the summary, and the lambda
+ * directory still comes from config.
  */
 export function extractCoverageIssues(coverageDir?: string): LocatedIssue[] {
+  return readCoverageIssues(coverageDir).issues;
+}
+
+function readCoverageIssues(coverageDir?: string): IssueReading {
   const config = getConfig();
-  const issues: LocatedIssue[] = [];
-  let foundCoverageFinal = false;
 
-  // Try unit coverage first, then lambda
-  const coveragePaths = [
-    path.join(config.projectRoot, coverageDir ?? config.coverage.unitDir, 'coverage-final.json'),
-    path.join(config.projectRoot, config.coverage.lambdaDir, 'coverage-final.json'),
-  ];
+  const reading = createIstanbulCoverageProvider({
+    unitDir: coverageDir ?? config.coverage.unitDir,
+    lambdaDir: config.coverage.lambdaDir,
+    summaryFile: config.coverage.summaryFile,
+  }).measure({
+    projectRoot: config.projectRoot,
+    timeoutMs: DEFAULT_MEASUREMENT_LIMITS.typecheckTimeoutMs,
+    maxBufferBytes: DEFAULT_MEASUREMENT_LIMITS.maxBufferBytes,
+    packageManager: config.packageManager,
+    typecheckScript: config.typecheckScript,
+  });
 
-  for (const coveragePath of coveragePaths) {
-    if (!existsSync(coveragePath)) continue;
-    foundCoverageFinal = true;
-
-    try {
-      const data = JSON.parse(readFileSync(coveragePath, 'utf-8')) as IstanbulCoverage;
-
-      for (const [filePath, fileCoverage] of Object.entries(data)) {
-        // Skip node_modules and test files
-        if (shouldSkipCoverageFile(filePath)) {
-          continue;
-        }
-
-        // Count total branches for this file to estimate per-branch impact
-        const totalBranches = Object.values(fileCoverage.branchMap).reduce(
-          (sum, branch) => sum + branch.locations.length,
-          0
-        );
-
-        // Extract uncovered branches
-        for (const [branchId, branch] of Object.entries(fileCoverage.branchMap)) {
-          const hitCounts = fileCoverage.b[branchId] || [];
-
-          for (let i = 0; i < branch.locations.length; i++) {
-            const loc = branch.locations[i];
-            const hits = hitCounts[i] ?? 0;
-
-            if (hits === 0) {
-              // Estimate impact: each branch is roughly equal fraction of file's branch coverage
-              // If file has 10 branches and 5 uncovered, covering 1 branch adds ~10% to file's coverage
-              const estimatedImpact = totalBranches > 0 ? 100 / totalBranches : 1;
-
-              issues.push({
-                file: filePath,
-                line: loc.start.line,
-                column: loc.start.column,
-                endLine: loc.end.line,
-                endColumn: loc.end.column,
-                source: 'coverage',
-                dimension: 'coverage.unit.branches',
-                code: `branch-${branch.type}`,
-                impact: {
-                  dimension: 'coverage.unit.branches',
-                  delta: estimatedImpact / 100, // Fractional coverage gain
-                  direction: 'higher-better',
-                },
-                message: `Uncovered ${branch.type} branch`,
-                context: `Branch ${branchId}[${i}] at line ${loc.start.line}`,
-              });
-            }
-          }
-        }
-
-        // Extract uncovered functions
-        for (const [fnId, fn] of Object.entries(fileCoverage.fnMap)) {
-          const hits = fileCoverage.f[fnId] ?? 0;
-
-          if (hits === 0) {
-            issues.push({
-              file: filePath,
-              line: fn.loc.start.line,
-              column: fn.loc.start.column,
-              endLine: fn.loc.end.line,
-              endColumn: fn.loc.end.column,
-              symbol: fn.name || `anonymous_${fnId}`,
-              source: 'coverage',
-              dimension: 'coverage.unit.functions',
-              code: 'uncovered-function',
-              impact: {
-                dimension: 'coverage.unit.functions',
-                delta: 0.5, // Rough estimate: covering a function helps
-                direction: 'higher-better',
-              },
-              message: `Uncovered function: ${fn.name || 'anonymous'}`,
-              context: `Function at line ${fn.loc.start.line}`,
-            });
-          }
-        }
-      }
-    } catch (error) {
-      // Silently skip if coverage file is malformed
-      console.error(`Warning: Could not parse ${coveragePath}: ${error}`);
-    }
+  if (!reading.ok) {
+    console.error(
+      `Warning: Could not parse coverage reports: ${reading.error.message}`
+    );
+    return { issues: [], failures: [reading.error] };
   }
 
-  // Fallback: use coverage-summary.json when coverage-final.json is missing
-  if (issues.length === 0) {
-    const summaryPaths: Array<{ path: string; prefix: 'coverage.unit' | 'coverage.lambda' }> = [
-      {
-        path: path.join(
-          config.projectRoot,
-          coverageDir ?? config.coverage.unitDir,
-          config.coverage.summaryFile
-        ),
-        prefix: 'coverage.unit',
-      },
-      {
-        path: path.join(
-          config.projectRoot,
-          config.coverage.lambdaDir,
-          config.coverage.summaryFile
-        ),
-        prefix: 'coverage.lambda',
-      },
-    ];
+  // The warning belongs HERE, not in the provider: this is the layer that
+  // discards the failure, and the rule is to handle an error or log it, never
+  // both.
+  //
+  // `absent` is not warned about on THIS path, and that is now a narrower claim
+  // than it used to be. The provider does report an absent unit summary, as
+  // `report-missing`, because the gate grades coverage rules against it -- see
+  // readFailure. What this loop is for is fix ADVICE, where a report that does not
+  // exist yields no findings and there is nothing to say beyond what the gate
+  // already said. The failure itself is discarded here along with every other one,
+  // which is #25.
+  //
+  // `shape: 'unexpected'` is reported alongside a failed read because from this
+  // function's point of view they cost the same thing: a report that parsed but
+  // is not the shape findings come from yields none, exactly as an unparseable
+  // one does.
+  // The provider's own `failures` are the SUMMARY-level ones, which the gate already
+  // grades on. What this loop adds is the detail reports: `coverage-final.json` is
+  // where the line-level findings come from, and the provider deliberately does not
+  // promote a broken one to a gate failure because the verdict's numbers come from
+  // the summary and stay sound. For fix ADVICE the cost is the whole point -- those
+  // findings are exactly what is missing -- so they become failures here, on the
+  // channel that carries advice.
+  const failures: MeasurementFailure[] = [...reading.value.failures];
 
-    for (const summary of summaryPaths) {
-      const summaryIssues = extractCoverageIssuesFromSummary(summary.path, summary.prefix);
-      if (summaryIssues.length > 0 && foundCoverageFinal) {
-        console.error(`Warning: Using ${config.coverage.summaryFile} fallback for ${summary.prefix} coverage`);
-      }
-      issues.push(...summaryIssues);
-    }
+  for (const read of reading.value.reads) {
+    const unreadable = read.attempt.outcome !== 'read' && read.attempt.outcome !== 'absent';
+    if (!unreadable && read.shape === 'expected') continue;
+    const reason = unreadable ? read.attempt.outcome : 'not a coverage report';
+    console.error(`Warning: Could not parse ${read.attempt.path}: ${reason}`);
+
+    // Only the detail reports. A summary in the same state is already in
+    // `reading.value.failures` above, and listing it twice would have the CLI
+    // report one broken file as two broken dimensions.
+    if (read.kind !== 'final') continue;
+
+    failures.push(
+      measurementFailure(
+        'unparseable-output',
+        read.suite,
+        `${read.attempt.path} could not be read for findings (${reason}), so the ` +
+          `located issues for ${read.suite} are incomplete. The gate's coverage ` +
+          'numbers are unaffected -- they come from the summary report.',
+        {
+          via: 'report',
+          command: `read ${read.attempt.path}`,
+          elapsedMs: 0,
+          attempts: [read.attempt],
+        }
+      )
+    );
   }
 
-  return issues;
+  return { issues: [...reading.value.issues], failures };
 }
 
 // =============================================================================
 // TypeScript Issue Extraction
 // =============================================================================
 
-interface TypeScriptError {
-  file: string;
-  line: number;
-  column: number;
-  code: string;
-  message: string;
-}
-
-function parseTypescriptOutput(output: string): TypeScriptError[] {
-  const errors: TypeScriptError[] = [];
-  // Match: file(line,col): error TSxxxx: message
-  const errorRegex = /^(.+?)\((\d+),(\d+)\): error (TS\d+): (.+)$/gm;
-
-  let match;
-  while ((match = errorRegex.exec(output)) !== null) {
-    errors.push({
-      file: match[1],
-      line: parseInt(match[2], 10),
-      column: parseInt(match[3], 10),
-      code: match[4],
-      message: match[5],
-    });
-  }
-
-  return errors;
-}
-
 /**
  * Extract TypeScript errors with location information.
+ *
+ * Delegates to the typecheck provider; the parsing that used to live here now
+ * lives in src/providers/typescript.ts, unchanged.
  */
 export function extractTypescriptIssues(): LocatedIssue[] {
+  return readTypescriptIssues().issues;
+}
+
+function readTypescriptIssues(): IssueReading {
   const config = getConfig();
-  const result = spawnSync('npm', ['run', 'type-check'], {
-    cwd: config.projectRoot,
-    encoding: 'utf-8',
-    shell: true,
-    timeout: 60000,
+
+  const reading = typescriptTypecheckProvider.measure({
+    projectRoot: config.projectRoot,
+    timeoutMs: DEFAULT_MEASUREMENT_LIMITS.typecheckTimeoutMs,
+    maxBufferBytes: DEFAULT_MEASUREMENT_LIMITS.maxBufferBytes,
+    packageManager: config.packageManager,
+    typecheckScript: config.typecheckScript,
   });
 
-  const output = (result.stdout || '') + (result.stderr || '');
-  const errors = parseTypescriptOutput(output);
+  // The empty list is still returned -- there are no findings to report -- but it no
+  // longer travels alone. A type-check that never ran and a project with no type
+  // errors are the same `[]` here, and the failure beside it is the only thing that
+  // tells them apart.
+  if (!reading.ok) return { issues: [], failures: [reading.error] };
 
-  return errors.map((err): LocatedIssue => ({
-    file: err.file,
-    line: err.line,
-    column: err.column,
-    source: 'typescript',
-    dimension: 'typescript.errors',
-    code: err.code,
-    impact: {
-      dimension: 'typescript.errors',
-      delta: -1, // Fixing one error reduces count by 1
-      direction: 'lower-better',
-    },
-    message: err.message,
-    context: `${err.code}: ${err.message}`,
-  }));
+  const issues = [...reading.value.issues];
+
+  // A SUCCESSFUL reading can still be short on findings, and the provider says so on
+  // purpose: the error TOTAL is `max(strictly parsed, loose 'error TSnnnn' matches)`
+  // because tsc emits global diagnostics with no file:line prefix (TS18003 "No inputs
+  // were found" is one), and `--pretty` puts the location on its own line in a shape
+  // the located regex cannot read. Those are real errors the issue list cannot
+  // represent -- `metrics.errors === 1` with `issues.length === 0` is a tested,
+  // intended combination -- and fix advice that reports only the list would say zero
+  // TypeScript errors while the gate counts one. The count is not wrong and the list
+  // is not wrong; what was wrong was letting the advice channel see only the list.
+  const unlocated = reading.value.metrics.errors - issues.length;
+  if (unlocated > 0) {
+    return {
+      issues,
+      failures: [
+        measurementFailure(
+          'unparseable-output',
+          'typescript',
+          `${unlocated} of ${reading.value.metrics.errors} type error(s) carry no ` +
+            'file and line, so they cannot be ranked as targets. Global diagnostics ' +
+            '(TS18003 and friends) and --pretty output both do this. Run the ' +
+            'typecheck script directly to see them.',
+          {
+            via: 'report',
+            command: 'typecheck output had diagnostics with no location',
+            elapsedMs: 0,
+            attempts: [],
+          }
+        ),
+      ],
+    };
+  }
+
+  return { issues, failures: [] };
 }
 
 // =============================================================================
 // ESLint Issue Extraction
 // =============================================================================
 
-interface EslintMessage {
-  ruleId: string | null;
-  severity: number; // 1 = warning, 2 = error
-  message: string;
-  line: number;
-  column: number;
-  endLine?: number;
-  endColumn?: number;
-}
-
-interface EslintFileResult {
-  filePath: string;
-  errorCount: number;
-  warningCount: number;
-  messages: EslintMessage[];
-}
-
 /**
  * Extract ESLint issues with location information.
+ *
+ * Delegates to the eslint provider; the parsing that used to live here now
+ * lives in src/providers/eslint.ts, unchanged.
  */
 export function extractEslintIssues(): LocatedIssue[] {
+  return readEslintIssues().issues;
+}
+
+function readEslintIssues(): IssueReading {
   const config = getConfig();
-  const result = spawnSync('npx', ['eslint', '--format', 'json', 'src/'], {
-    cwd: config.projectRoot,
-    encoding: 'utf-8',
-    shell: true,
-    timeout: 120000,
+
+  const reading = eslintLintProvider.measure({
+    projectRoot: config.projectRoot,
+    timeoutMs: DEFAULT_MEASUREMENT_LIMITS.lintTimeoutMs,
+    maxBufferBytes: DEFAULT_MEASUREMENT_LIMITS.maxBufferBytes,
+    packageManager: config.packageManager,
+    typecheckScript: config.typecheckScript,
   });
 
-  const issues: LocatedIssue[] = [];
-
-  try {
-    const output = result.stdout || '[]';
-    const results = JSON.parse(output) as EslintFileResult[];
-
-    for (const fileResult of results) {
-      for (const msg of fileResult.messages) {
-        const isError = msg.severity === 2;
-        const dimension = isError ? 'eslint.errors' : 'eslint.warnings';
-
-        issues.push({
-          file: fileResult.filePath,
-          line: msg.line,
-          column: msg.column,
-          endLine: msg.endLine,
-          endColumn: msg.endColumn,
-          source: 'eslint',
-          dimension,
-          code: msg.ruleId || 'unknown',
-          severity: isError ? 'major' : 'minor',
-          impact: {
-            dimension,
-            delta: -1, // Fixing one issue reduces count by 1
-            direction: 'lower-better',
-          },
-          message: msg.message,
-          context: msg.ruleId ? `Rule: ${msg.ruleId}` : undefined,
-        });
-      }
-    }
-  } catch {
-    // If parsing fails, return empty
-  }
-
-  return issues;
+  // See readTypescriptIssues.
+  return reading.ok
+    ? { issues: [...reading.value.issues], failures: [] }
+    : { issues: [], failures: [reading.error] };
 }
 
 // =============================================================================
@@ -455,13 +286,60 @@ function mapSonarTypeToDimension(type: string): string {
 
 /**
  * Extract SonarQube issues with location information.
+ *
+ * The lossy wrapper, kept because it is exported from the package root. Callers that
+ * need to know whether an empty list means "no findings" or "could not ask" want
+ * {@link readSonarqubeIssues}.
  */
 export function extractSonarqubeIssues(): LocatedIssue[] {
+  return readSonarqubeIssues().issues;
+}
+
+/**
+ * SonarQube issues, and the reason if they could not be read.
+ *
+ * The last source with no failure channel. Every exit from the loop below used to
+ * return `issues` -- a token that will not load, a curl that exits nonzero, a page
+ * of JSON that will not parse -- so a refused query and a genuinely clean project
+ * were the same empty array. The advice channel reported "nothing to fix" for a
+ * server it never reached, which is the same defect `readCoverageIssues` and
+ * `readTypescriptIssues` were given channels for.
+ *
+ * A partial result is a failure too, and deliberately still carries the issues it
+ * did fetch: page 3 failing after two good pages is not five hundred findings, and
+ * saying so is more useful than either discarding them or presenting them as the
+ * whole set.
+ */
+export function readSonarqubeIssues(): IssueReading {
   const config = getConfig();
   const token = getSonarAuthToken();
+  const url = `${redactUrlCredentials(config.sonarqube.url)}/api/issues/search`;
+
+  const failed = (
+    kind: MeasurementFailureKind,
+    message: string,
+    partial: LocatedIssue[] = []
+  ): IssueReading => ({
+    issues: partial,
+    failures: [
+      measurementFailure(kind, 'sonarqube', message, {
+        via: 'process',
+        command: `curl -u <redacted> "${url}?componentKeys=${config.sonarqube.projectKey}"`,
+        exitCode: null,
+        signal: null,
+        elapsedMs: 0,
+        stdoutBytes: 0,
+        stderrBytes: 0,
+      }),
+    ],
+  });
 
   if (!token) {
-    return [];
+    return failed(
+      'access-denied',
+      'No SonarQube token is configured, so its issues could not be listed. Set ' +
+        'SONARQUBE_TOKEN, or the token file named by the config.'
+    );
   }
 
   const issues: LocatedIssue[] = [];
@@ -487,10 +365,26 @@ export function extractSonarqubeIssues(): LocatedIssue[] {
       ], {
         encoding: 'utf-8',
         timeout: 30000,
+        // A page of issues can exceed 1 MiB. Truncation kills curl, `status`
+        // comes back null, and the break below then returns whatever pages had
+        // already been fetched as if that were the whole result set -- a
+        // silently partial finding list, which is worse than none.
+        maxBuffer: SUBPROCESS_MAX_BUFFER,
       });
 
       if (result.status !== 0 || !result.stdout) {
-        break;
+        return failed(
+          result.error ? 'tool-missing' : 'crashed',
+          `Listing SonarQube issues stopped at page ${page}: ` +
+            (result.error
+              ? `curl could not run (${result.error.message}).`
+              : `curl exited ${String(result.status)} with ${
+                  result.stdout ? 'a body' : 'no body'
+                }.`) +
+            ` ${issues.length} issue(s) had been read; they are reported, and this ` +
+            'is reported with them rather than presented as the whole list.',
+          issues
+        );
       }
 
       const response = JSON.parse(result.stdout) as SonarResponse;
@@ -526,11 +420,17 @@ export function extractSonarqubeIssues(): LocatedIssue[] {
       // Safety limit to prevent infinite loops
       if (page > 10) break;
     }
-  } catch {
-    // If fetching fails, return empty
+  } catch (error) {
+    return failed(
+      'unparseable-output',
+      `SonarQube's issue list could not be read: ` +
+        `${error instanceof Error ? error.message : String(error)}. ` +
+        `${issues.length} issue(s) had been read before that.`,
+      issues
+    );
   }
 
-  return issues;
+  return { issues, failures: [] };
 }
 
 // =============================================================================
@@ -625,10 +525,21 @@ function enrichIssuesWithSymbols(
 export function extractLocatedIssues(
   options: ExtractLocatedIssuesOptions = {}
 ): ExtractedIssues {
-  const coverage = extractCoverageIssues(options.coverageDir);
-  const typescript = options.skipTypescript ? [] : extractTypescriptIssues();
-  const eslint = options.skipEslint ? [] : extractEslintIssues();
-  const sonarqube = options.skipSonarQube ? [] : extractSonarqubeIssues();
+  const empty: IssueReading = { issues: [], failures: [] };
+
+  const coverageReading = readCoverageIssues(options.coverageDir);
+  const typescriptReading = options.skipTypescript ? empty : readTypescriptIssues();
+  const eslintReading = options.skipEslint ? empty : readEslintIssues();
+
+  // A skipped dimension is deliberately not a failure -- `--coverage-only` asked for
+  // it -- but a dimension that was ASKED FOR and could not be read now says so, which
+  // is what the comment that stood here recorded as still missing.
+  const sonarqubeReading = options.skipSonarQube ? empty : readSonarqubeIssues();
+  const sonarqube = sonarqubeReading.issues;
+
+  const coverage = coverageReading.issues;
+  const typescript = typescriptReading.issues;
+  const eslint = eslintReading.issues;
 
   // Enrich issues with symbol information if symbol table provided
   if (options.symbolTable) {
@@ -650,5 +561,12 @@ export function extractLocatedIssues(
       eslint: eslint.length,
       sonarqube: sonarqube.length,
     },
+    measurementFailures: [
+      ...coverageReading.failures,
+      ...typescriptReading.failures,
+      ...eslintReading.failures,
+      // Last, so the orderings the existing tests assert on are untouched.
+      ...sonarqubeReading.failures,
+    ],
   };
 }

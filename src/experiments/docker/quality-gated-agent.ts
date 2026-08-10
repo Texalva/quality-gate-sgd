@@ -82,7 +82,7 @@ export function createQualityGatedAgent(
   };
 
   return {
-    async initialize(experimentTask: ExperimentTask, experimentConfig: ExperimentConfig) {
+    async initialize(experimentTask: ExperimentTask, _experimentConfig: ExperimentConfig) {
       currentScore = 0;
       lastEvaluation = null;
       iterationCount = 0;
@@ -94,7 +94,7 @@ export function createQualityGatedAgent(
       log(`  Target score: ${targetScore}`);
     },
 
-    async getSuggestion(experimentConfig: ExperimentConfig): Promise<TargetSuggestion | null> {
+    async getSuggestion(_experimentConfig: ExperimentConfig): Promise<TargetSuggestion | null> {
       // For quality-gated mode, suggestions could be based on which
       // reasoning dimensions scored lowest
       if (reasoningAttempts.length > 0) {
@@ -125,7 +125,7 @@ export function createQualityGatedAgent(
     async executeIteration(
       iteration: number,
       suggestion: TargetSuggestion | null,
-      experimentConfig: ExperimentConfig
+      _experimentConfig: ExperimentConfig
     ): Promise<IterationOutcome> {
       iterationCount = iteration;
       log(`Iteration ${iteration}`);
@@ -314,7 +314,7 @@ export function createQualityGatedAgent(
       }
     },
 
-    async evaluate(experimentConfig: ExperimentConfig): Promise<IterationEvaluationResult> {
+    async evaluate(_experimentConfig: ExperimentConfig): Promise<IterationEvaluationResult> {
       // Add quality metrics to the evaluation result
       const lastAttempt = reasoningAttempts[reasoningAttempts.length - 1];
 

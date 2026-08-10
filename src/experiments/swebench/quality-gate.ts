@@ -11,7 +11,6 @@
  * 5. Observable effects (predicted outcomes match actual)
  */
 
-import type { SWEBenchTask } from './types.js';
 
 // =============================================================================
 // Quality Dimensions
@@ -211,7 +210,7 @@ function evaluateHypothesisCoherence(hypothesis: PatchProposalReasoning['hypothe
  */
 function evaluateEvidenceAlignment(
   evidence: PatchProposalReasoning['evidence'],
-  hypothesis: PatchProposalReasoning['hypothesis']
+  _hypothesis: PatchProposalReasoning['hypothesis']
 ): number {
   let score = 0;
 

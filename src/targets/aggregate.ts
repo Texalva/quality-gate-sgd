@@ -90,8 +90,17 @@ function computeBreakdown(issues: LocatedIssue[]): OptimizationTarget['breakdown
   // Coverage
   const coverageIssues = issues.filter(i => i.source === 'coverage');
   if (coverageIssues.length > 0) {
-    const branchIssues = coverageIssues.filter(i => i.dimension === 'coverage.unit.branches');
-    const lineIssues = coverageIssues.filter(i => i.dimension === 'coverage.unit.lines');
+    // By SUFFIX, not by the full `coverage.unit.*` path. `estimatedCoverageGain`
+    // below already sums every coverage finding regardless of suite, so matching the
+    // unit suite exactly here meant a project with a second coverage suite reported
+    // `uncoveredBranches: 0` beside a non-zero gain -- a count that contradicts the
+    // number next to it. Latent until the detail walk stopped labelling every
+    // finding `coverage.unit.*` (#36); fixing one without the other would have
+    // traded a false label for a false count. `aggregate.ts:526` already matches by
+    // suffix, so this converges with existing code rather than inventing a
+    // convention.
+    const branchIssues = coverageIssues.filter(i => i.dimension.endsWith('.branches'));
+    const lineIssues = coverageIssues.filter(i => i.dimension.endsWith('.lines'));
     const estimatedGain = coverageIssues.reduce((sum, i) => sum + i.impact.delta * 100, 0);
 
     breakdown.coverage = {

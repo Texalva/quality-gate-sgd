@@ -7,7 +7,7 @@
  * that the agent queries, rather than controlling iteration flow directly.
  */
 
-import type { ExperimentDesign, ExperimentConfig, ExperimentCondition } from '../types.js';
+import type { ExperimentDesign, ExperimentCondition } from '../types.js';
 
 // =============================================================================
 // Experiment Definition

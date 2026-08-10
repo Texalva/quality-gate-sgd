@@ -330,7 +330,7 @@ export function stratifiedSample(
 
   // Sample from each repo
   const sampled: SWEBenchTask[] = [];
-  for (const [repo, repoTasks] of byRepo) {
+  for (const [, repoTasks] of byRepo) {
     const shuffled = shuffleArray(repoTasks, seed);
     sampled.push(...shuffled.slice(0, tasksPerRepo));
   }

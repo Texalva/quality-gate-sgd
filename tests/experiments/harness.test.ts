@@ -6,11 +6,9 @@ import {
   type MetricsProvider,
   type LLMExecutor,
   type FixContext,
-  type FixAttemptResult,
 } from '../../src/experiments/harness.js';
-import type { ExperimentConfig, TargetSuggestion } from '../../src/experiments/types.js';
+import type { ExperimentConfig } from '../../src/experiments/types.js';
 import type { ExperimentTask } from '../../src/experiments/runner.js';
-import type { Metrics } from '../../src/types.js';
 
 describe('agent harness', () => {
   describe('createMockMetricsProvider', () => {

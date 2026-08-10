@@ -1,6 +1,22 @@
 {
   "version": "1.0.0",
   "description": "Quality Gate Rules Template - Customize for your project",
+  "_readme": [
+    "REPLACE the entry in requiredScripts below with the npm script in YOUR",
+    "package.json that writes the coverage report -- the one that passes",
+    "--coverage. A template cannot know its name, and getting it wrong is not a",
+    "cosmetic mistake: the gate reads coverage/coverage-summary.json AFTER running",
+    "requiredScripts, so if none of those scripts rewrites that report, the floors",
+    "below are graded against whatever generation of the code last wrote it --",
+    "silently. The gate does not check a report's age; nothing warns you.",
+    "For vitest and jest, the default `test` script writes NO coverage report:",
+    "measured with vitest 4 + @vitest/coverage-v8, `npm run test` on `vitest run`",
+    "created no coverage/ directory at all, while `vitest run --coverage` did.",
+    "Easier alternative: run `npx quality-gate-sgd init`, which picks a",
+    "coverage-writing script for you and calibrates these numbers from your",
+    "current metrics.",
+    "Keys starting with _ are ignored by the gate; delete this one once read."
+  ],
   "rules": {
     "floors": {
       "coverage.unit.branches": 50,
@@ -34,6 +50,6 @@
         ]
       }
     ],
-    "requiredScripts": ["test", "lint"]
+    "requiredScripts": ["test:coverage", "lint"]
   }
 }

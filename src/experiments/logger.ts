@@ -5,7 +5,8 @@
  * Supports streaming writes for crash-resilient logging.
  */
 
-import { writeFileSync, appendFileSync, mkdirSync, existsSync, readFileSync } from 'fs';
+import { writeFileSync, appendFileSync, mkdirSync, existsSync, readFileSync, readdirSync } from 'fs';
+import { execSync } from 'child_process';
 import { join, dirname } from 'path';
 import { randomUUID } from 'crypto';
 import type {
@@ -263,7 +264,6 @@ function computeOutcome(
 function getMetadata(): RunMetadata {
   let experimentCommit = 'unknown';
   try {
-    const { execSync } = require('child_process');
     experimentCommit = execSync('git rev-parse HEAD', { encoding: 'utf-8' }).trim();
   } catch {
     // Ignore git errors
@@ -379,7 +379,6 @@ export function listRuns(options: { logDir?: string } = {}): string[] {
     return [];
   }
 
-  const { readdirSync } = require('fs');
   const files: string[] = readdirSync(fullDir);
 
   return files

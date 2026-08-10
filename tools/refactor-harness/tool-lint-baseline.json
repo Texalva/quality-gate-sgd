@@ -49,5 +49,11 @@
     "src/rules.ts"
   ],
   "capturedAtCommit": "95b3a41bce6bfbfdea93cec1f28ac5ea0f8330e6",
-  "note": "src/targets/aggregate.ts carries 3 no-non-null-assertion WARNINGS (0 errors); refactor surface has 0 errors."
+  "note": "src/targets/aggregate.ts carries 3 no-non-null-assertion WARNINGS (0 errors); refactor surface has 0 errors.",
+  "status": "HISTORICAL SNAPSHOT, not an active check. Nothing reads this file. It records the state the refactor started from so the end state can be compared to it by hand.",
+  "endState": {
+    "atCommit": "the tip of the refactor branch",
+    "totals": { "errors": 0, "warnings": 78 },
+    "whatMoved": "All 60 errors cleared (see the first refactor commit). Warnings went 75 -> 78; 45 of the 78 are in src/experiments and tests/experiments, which is research scaffolding rather than gate surface. The refactor surface listed above is still at 0 errors."
+  }
 }

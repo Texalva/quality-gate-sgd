@@ -72,8 +72,24 @@ contaminates the reading.
 
 ## The frozen baseline
 
-`golden-A.json` / `golden-B.json` are two byte-identical captures against
-apollographql/apollo-client at `359f3e63`, pinned by `fixture-manifest.json`.
+`golden-A.json` is a capture against apollographql/apollo-client at `359f3e63`,
+pinned by `fixture-manifest.json`.
+
+It has a twin that is deliberately **not** committed. Every re-baseline takes two
+back-to-back captures and diffs them; the pair must differ in nothing but
+`liveness.*.elapsedMs`, which is what earns the byte-identity bar below. At the
+last re-baseline that diff was exactly two fields — `46711/34198` and
+`41683/26216` ms — and nothing else. Only `golden-A.json` is kept, because the
+second capture was read by no script: `verify-gate.mjs` opens `golden-A.json`,
+and `accept-refactor.mjs` names the `liveness` and `captureSha` exclusions
+outright rather than inferring them from an A-vs-B comparison. Carrying a second
+670 KB / 22,487-line artefact to record a four-line result is a bad trade, and
+the result is reproducible on demand:
+
+```bash
+node tools/refactor-harness/capture.mjs . ~/scratch/qg-fixtures/apollo-client /tmp/b.json
+diff tools/refactor-harness/golden-A.json /tmp/b.json   # expect: elapsedMs only
+```
 
 | dimension | baseline |
 |---|---|
@@ -358,6 +374,9 @@ and refuses to run (exit 2) if that clone is not actually shallow, since a
 fixture that no longer reproduces the condition proves nothing while still
 reporting success.
 
-`tool-lint-baseline.json` is a separate record of *this repo's own* lint state,
-used to check that refactor commits do not introduce new errors. It is not part
-of the golden comparison.
+`tool-lint-baseline.json` is a separate record of *this repo's own* lint state at
+the commit the refactor started from. It is not part of the golden comparison, and
+despite what this paragraph used to say, **no script reads it** — it is a
+historical snapshot for comparing the end state by hand, and it now carries that
+end state alongside the starting one. If "no new lint errors" should be enforced
+rather than remembered, that belongs in CI, not in a JSON file.

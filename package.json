@@ -15,6 +15,7 @@
     "test:coverage": "vitest run --coverage",
     "lint": "eslint src/ tests/",
     "lint:ci": "eslint src/ tests/ --max-warnings 78",
+    "typecheck:all": "tsc -p tsconfig.check.json",
     "lint:fix": "eslint src/ tests/ --fix",
     "prepare": "npm run build",
     "quality-gate": "tsx src/cli.ts",

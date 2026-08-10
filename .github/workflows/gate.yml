@@ -43,6 +43,11 @@ jobs:
       - name: the build actually produced something
         run: test -f dist/cli.js && test -f dist/index.js
 
+      # SRC ONLY. tsconfig.json drives the build, so it is scoped to `src/**/*`
+      # and this checks nothing under tests/. `npm run typecheck:all` covers both
+      # and currently reports 303 errors, so it is not a gate yet -- see the
+      # header of tsconfig.check.json. Do not read a green tsc here as "the tests
+      # typecheck".
       - run: npx tsc --noEmit
 
       # `lint:ci` is `eslint src/ tests/ --max-warnings 78`, which is exactly

@@ -120,3 +120,30 @@ jobs:
       # When a measurement genuinely breaks, does the gate say so? Slowest of
       # the four at roughly a minute.
       - run: node tools/refactor-harness/verify-vacuous-pass.mjs
+
+  # The one status the org-wide `require-check` ruleset requires, in every
+  # Texalva repo. It exists so "green" has a single name across the org no
+  # matter what a repo's internal job graph looks like -- a new repo inherits
+  # the requirement from the org ruleset and only has to expose this context.
+  #
+  # `if: always()` is load-bearing, not defensive. Without it a failed
+  # dependency SKIPS this job, and GitHub counts a skipped required check as
+  # satisfied -- a red build would merge. With it the job always runs and
+  # decides for itself, so the failure is reported rather than skipped past.
+  #
+  # CodeQL's two Analyze contexts are not aggregated here: they come from code
+  # scanning default setup, a dynamic workflow with no job in this file, so
+  # they cannot appear in `needs`. They stay separately required by their own
+  # ruleset.
+  check:
+    name: check
+    needs: [checks, harness]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: every gated job succeeded
+        run: |
+          echo "types, lint, tests  -> ${{ needs.checks.result }}"
+          echo "verification harness -> ${{ needs.harness.result }}"
+          [ "${{ needs.checks.result }}" = "success" ] \
+            && [ "${{ needs.harness.result }}" = "success" ]
